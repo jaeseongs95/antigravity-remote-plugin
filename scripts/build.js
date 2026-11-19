@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
 
+// Ordered in strict topological dependency order for standalone ESM bundling.
 const SOURCE_FILES = [
   'src/security/redactor.js',
   'src/security/origin-policy.js',
@@ -23,11 +24,19 @@ const SOURCE_FILES = [
   'src/adapters/antigravity/frame-adapter.js',
   'src/adapters/antigravity/sidecar-adapter.js',
   'src/adapters/antigravity/settings-adapter.js',
+  'src/adapters/antigravity/theme-workspace-adapter.js',
   'src/runtime/bootstrap.js',
 ];
 
 function sha256(content) {
   return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+function stripRelativeImports(source) {
+  return source.replace(
+    /^import\s+[\s\S]*?from\s+['"]\.\.?\/[^'"]+['"];\s*$/gm,
+    '',
+  ).trim();
 }
 
 function build() {
@@ -41,6 +50,13 @@ function build() {
   }
 
   const moduleEntries = [];
+  const bundledChunks = [
+    `// antigravity-remote-plugin v${pkg.version} — standalone self-contained ESM bundle`,
+    `// Generated deterministically from ${SOURCE_FILES.length} source modules.`,
+    `export const BUILD_VERSION = ${JSON.stringify(pkg.version)};`,
+    '',
+  ];
+
   for (const relPath of SOURCE_FILES) {
     const absPath = join(ROOT, relPath);
     const content = readFileSync(absPath, 'utf8').replace(/\r\n/g, '\n');
@@ -49,33 +65,23 @@ function build() {
       sha256: sha256(content),
       bytes: Buffer.byteLength(content, 'utf8'),
     });
+    bundledChunks.push(`// --- module: ${relPath} ---`);
+    bundledChunks.push(stripRelativeImports(content));
+    bundledChunks.push('');
   }
 
   const distDir = join(ROOT, 'dist');
   mkdirSync(distDir, { recursive: true });
 
-  const entrySource = [
-    `// antigravity-remote-plugin v${pkg.version} — deterministic entry bundle`,
-    `// Built from ${SOURCE_FILES.length} source modules.`,
-    `export { bootstrapAntigravityRemoteBridge } from '../src/runtime/bootstrap.js';`,
-    `export { RemoteOrchestrator } from '../src/core/orchestrator.js';`,
-    `export { DiagnosticsBus } from '../src/core/diagnostics.js';`,
-    `export { DisposableStore, EventChain, SingleFlight } from '../src/core/lifecycle.js';`,
-    `export { createDomOverlayBridge, sanitizeRemoteOverlaySettings } from '../src/bridges/dom-overlay-bridge.js';`,
-    `export { createSidecarUiBridge } from '../src/bridges/sidecar-ui-bridge.js';`,
-    `export { createMcpExtensionSlot } from '../src/bridges/mcp-extension-slot.js';`,
-    `export const BUILD_VERSION = ${JSON.stringify(pkg.version)};`,
-    '',
-  ].join('\n');
-
+  const bundleSource = `${bundledChunks.join('\n').trimEnd()}\n`;
   const bundlePath = join(distDir, 'remote_bridge.js');
-  writeFileSync(bundlePath, entrySource, 'utf8');
+  writeFileSync(bundlePath, bundleSource, 'utf8');
 
   const manifest = {
     name: pkg.name,
     version: pkg.version,
     entry: 'dist/remote_bridge.js',
-    entrySha256: sha256(entrySource),
+    entrySha256: sha256(bundleSource),
     moduleCount: moduleEntries.length,
     modules: moduleEntries,
   };

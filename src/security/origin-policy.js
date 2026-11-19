@@ -31,8 +31,19 @@ export function isLoopbackHostname(hostname) {
   if (typeof hostname !== 'string') {
     return false;
   }
-  const lower = hostname.toLowerCase();
+  const lower = hostname.trim().toLowerCase();
   return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]' || lower === '::1';
+}
+
+export function formatHostForUrl(hostname) {
+  if (typeof hostname !== 'string' || !hostname.trim()) {
+    throw new SecurityPolicyError('INVALID_HOST', 'Hostname must be a non-empty string.');
+  }
+  const trimmed = hostname.trim();
+  if (trimmed.includes(':') && !trimmed.startsWith('[')) {
+    return `[${trimmed}]`;
+  }
+  return trimmed;
 }
 
 export function matchesDomainBoundary(hostname, rule) {
@@ -86,11 +97,19 @@ export function isOriginAllowed(candidateOrigin, allowlist) {
       continue;
     }
 
-    if (rule === 'http://127.0.0.1:*' || rule === 'http://localhost:*') {
+    if (
+      rule === 'http://127.0.0.1:*' ||
+      rule === 'http://localhost:*' ||
+      rule === 'http://[::1]:*'
+    ) {
       if (candidate.protocol !== 'http:') {
         continue;
       }
-      const expectedHost = rule.startsWith('http://127.0.0.1') ? '127.0.0.1' : 'localhost';
+      const expectedHost = rule.startsWith('http://127.0.0.1')
+        ? '127.0.0.1'
+        : rule.startsWith('http://[::1]')
+          ? '[::1]'
+          : 'localhost';
       if (candidate.hostname === expectedHost) {
         return true;
       }

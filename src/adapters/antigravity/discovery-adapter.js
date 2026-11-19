@@ -1,4 +1,8 @@
-import { isLoopbackHostname, SecurityPolicyError } from '../../security/origin-policy.js';
+import {
+  formatHostForUrl,
+  isLoopbackHostname,
+  SecurityPolicyError,
+} from '../../security/origin-policy.js';
 
 const RPC_BASE_PATH = '/exa.language_server_pb.LanguageServerService';
 
@@ -6,12 +10,21 @@ function validateLoopbackAddress(lsAddress) {
   if (typeof lsAddress !== 'string' || !lsAddress.trim()) {
     throw new SecurityPolicyError('INVALID_LS_ADDRESS', 'Language server address is required.');
   }
-  const normalized = lsAddress.includes('://') ? lsAddress.trim() : `http://${lsAddress.trim()}`;
+  const raw = lsAddress.trim();
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
+  const normalized = hasScheme ? raw : `http://${raw}`;
+
   let parsed;
   try {
     parsed = new URL(normalized);
   } catch (_err) {
     throw new SecurityPolicyError('INVALID_LS_ADDRESS', 'Language server address is not a valid URL.');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new SecurityPolicyError(
+      'INVALID_LS_PROTOCOL',
+      `Language server RPC adapter only permits http/https protocols, got "${parsed.protocol}".`,
+    );
   }
   if (!isLoopbackHostname(parsed.hostname)) {
     throw new SecurityPolicyError(
@@ -19,7 +32,9 @@ function validateLoopbackAddress(lsAddress) {
       'Language server RPC adapter only permits loopback addresses.',
     );
   }
-  return parsed.origin;
+  const host = formatHostForUrl(parsed.hostname);
+  const portSuffix = parsed.port ? `:${parsed.port}` : '';
+  return `${parsed.protocol}//${host}${portSuffix}`;
 }
 
 function validateCsrfToken(csrfToken) {
@@ -71,8 +86,10 @@ export function createAntigravityDiscoveryAdapter({
         ? { workspaceUris }
         : {};
       const data = await callRpc('GetAllPlugins', body);
-      const plugins = Array.isArray(data?.plugins) ? data.plugins : [];
-      return plugins.map((plugin) => ({
+      if (!data || !Array.isArray(data.plugins)) {
+        throw new Error('LanguageServerService/GetAllPlugins returned invalid payload: missing "plugins" array.');
+      }
+      return data.plugins.map((plugin) => ({
         name: plugin.name,
         path: plugin.path || '',
         dir: typeof plugin.path === 'string' && plugin.path.length > 0
@@ -89,8 +106,10 @@ export function createAntigravityDiscoveryAdapter({
         ? { workspaceUris }
         : {};
       const data = await callRpc('GetSidecars', body);
-      const sidecars = Array.isArray(data?.sidecars) ? data.sidecars : [];
-      return sidecars.map((sc) => ({
+      if (!data || !Array.isArray(data.sidecars)) {
+        throw new Error('LanguageServerService/GetSidecars returned invalid payload: missing "sidecars" array.');
+      }
+      return data.sidecars.map((sc) => ({
         sidecarId: sc.sidecarId || sc.id || '',
         pluginName: sc.pluginName || '',
         port: Number(sc.port || sc.webPort || 0),

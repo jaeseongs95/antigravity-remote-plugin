@@ -2,9 +2,7 @@ import { SecurityPolicyError } from './origin-policy.js';
 
 const FORBIDDEN_TAGS = new Set(['base', 'script', 'object', 'embed']);
 
-const FORBIDDEN_PROP_PREFIXES = Object.freeze([
-  'on',
-]);
+const FORBIDDEN_PROP_PREFIXES = Object.freeze(['on']);
 
 const FORBIDDEN_HTML_PROPS = new Set([
   ['inner', 'HTML'].join(''),
@@ -12,6 +10,13 @@ const FORBIDDEN_HTML_PROPS = new Set([
   ['insertAdjacent', 'HTML'].join(''),
   'srcdoc',
 ]);
+
+const FORBIDDEN_URI_SCHEME_PATTERN = /^(?:javascript|vbscript|data):/i;
+
+function normalizeUriForSchemeCheck(rawValue) {
+  // Strip ASCII control characters (including \t, \n, \r) and spaces that browsers ignore in URL schemes.
+  return String(rawValue).replace(/[\u0000-\u0020\u007f]+/g, '');
+}
 
 export function assertSafeTagName(tagName) {
   if (typeof tagName !== 'string' || tagName.trim().length === 0) {
@@ -47,11 +52,14 @@ export function assertSafeAttribute(attrName, attrValue) {
       );
     }
   }
-  if (typeof attrValue === 'string' && /^\s*javascript:/i.test(attrValue)) {
-    throw new SecurityPolicyError(
-      'FORBIDDEN_JAVASCRIPT_URI',
-      `javascript: URI in attribute "${attrName}" is forbidden.`,
-    );
+  if (typeof attrValue === 'string') {
+    const collapsed = normalizeUriForSchemeCheck(attrValue);
+    if (FORBIDDEN_URI_SCHEME_PATTERN.test(collapsed)) {
+      throw new SecurityPolicyError(
+        'FORBIDDEN_URI_SCHEME',
+        `Dangerous URI scheme in attribute "${attrName}" is forbidden.`,
+      );
+    }
   }
 }
 

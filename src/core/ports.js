@@ -35,6 +35,10 @@ export function validateSettingsReadPort(port) {
   return assertPort(port, 'SettingsReadPort', PORT_CONTRACTS.SettingsReadPort);
 }
 
+export function validateThemeWorkspaceSyncPort(port) {
+  return assertPort(port, 'ThemeWorkspaceSyncPort', PORT_CONTRACTS.ThemeWorkspaceSyncPort);
+}
+
 export function validateBridgeDescriptor(bridge) {
   if (!bridge || typeof bridge !== 'object') {
     throw new TypeError('Bridge descriptor must be an object.');

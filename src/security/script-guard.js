@@ -40,6 +40,7 @@ export function assertTrustedScriptUrl(rawUrl, allowlist) {
 /**
  * Guards Worker / AudioWorklet bootstrap Blob URL creation by requiring
  * the underlying script URL to pass `isTrustedScriptUrl` first.
+ * Preserves native TrustedScriptURL objects intact (never coerces via String()).
  */
 export function createGuardedWorkerBlobUrl({
   scriptUrl,
@@ -57,5 +58,5 @@ export function createGuardedWorkerBlobUrl({
   const validatedUrl = trustedTypesPolicy
     ? trustedTypesPolicy.createScriptURL(scriptUrl)
     : scriptUrl;
-  return createBlobUrl(String(validatedUrl));
+  return createBlobUrl(validatedUrl);
 }

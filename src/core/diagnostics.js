@@ -1,4 +1,4 @@
-import { redactSecrets } from '../security/redactor.js';
+import { deepFreeze, redactSecrets } from '../security/redactor.js';
 
 const DEFAULT_MAX_EVENTS = 200;
 
@@ -12,7 +12,7 @@ export class DiagnosticsBus {
   }
 
   emit({ level = 'info', code, source, message, detail = null }) {
-    const entry = Object.freeze({
+    const entry = deepFreeze({
       timestamp: new Date().toISOString(),
       level,
       code: String(code || 'UNKNOWN'),

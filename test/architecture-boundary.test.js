@@ -20,7 +20,7 @@ function collectJsFiles(dir) {
   return files;
 }
 
-test('ARP-TC-001: core, security, and bridges contain zero vendor literals', () => {
+test('ARP-TC-001: core, security, and bridges contain zero vendor literals or domain leakage', () => {
   const forbidden = [
     /\bantigravity\b/i,
     /\bgoogle\b/i,
@@ -31,8 +31,10 @@ test('ARP-TC-001: core, security, and bridges contain zero vendor literals', () 
     /app\.asar/i,
     /statusbar_autoinject/i,
     /\.gemini\b/i,
+    /translateThinking/,
+    /translateStaticUi/,
+    /local-llm/,
   ];
-  // Exception: trusted-types.js explicitly lists 'angular' in RESERVED_TRUSTED_TYPES_POLICIES
   const dirs = ['src/core', 'src/security', 'src/bridges'];
   const violations = [];
 
@@ -49,26 +51,32 @@ test('ARP-TC-001: core, security, and bridges contain zero vendor literals', () 
       }
     }
   }
+
+  // Hexagonal boundary: adapters must not import from bridges.
+  for (const file of collectJsFiles(join(ROOT, 'src/adapters'))) {
+    const content = readFileSync(file, 'utf8');
+    if (/from\s+['"][^'"]*bridges\//.test(content)) {
+      violations.push(`${file} reverse-imports from bridges/`);
+    }
+  }
+
   assert.deepEqual(violations, []);
 });
 
-test('ARP-TC-002: core and security contain zero HTML sink calls or assignments', () => {
+test('ARP-TC-002: entire src/ contains zero HTML sink calls or assignments', () => {
   const sinkPatterns = [
     /\.innerHTML\b/,
     /\.outerHTML\b/,
     /insertAdjacentHTML\s*\(/,
     /document\.write\s*\(/,
   ];
-  const dirs = ['src/core', 'src/security'];
   const violations = [];
 
-  for (const relDir of dirs) {
-    for (const file of collectJsFiles(join(ROOT, relDir))) {
-      const content = readFileSync(file, 'utf8');
-      for (const pattern of sinkPatterns) {
-        if (pattern.test(content)) {
-          violations.push(`${file} matched ${pattern}`);
-        }
+  for (const file of collectJsFiles(join(ROOT, 'src'))) {
+    const content = readFileSync(file, 'utf8');
+    for (const pattern of sinkPatterns) {
+      if (pattern.test(content)) {
+        violations.push(`${file} matched ${pattern}`);
       }
     }
   }
@@ -81,7 +89,7 @@ test('ARP-TC-003: entire src/ contains zero forbidden legacy patterns or empty c
     /statusbar_autoinject/i,
     /agy-statusbar-code/i,
     /window\.agyMcpManager/,
-    /catch\s*\{\s*\}/,
+    /catch\s*(?:\([^)]*\))?\s*\{\s*\}/,
   ];
   const violations = [];
   for (const file of collectJsFiles(join(ROOT, 'src'))) {

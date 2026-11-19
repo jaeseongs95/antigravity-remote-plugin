@@ -1,52 +1,55 @@
 # Test Cases — antigravity-remote-plugin v0.1.0
 
-Written prior to implementation to verify vendor independence, security invariants, lifecycle determinism, and all three stakeholder bridge contracts (`antigravity-ko-translator`, `antigravity-statusbar`, `antigravity-mcp-manager`).
+Written prior to implementation and expanded with audit regression cases (`ARP-TC-020` through `ARP-TC-030`) to verify vendor independence, security invariants, concurrency safety, real loopback HTTP integration, and standalone bundle execution.
 
 ## 1. Architecture & Vendor-Independence Boundary (`test/architecture-boundary.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-001 | Static scan of `src/core/`, `src/security/`, and `src/bridges/` for vendor literals (`antigravity`, `google`, `codeium`, `angular`, `electron`, `boq-jetski`, `app.asar`, `statusbar_autoinject`) | 0 matches across all files |
-| ARP-TC-002 | Static scan of `src/core/` and `src/security/` for direct DOM/HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
-| ARP-TC-003 | Static scan of entire `src/` for forbidden legacy patterns (`app.asar`, `statusbar_autoinject`, `agy-statusbar-code`, `window.agyMcpManager`, synthetic `'csrf_token'`, empty `catch {}`) | 0 matches across all files |
+| ARP-TC-001 | Static scan of `src/core/`, `src/security/`, and `src/bridges/` for vendor literals and domain leakage (`translateThinking`, `local-llm`, reverse adapter->bridge imports) | 0 matches across all files |
+| ARP-TC-002 | Static scan of entire `src/` for direct HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
+| ARP-TC-003 | Static scan of entire `src/` for forbidden legacy patterns and empty catch blocks (`catch {}`, `catch (e) {}`) | 0 matches across all files |
 
 ## 2. Security Invariants (`test/security.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-004 | `isOriginAllowed`: exact origin match and explicit subdomain boundary match vs substring spoofing (`evil-example.com`, `example.com.attacker.test`, `http:` downgrade) | Allows exact/valid subdomain over `https:` (or explicit loopback `127.0.0.1`), rejects substring spoofs and scheme downgrades |
-| ARP-TC-005 | `createScopedTrustedTypesPolicy`: rejects reserved policy names (`default`, `dompurify`, `angular`) and uses scoped policy name with URL guard | Throws `SecurityPolicyError` for reserved names; creates/returns scoped policy when allowed |
-| ARP-TC-006 | `isTrustedScriptUrl` & `createGuardedWorkerBlobUrl`: rejects untrusted script URLs, `javascript:`, `data:`, and non-allowlisted origins before Blob/Worker creation | Fails closed with `SecurityPolicyError`; permits only allowlisted URLs |
-| ARP-TC-007 | `dom-guard`: rejects `<base>` element creation and rejects unsafe HTML sink properties (`innerHTML`, `outerHTML`, `insertAdjacentHTML`) | Throws `SecurityPolicyError`; safe `createSafeElement` sets attributes/textContent cleanly |
-| ARP-TC-008 | `redactSecrets`: strips/masks `token`, `csrf`, `authorization`, `x-sidecar-token`, `x-codeium-csrf-token`, `env`, `headers`, and URL query `?token=...` | All sensitive values replaced with `[REDACTED]`; non-sensitive fields preserved |
+| ARP-TC-004 | `isOriginAllowed`: exact origin, subdomain boundary, IPv6 loopback vs substring spoofing and scheme downgrades | Allows valid origins; rejects spoofs & downgrades |
+| ARP-TC-005 | `createScopedTrustedTypesPolicy`: blocks reserved names (`default`, `dompurify`, `angular`) and enforces URL allowlist | Throws `SecurityPolicyError` for reserved names |
+| ARP-TC-006 | `createGuardedWorkerBlobUrl`: fails closed on untrusted URLs and preserves native `TrustedScriptURL` object identity (no `String()` coercion) | Rejects untrusted URLs; passes `TrustedScriptURL` instance intact |
+| ARP-TC-007 | `dom-guard`: blocks `<base>`, HTML sinks, inline handlers, `java\tscript:`, `vbscript:`, and `data:text/html` URIs | Throws `SecurityPolicyError` for every bypass vector |
+| ARP-TC-008 | `redactSecrets` & `redactUrl`: masks query params, `#token=` fragments, `password`, `x-sidecar-token`, `env`, `headers`, and `deepFreeze` | All secrets replaced with `[REDACTED]`; objects deeply frozen |
 
 ## 3. Lifecycle & Concurrency (`test/lifecycle.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-009 | `DisposableStore`: idempotent `dispose()`, reverse-order cleanup, continues cleanup if one disposer throws and reports via `DiagnosticsBus` | All disposers invoked exactly once; errors emitted to diagnostics without swallowing |
-| ARP-TC-010 | `EventChain`: arbitrary-order registration and removal of multiple plugin handlers preserves remaining handlers and host guard return value | Removing middle/first/last handler never breaks others; host guard result preserved |
-| ARP-TC-011 | `SingleFlight`: concurrent discovery calls share one in-flight promise and settle identically; subsequent call after settlement runs fresh | Underlying fetcher invoked once for concurrent callers, twice after completion |
-| ARP-TC-012 | `RemoteOrchestrator`: mounts only plugins reported as installed & enabled by `HostDiscoveryPort`, skips disabled/uninstalled without loading external resources, and disposes cleanly on teardown | Zero external loads for disabled/missing plugins; `dispose()` invoked on every mounted bridge |
+| ARP-TC-009 | `DisposableStore`: idempotent, reverse order, reports errors to deep-frozen `DiagnosticsBus` | All disposers run once; `detail` is deeply frozen |
+| ARP-TC-010 | `EventChain`: arbitrary-order removal, host guard preservation, async rejection capture | No unhandledRejection; `EVENT_CHAIN_ASYNC_HANDLER_FAILED` emitted |
+| ARP-TC-011 | `SingleFlight`: deduplicates concurrent calls and resets after settlement | Fetcher invoked once concurrently, twice sequentially |
+| ARP-TC-012 | `RemoteOrchestrator`: mounts only active plugins and disposes cleanly | Skips disabled/uninstalled; disposes all mounted |
+| ARP-TC-020 | `RemoteOrchestrator` concurrency: parallel `reconcile()` prevents duplicate mount; mid-mount `dispose()` prevents zombie mount; restart after `dispose()` works | Mount count === 1; zombie count === 0; restart mounts cleanly |
 
 ## 4. Stakeholder Bridge Contracts (`test/bridges.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-013 | `DomOverlayBridge` (`ko-translator` contract): passes ONLY `{ win, doc, settings, onStatus }` to `createOverlay`; strips RPC/tokens; falls back `local-llm` -> `google-translate` (or HTTPS `customEndpoint`); invokes `dispose()` on unmount | Factory receives zero credentials/RPC; `local-llm` sanitized; `updateSettings` and `dispose` called cleanly |
-| ARP-TC-014 | `SidecarUiBridge` (`statusbar` contract): discovers active sidecar via `HostDiscoveryPort`, relays `/api/telemetry`, `/api/context-limit`, `/api/compact` via `SidecarRelayPort` with `X-Sidecar-Token`, forwards `theme-change`/`workspace-change` and validates incoming `postMessage` origin/source | API responses returned accurately; untrusted `postMessage` origins dropped with diagnostic warning; sidecar UI URL includes `conversationId` without leaking token to logs |
-| ARP-TC-015 | `McpExtensionSlot` (`mcp-manager` contract): independent lifecycle with zero legacy globals; blocks unconfirmed remote `stdio` command execution/creation; blocks writes to host `config.json` or `plugins/*/mcp_config.json`; redacts `env`/`headers` | Unconfirmed `stdio` throws `SecurityPolicyError`; protected config paths rejected; secrets never exposed |
+| ARP-TC-013 | `DomOverlayBridge`: least privilege, parallel `mount()` serialization, `start()` failure rollback & rethrow, `dispose()` | Zero credentials passed; failed `start()` rolls back and rejects |
+| ARP-TC-014 | `SidecarUiBridge`: relays allowed APIs, wires `ThemeWorkspaceSyncPort` + `message` listener, enforces exact `activeSidecar` port origin & `expectedSource` | Rejects different localhost port (`9999`) & wrong `event.source`; pushes theme/workspace live |
+| ARP-TC-015 | `McpExtensionSlot`: canonicalizes `./`, `../`, `//`, `~/` paths; rejects `null` path, `~/.gemini/antigravity/mcp_config.json`, and omitted `transport` with `serverConfig.command` | Throws `SecurityPolicyError` on every bypass attempt |
 
 ## 5. Antigravity Host Adapter (`test/antigravity-adapter.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-016 | `AntigravityDiscoveryAdapter`: queries `GetAllPlugins` & `GetSidecars` via Connect RPC with real host CSRF header; treats `disabled: true` as inactive; rejects missing/synthetic CSRF token | Accurate plugin/sidecar inventory; fails closed when CSRF token is absent |
-| ARP-TC-017 | `AntigravitySidecarAdapter`: communicates with loopback `127.0.0.1` sidecar using `X-Sidecar-Token` header; rejects non-loopback sidecar hosts | Loopback requests succeed with token header; remote/non-loopback target rejected |
-| ARP-TC-018 | `AntigravitySettingsAdapter`: reads sanitized read-only translator settings and applies remote `local-llm` fallback (`google-translate` or valid `https://` `customEndpoint`, rejecting `http://` custom endpoints) | Safe settings object returned; insecure `http://` custom endpoint rejected to `google-translate` |
+| ARP-TC-016 | `AntigravityDiscoveryAdapter`: queries `GetAllPlugins`/`GetSidecars`, rejects `file://localhost`, rejects synthetic CSRF, throws on malformed payloads without `plugins`/`sidecars` arrays | Accurate inventory; fails closed on invalid protocol/CSRF/payload |
+| ARP-TC-017 | `AntigravitySidecarAdapter`: supports IPv4 & IPv6 (`::1` -> `[::1]`), injects `X-Sidecar-Token`, and omits `?token=` from `buildUiUrl()` | Valid IPv6 URL; zero token leakage in UI URL |
+| ARP-TC-018 | `AntigravitySettingsAdapter`: sanitizes translator settings & applies remote `local-llm` fallback (`google-translate` or HTTPS `customEndpoint`) | Safe frozen settings returned |
+| ARP-TC-021 | `AntigravityFrameAdapter`: fail-closed on missing `.origin`; real `promoteRemoteIframe()` promotes accessible iframe & blocks cross-origin/untrusted origins | Throws `SecurityPolicyError` on missing/untrusted origin; dispatches promoted frame |
 
-## 6. Deterministic Build & Manifest (`test/build.test.js`)
+## 6. Deterministic Standalone Build & Real Loopback Integration (`test/build.test.js`, `test/integration-loopback.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-019 | `scripts/build.js`: produces `dist/remote_bridge.js` and `dist/manifest.json` matching `package.json` and `plugin.json` version (`0.1.0`) with deterministic SHA-256 checksum | Build exits 0; artifacts exist; versions and checksums match; zero forbidden legacy markers in bundle |
+| ARP-TC-019 | `scripts/build.js`: verifies all 18 module SHA-256 digests in `dist/manifest.json`, zero `../src/` imports in `dist/remote_bridge.js`, and isolated `tmpdir` standalone `import()` | All module checksums match; standalone bundle imports cleanly without `src/` |
+| ARP-TC-022 | Real `node:http` loopback integration: `bootstrapAntigravityRemoteBridge` (and standalone `dist/remote_bridge.js`) against real HTTP RPC & Sidecar servers with live iframe promotion, `ThemeWorkspaceSyncPort`, and `X-Sidecar-Token` verification | End-to-end mount, API relay, theme/workspace sync, and clean teardown pass |

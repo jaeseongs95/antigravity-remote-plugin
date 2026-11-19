@@ -4,7 +4,7 @@ import { DiagnosticsBus } from '../src/core/diagnostics.js';
 import { DisposableStore, EventChain, SingleFlight } from '../src/core/lifecycle.js';
 import { RemoteOrchestrator } from '../src/core/orchestrator.js';
 
-test('ARP-TC-009: DisposableStore is idempotent, runs in reverse order, and reports disposer errors', () => {
+test('ARP-TC-009: DisposableStore is idempotent, runs in reverse order, and DiagnosticsBus deep-freezes detail', () => {
   const diagnostics = new DiagnosticsBus();
   const store = new DisposableStore({ diagnostics });
   const order = [];
@@ -17,32 +17,36 @@ test('ARP-TC-009: DisposableStore is idempotent, runs in reverse order, and repo
   store.add(() => order.push('last'));
 
   store.dispose();
-  store.dispose(); // idempotent
+  store.dispose();
 
   assert.deepEqual(order, ['last', 'failing', 'first']);
   const errors = diagnostics.snapshot().filter((e) => e.code === 'DISPOSE_FAILED');
   assert.equal(errors.length, 1);
+  assert.equal(Object.isFrozen(errors[0].detail), true);
 });
 
-test('ARP-TC-010: EventChain supports arbitrary-order removal and preserves host guard', () => {
+test('ARP-TC-010: EventChain supports arbitrary-order removal, host guard, and async rejection capture', async () => {
+  const diagnostics = new DiagnosticsBus();
   let allow = true;
-  const chain = new EventChain({ hostGuard: () => allow });
+  const chain = new EventChain({ hostGuard: () => allow, diagnostics });
   const seen = [];
 
-  const offA = chain.register((v) => seen.push(`A:${v}`));
-  const offB = chain.register((v) => seen.push(`B:${v}`));
-  const offC = chain.register((v) => seen.push(`C:${v}`));
+  const offA = chain.register((v) => seen.push(`A:${v}`), { label: 'A' });
+  const offB = chain.register((v) => seen.push(`B:${v}`), { label: 'B' });
+  const offC = chain.register(async () => { throw new Error('async boom'); }, { label: 'C' });
 
   offB();
   const r1 = chain.dispatch(1);
   assert.deepEqual(r1, { allowed: true, invoked: 2 });
-  assert.deepEqual(seen, ['A:1', 'C:1']);
+  assert.deepEqual(seen, ['A:1']);
+
+  await new Promise((r) => setTimeout(r, 10));
+  const asyncErrors = diagnostics.snapshot().filter((e) => e.code === 'EVENT_CHAIN_ASYNC_HANDLER_FAILED');
+  assert.equal(asyncErrors.length, 1);
 
   allow = false;
-  const r2 = chain.dispatch(2);
-  assert.deepEqual(r2, { allowed: false, invoked: 0 });
+  assert.deepEqual(chain.dispatch(2), { allowed: false, invoked: 0 });
 
-  allow = true;
   offA();
   offC();
   assert.equal(chain.size, 0);
@@ -122,4 +126,67 @@ test('ARP-TC-012: RemoteOrchestrator mounts only active plugins and disposes cle
 
   orchestrator.dispose();
   assert.deepEqual(disposed, ['b-active']);
+});
+
+test('ARP-TC-020: RemoteOrchestrator prevents concurrent duplicate mounts, zombie mounts after dispose, and supports clean restart', async () => {
+  let mountCount = 0;
+  let disposeCount = 0;
+  let releaseMount;
+
+  const discoveryPort = {
+    async listPlugins() {
+      return [{ name: 'slow-plugin', disabled: false }];
+    },
+    async listSidecars() {
+      return [];
+    },
+  };
+  const framePort = {
+    async acquireActiveFrame() {
+      return { win: {}, doc: {} };
+    },
+    onFrameChange() {
+      return () => {};
+    },
+  };
+
+  const orchestrator = new RemoteOrchestrator({ discoveryPort, framePort });
+  orchestrator.registerBridge({
+    id: 'slow',
+    pluginName: 'slow-plugin',
+    async mount() {
+      mountCount += 1;
+      if (releaseMount) {
+        await new Promise((r) => { releaseMount = r; });
+      }
+    },
+    dispose() {
+      disposeCount += 1;
+    },
+  });
+
+  // 1) Parallel reconcile calls must serialize and mount only once.
+  const [r1, r2] = await Promise.all([orchestrator.reconcile(), orchestrator.reconcile()]);
+  assert.equal(mountCount, 1);
+  assert.deepEqual(r1.mountedIds, ['slow']);
+  assert.deepEqual(r2.mountedIds, ['slow']);
+
+  orchestrator.dispose();
+  assert.equal(disposeCount, 1);
+
+  // 2) Dispose mid-mount must immediately dispose the finishing mount (zero zombie mounts).
+  releaseMount = () => {};
+  const pendingReconcile = orchestrator.start();
+  await new Promise((r) => setTimeout(r, 10));
+  orchestrator.dispose();
+  releaseMount();
+  await pendingReconcile;
+  assert.deepEqual(orchestrator.getMountedBridgeIds(), []);
+  assert.ok(disposeCount >= 2);
+
+  // 3) Restart after dispose must work cleanly.
+  releaseMount = null;
+  const restarted = await orchestrator.start();
+  assert.deepEqual(restarted.mountedIds, ['slow']);
+  orchestrator.dispose();
 });

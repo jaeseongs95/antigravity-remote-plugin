@@ -2,7 +2,7 @@ const SENSITIVE_KEY_PATTERN =
   /^(authorization|cookie|set-cookie|token|access_token|refresh_token|csrf|csrf_token|x-sidecar-token|x-csrf-token|x-api-key|api_key|apikey|secret|password|passwd|env|headers)$/i;
 
 const SENSITIVE_SUBSTRING_PATTERN =
-  /(token|secret|password|csrf|authorization|apikey|api_key)/i;
+  /(token|secret|password|passwd|csrf|authorization|apikey|api_key)/i;
 
 const SENSITIVE_QUERY_PARAMS = new Set([
   'token',
@@ -14,9 +14,22 @@ const SENSITIVE_QUERY_PARAMS = new Set([
   'apikey',
   'secret',
   'key',
+  'password',
+  'passwd',
+  'x-sidecar-token',
 ]);
 
+const INLINE_PARAM_PATTERN =
+  /([?&#](?:token|access_token|refresh_token|csrf|csrf_token|api_key|apikey|secret|key|password|passwd|x-sidecar-token)=)([^&#]*)/gi;
+
 export const REDACTED = '[REDACTED]';
+
+function redactFragment(hash) {
+  if (!hash || hash.length <= 1) {
+    return hash;
+  }
+  return hash.replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
+}
 
 export function redactUrl(rawUrl) {
   if (typeof rawUrl !== 'string' || rawUrl.length === 0) {
@@ -25,11 +38,8 @@ export function redactUrl(rawUrl) {
   let parsed;
   try {
     parsed = new URL(rawUrl);
-  } catch (err) {
-    return rawUrl.replace(
-      /([?&](?:token|access_token|csrf|csrf_token|api_key|apikey|secret|key)=)([^&#]*)/gi,
-      `$1${REDACTED}`,
-    );
+  } catch (_err) {
+    return rawUrl.replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
   }
   let mutated = false;
   for (const paramKey of [...parsed.searchParams.keys()]) {
@@ -41,6 +51,13 @@ export function redactUrl(rawUrl) {
   if (parsed.password) {
     parsed.password = REDACTED;
     mutated = true;
+  }
+  if (parsed.hash) {
+    const cleanHash = redactFragment(parsed.hash);
+    if (cleanHash !== parsed.hash) {
+      parsed.hash = cleanHash;
+      mutated = true;
+    }
   }
   return mutated ? parsed.toString() : rawUrl;
 }
@@ -95,4 +112,21 @@ export function redactSecrets(value, depth = 0, seen = new WeakSet()) {
     }
   }
   return out;
+}
+
+export function deepFreeze(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== 'object' || seen.has(value)) {
+    return value;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      deepFreeze(item, seen);
+    }
+  } else {
+    for (const prop of Object.values(value)) {
+      deepFreeze(prop, seen);
+    }
+  }
+  return Object.freeze(value);
 }

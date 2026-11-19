@@ -11,8 +11,16 @@ import {
 import {
   createAntigravitySettingsAdapter,
   DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
+  sanitizeTranslatorSettings,
 } from '../adapters/antigravity/settings-adapter.js';
 import { createAntigravitySidecarAdapter } from '../adapters/antigravity/sidecar-adapter.js';
+import { createAntigravityThemeWorkspaceAdapter } from '../adapters/antigravity/theme-workspace-adapter.js';
+
+const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
+  /(?:^|\/)\.gemini\/config\/config\.json$/i,
+  /(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i,
+  /(?:^|\/)\.gemini\/config\/plugins\/[^/]+\/mcp_config\.json$/i,
+]);
 
 export function bootstrapAntigravityRemoteBridge({
   lsAddress,
@@ -24,6 +32,8 @@ export function bootstrapAntigravityRemoteBridge({
   createKoTranslator = null,
   mcpDelegate = null,
   initialFrame = null,
+  initialThemeVariables = {},
+  initialWorkspaceUris = [],
   hostLoadGuard = null,
   onSidecarEvent = null,
 }) {
@@ -48,6 +58,10 @@ export function bootstrapAntigravityRemoteBridge({
     readSettingsFile,
     remoteFallbackProvider: DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
   });
+  const themeWorkspacePort = createAntigravityThemeWorkspaceAdapter({
+    initialThemeVariables,
+    initialWorkspaceUris,
+  });
 
   const orchestrator = new RemoteOrchestrator({
     discoveryPort,
@@ -60,21 +74,28 @@ export function bootstrapAntigravityRemoteBridge({
   if (typeof createKoTranslator === 'function') {
     const koBridge = createDomOverlayBridge({
       id: 'ko-translator-overlay',
-      pluginName: 'ko-thought-translator',
+      pluginName: 'antigravity-ko-translator',
+      pluginAliases: ['ko-thought-translator'],
       createOverlay: createKoTranslator,
       settingsPort,
-      remoteFallbackProvider: DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
+      sanitizeSettings: (raw) =>
+        sanitizeTranslatorSettings(raw, {
+          remoteFallbackProvider: DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
+        }),
     });
     orchestrator.registerBridge(koBridge);
     bridges.koTranslator = koBridge;
   }
 
+  // Exact sidecar origin is derived dynamically from activeSidecar.host/port on mount;
+  // never grant wildcard localhost:* / 127.0.0.1:* origins.
   const statusbarBridge = createSidecarUiBridge({
     id: 'statusbar-sidecar',
     pluginName: 'antigravity-statusbar',
     sidecarId: 'antigravity-statusbar/statusbar',
     relayPort: sidecarRelayPort,
-    allowedOrigins: [...allowedOrigins, 'http://127.0.0.1:*', 'http://localhost:*'],
+    themeWorkspacePort,
+    allowedOrigins: [],
     onInboundEvent: onSidecarEvent,
   });
   orchestrator.registerBridge(statusbarBridge);
@@ -83,6 +104,7 @@ export function bootstrapAntigravityRemoteBridge({
   const mcpSlot = createMcpExtensionSlot({
     id: 'mcp-manager-slot',
     pluginName: 'antigravity-mcp-manager',
+    protectedConfigPatterns: ANTIGRAVITY_PROTECTED_MCP_PATHS,
     delegate: mcpDelegate,
   });
   orchestrator.registerBridge(mcpSlot);
@@ -92,6 +114,7 @@ export function bootstrapAntigravityRemoteBridge({
     orchestrator,
     diagnostics,
     framePort,
+    themeWorkspacePort,
     bridges,
   };
 }

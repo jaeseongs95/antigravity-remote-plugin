@@ -1,5 +1,5 @@
 import { DiagnosticsBus } from './diagnostics.js';
-import { DisposableStore, SingleFlight } from './lifecycle.js';
+import { AsyncMutex, DisposableStore, SingleFlight } from './lifecycle.js';
 import {
   validateBridgeDescriptor,
   validateDiscoveryPort,
@@ -13,8 +13,10 @@ export class RemoteOrchestrator {
   #bridges = new Map();
   #mounted = new Map();
   #singleFlight = new SingleFlight();
+  #mutex = new AsyncMutex();
   #store;
   #started = false;
+  #epoch = 0;
   #activeFrame = null;
 
   constructor({ discoveryPort, framePort, diagnostics = new DiagnosticsBus() }) {
@@ -46,22 +48,29 @@ export class RemoteOrchestrator {
         this.#discoveryPort.listPlugins(context),
         this.#discoveryPort.listSidecars(context),
       ]);
-      const normalizedPlugins = Array.isArray(plugins) ? plugins : [];
-      const normalizedSidecars = Array.isArray(sidecars) ? sidecars : [];
+      if (!Array.isArray(plugins)) {
+        throw new TypeError('HostDiscoveryPort.listPlugins() must return an array.');
+      }
+      if (!Array.isArray(sidecars)) {
+        throw new TypeError('HostDiscoveryPort.listSidecars() must return an array.');
+      }
 
       const activePlugins = new Map();
-      for (const plugin of normalizedPlugins) {
+      for (const plugin of plugins) {
         if (!plugin || typeof plugin.name !== 'string') {
           continue;
         }
         const isEnabled = plugin.disabled !== true && plugin.enabled !== false;
         if (isEnabled) {
           activePlugins.set(plugin.name, plugin);
+          if (typeof plugin.dir === 'string' && plugin.dir.trim()) {
+            activePlugins.set(plugin.dir.trim(), plugin);
+          }
         }
       }
 
       const activeSidecars = new Map();
-      for (const sidecar of normalizedSidecars) {
+      for (const sidecar of sidecars) {
         if (!sidecar || typeof sidecar.sidecarId !== 'string') {
           continue;
         }
@@ -75,13 +84,27 @@ export class RemoteOrchestrator {
   }
 
   async start(context = {}) {
-    if (this.#started) {
+    if (this.#started && !this.#store.isDisposed) {
       return this.reconcile(context);
     }
+
+    if (this.#store.isDisposed) {
+      this.#store = new DisposableStore({ diagnostics: this.#diagnostics });
+    }
+
+    const startEpoch = this.#epoch;
+    const frame = await this.#framePort.acquireActiveFrame();
+    if (startEpoch !== this.#epoch || this.#store.isDisposed) {
+      return { mountedIds: [], skippedIds: [] };
+    }
+
+    this.#activeFrame = frame;
     this.#started = true;
-    this.#activeFrame = await this.#framePort.acquireActiveFrame();
 
     const unsubFrame = this.#framePort.onFrameChange(async (nextFrame) => {
+      if (startEpoch !== this.#epoch || this.#store.isDisposed) {
+        return;
+      }
       this.#activeFrame = nextFrame;
       this.#unmountAll();
       if (nextFrame) {
@@ -96,74 +119,101 @@ export class RemoteOrchestrator {
   }
 
   async reconcile(context = {}) {
-    if (this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
-    }
-    const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
-    const mountedIds = [];
-    const skippedIds = [];
+    const runEpoch = this.#epoch;
+    return this.#mutex.runExclusive(async () => {
+      if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+        return { mountedIds: [], skippedIds: [] };
+      }
 
-    for (const [bridgeId, bridge] of this.#bridges.entries()) {
-      const pluginRecord = activePlugins.get(bridge.pluginName);
-      const sidecarRecord = bridge.sidecarId
-        ? activeSidecars.get(bridge.sidecarId) ?? null
-        : null;
+      const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
+      if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+        return { mountedIds: [], skippedIds: [] };
+      }
 
-      const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
+      const mountedIds = [];
+      const skippedIds = [];
 
-      if (!isEligible) {
-        if (this.#mounted.has(bridgeId)) {
-          this.#unmountBridge(bridgeId);
+      for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
+        if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+          break;
         }
-        skippedIds.push(bridgeId);
-        this.#diagnostics.emit({
-          level: 'info',
-          code: 'BRIDGE_SKIPPED_INACTIVE',
-          source: 'core.orchestrator',
-          message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
-          detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
-        });
-        continue;
+
+        const pluginRecord = this.#matchActivePlugin(bridge, activePlugins);
+        const sidecarRecord = bridge.sidecarId
+          ? activeSidecars.get(bridge.sidecarId) ?? null
+          : null;
+
+        const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
+
+        if (!isEligible) {
+          if (this.#mounted.has(bridgeId)) {
+            this.#unmountBridge(bridgeId);
+          }
+          skippedIds.push(bridgeId);
+          this.#diagnostics.emit({
+            level: 'info',
+            code: 'BRIDGE_SKIPPED_INACTIVE',
+            source: 'core.orchestrator',
+            message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
+            detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
+          });
+          continue;
+        }
+
+        if (this.#mounted.has(bridgeId)) {
+          mountedIds.push(bridgeId);
+          continue;
+        }
+
+        try {
+          await bridge.mount({
+            frame: this.#activeFrame,
+            plugin: pluginRecord,
+            sidecar: sidecarRecord,
+            diagnostics: this.#diagnostics,
+          });
+          if (runEpoch !== this.#epoch || this.#store.isDisposed || !this.#bridges.has(bridgeId)) {
+            // Disposed or unregistered mid-mount: clean up immediately, never leave a zombie mount.
+            this.#safeDisposeBridge(bridgeId, bridge);
+            continue;
+          }
+          this.#mounted.set(bridgeId, bridge);
+          mountedIds.push(bridgeId);
+        } catch (err) {
+          this.#safeDisposeBridge(bridgeId, bridge);
+          this.#diagnostics.emit({
+            level: 'error',
+            code: 'BRIDGE_MOUNT_FAILED',
+            source: 'core.orchestrator',
+            message: `Failed to mount bridge "${bridgeId}"`,
+            detail: err,
+          });
+        }
       }
 
-      if (this.#mounted.has(bridgeId)) {
-        mountedIds.push(bridgeId);
-        continue;
-      }
-
-      try {
-        await bridge.mount({
-          frame: this.#activeFrame,
-          plugin: pluginRecord,
-          sidecar: sidecarRecord,
-          diagnostics: this.#diagnostics,
-        });
-        this.#mounted.set(bridgeId, bridge);
-        mountedIds.push(bridgeId);
-      } catch (err) {
-        this.#diagnostics.emit({
-          level: 'error',
-          code: 'BRIDGE_MOUNT_FAILED',
-          source: 'core.orchestrator',
-          message: `Failed to mount bridge "${bridgeId}"`,
-          detail: err,
-        });
-      }
-    }
-
-    return { mountedIds, skippedIds };
+      return { mountedIds, skippedIds };
+    });
   }
 
   getMountedBridgeIds() {
     return [...this.#mounted.keys()];
   }
 
-  #unmountBridge(bridgeId) {
-    const bridge = this.#mounted.get(bridgeId);
-    if (!bridge) {
-      return;
+  #matchActivePlugin(bridge, activePlugins) {
+    if (activePlugins.has(bridge.pluginName)) {
+      return activePlugins.get(bridge.pluginName);
     }
-    this.#mounted.delete(bridgeId);
+    if (Array.isArray(bridge.pluginAliases)) {
+      for (const alias of bridge.pluginAliases) {
+        if (typeof alias === 'string' && activePlugins.has(alias)) {
+          return activePlugins.get(alias);
+        }
+      }
+    }
+    return null;
+  }
+
+  #safeDisposeBridge(bridgeId, bridge) {
     try {
       bridge.dispose();
     } catch (err) {
@@ -177,6 +227,15 @@ export class RemoteOrchestrator {
     }
   }
 
+  #unmountBridge(bridgeId) {
+    const bridge = this.#mounted.get(bridgeId);
+    if (!bridge) {
+      return;
+    }
+    this.#mounted.delete(bridgeId);
+    this.#safeDisposeBridge(bridgeId, bridge);
+  }
+
   #unmountAll() {
     for (const bridgeId of [...this.#mounted.keys()].reverse()) {
       this.#unmountBridge(bridgeId);
@@ -184,9 +243,10 @@ export class RemoteOrchestrator {
   }
 
   dispose() {
+    this.#epoch += 1;
+    this.#started = false;
     this.#unmountAll();
     this.#store.dispose();
-    this.#started = false;
     this.#activeFrame = null;
   }
 }

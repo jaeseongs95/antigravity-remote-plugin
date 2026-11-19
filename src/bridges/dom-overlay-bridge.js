@@ -1,74 +1,62 @@
-import { DisposableStore } from '../core/lifecycle.js';
+import { AsyncMutex, DisposableStore } from '../core/lifecycle.js';
 import { SecurityPolicyError } from '../security/origin-policy.js';
+import { isSensitiveKey } from '../security/redactor.js';
 
-const ALLOWED_OVERLAY_SETTING_KEYS = Object.freeze([
-  'enabled',
-  'translateThinking',
-  'translateStaticUi',
-  'provider',
-  'customEndpoint',
-]);
-
-export function sanitizeRemoteOverlaySettings(
-  rawSettings,
-  { remoteFallbackProvider = 'remote-default', localOnlyProviders = ['local-llm'] } = {},
-) {
+export function stripSensitiveSettings(rawSettings) {
   const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
-  const sanitized = {
-    enabled: input.enabled !== false,
-    translateThinking: input.translateThinking !== false,
-    translateStaticUi: input.translateStaticUi !== false,
-    provider: typeof input.provider === 'string' && input.provider.trim()
-      ? input.provider.trim()
-      : remoteFallbackProvider,
-    customEndpoint: null,
-  };
-
-  if (typeof input.customEndpoint === 'string' && input.customEndpoint.trim()) {
-    try {
-      const parsed = new URL(input.customEndpoint.trim());
-      if (parsed.protocol === 'https:') {
-        sanitized.customEndpoint = parsed.toString();
-      }
-    } catch (_err) {
-      sanitized.customEndpoint = null;
+  const clean = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (isSensitiveKey(key) || typeof value === 'function') {
+      continue;
     }
+    clean[key] = value;
   }
-
-  if (localOnlyProviders.includes(sanitized.provider.toLowerCase())) {
-    sanitized.provider = sanitized.customEndpoint ? 'custom-https' : remoteFallbackProvider;
-  }
-
-  const locked = {};
-  for (const key of ALLOWED_OVERLAY_SETTING_KEYS) {
-    locked[key] = sanitized[key];
-  }
-  return Object.freeze(locked);
+  return Object.freeze(clean);
 }
 
 /**
- * Vendor-independent pure DOM overlay bridge.
+ * Vendor- and domain-independent pure DOM overlay bridge.
  * Enforces least privilege: passes ONLY `{ win, doc, settings, onStatus }` to
- * the overlay factory and guarantees deterministic `dispose()` on teardown.
+ * the overlay factory, serializes mount/dispose against races, and rolls back
+ * cleanly if `start()` fails.
  */
 export function createDomOverlayBridge({
   id,
   pluginName,
+  pluginAliases = [],
   createOverlay,
   settingsPort = null,
-  remoteFallbackProvider = 'remote-default',
+  sanitizeSettings = stripSensitiveSettings,
   onStatus = null,
 }) {
   if (typeof createOverlay !== 'function') {
     throw new TypeError('DomOverlayBridge requires a createOverlay factory function.');
   }
+  if (typeof sanitizeSettings !== 'function') {
+    throw new TypeError('DomOverlayBridge sanitizeSettings must be a function.');
+  }
 
+  const mutex = new AsyncMutex();
+  let mountEpoch = 0;
   let activeInstance = null;
   let store = null;
+
+  function teardownCurrent() {
+    if (store) {
+      const currentStore = store;
+      store = null;
+      currentStore.dispose();
+    } else if (activeInstance) {
+      const target = activeInstance;
+      activeInstance = null;
+      target.dispose();
+    }
+  }
 
   return {
     id,
     pluginName,
+    pluginAliases: [...pluginAliases],
     requireSidecar: false,
 
     async mount({ frame, diagnostics }) {
@@ -79,68 +67,86 @@ export function createDomOverlayBridge({
         );
       }
 
-      if (activeInstance) {
-        this.dispose();
-      }
+      const myEpoch = ++mountEpoch;
 
-      store = new DisposableStore({ diagnostics });
-      const rawSettings = settingsPort
-        ? await settingsPort.readPluginSettings(pluginName)
-        : {};
-      const safeSettings = sanitizeRemoteOverlaySettings(rawSettings, {
-        remoteFallbackProvider,
-      });
-
-      const statusCallback = (statusPayload) => {
-        if (typeof onStatus === 'function') {
-          onStatus(statusPayload);
+      return mutex.runExclusive(async () => {
+        if (myEpoch !== mountEpoch) {
+          return { skipped: true };
         }
-        if (diagnostics) {
-          diagnostics.emit({
-            level: 'info',
-            code: 'OVERLAY_STATUS',
-            source: `bridge.${id}`,
-            message: 'Overlay status updated',
-            detail: statusPayload,
-          });
+
+        teardownCurrent();
+
+        const rawSettings = settingsPort
+          ? await settingsPort.readPluginSettings(pluginName)
+          : {};
+
+        if (myEpoch !== mountEpoch) {
+          return { skipped: true };
         }
-      };
 
-      // Least-privilege invocation: zero RPC clients, zero CSRF/sidecar tokens.
-      const instance = createOverlay({
-        win: frame.win,
-        doc: frame.doc,
-        settings: safeSettings,
-        onStatus: statusCallback,
-      });
+        const safeSettings = Object.freeze({ ...sanitizeSettings(rawSettings) });
 
-      if (
-        !instance ||
-        typeof instance.start !== 'function' ||
-        typeof instance.dispose !== 'function'
-      ) {
-        throw new TypeError(
-          `Overlay factory for "${id}" must return { start(), dispose() }.`,
-        );
-      }
+        const statusCallback = (statusPayload) => {
+          if (typeof onStatus === 'function') {
+            onStatus(statusPayload);
+          }
+          if (diagnostics) {
+            diagnostics.emit({
+              level: 'info',
+              code: 'OVERLAY_STATUS',
+              source: `bridge.${id}`,
+              message: 'Overlay status updated',
+              detail: statusPayload,
+            });
+          }
+        };
 
-      activeInstance = instance;
-      store.add(() => {
-        if (activeInstance) {
-          const target = activeInstance;
-          activeInstance = null;
-          target.dispose();
+        // Least-privilege invocation: zero RPC clients, zero CSRF/sidecar tokens.
+        const instance = createOverlay({
+          win: frame.win,
+          doc: frame.doc,
+          settings: safeSettings,
+          onStatus: statusCallback,
+        });
+
+        if (
+          !instance ||
+          typeof instance.start !== 'function' ||
+          typeof instance.dispose !== 'function'
+        ) {
+          throw new TypeError(
+            `Overlay factory for "${id}" must return { start(), dispose() }.`,
+          );
         }
-      });
 
-      await instance.start();
-      return { settings: safeSettings };
+        const nextStore = new DisposableStore({ diagnostics });
+        activeInstance = instance;
+        store = nextStore;
+        nextStore.add(() => {
+          if (activeInstance === instance) {
+            activeInstance = null;
+          }
+          instance.dispose();
+        });
+
+        try {
+          await instance.start();
+        } catch (startErr) {
+          teardownCurrent();
+          throw startErr;
+        }
+
+        if (myEpoch !== mountEpoch) {
+          teardownCurrent();
+          return { skipped: true };
+        }
+
+        return { settings: safeSettings };
+      });
     },
 
     updateSettings(nextRawSettings) {
-      const safeNext = sanitizeRemoteOverlaySettings(nextRawSettings, {
-        remoteFallbackProvider,
-      });
+      const safeNext = Object.freeze({ ...sanitizeSettings(nextRawSettings) });
       if (activeInstance && typeof activeInstance.updateSettings === 'function') {
         activeInstance.updateSettings(safeNext);
       }
@@ -148,15 +154,8 @@ export function createDomOverlayBridge({
     },
 
     dispose() {
-      if (store) {
-        const currentStore = store;
-        store = null;
-        currentStore.dispose();
-      } else if (activeInstance) {
-        const target = activeInstance;
-        activeInstance = null;
-        target.dispose();
-      }
+      mountEpoch += 1;
+      teardownCurrent();
     },
   };
 }

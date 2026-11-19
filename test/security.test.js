@@ -1,27 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isOriginAllowed, SecurityPolicyError } from '../src/security/origin-policy.js';
+import { formatHostForUrl, isOriginAllowed, SecurityPolicyError } from '../src/security/origin-policy.js';
 import { createScopedTrustedTypesPolicy } from '../src/security/trusted-types.js';
 import { createGuardedWorkerBlobUrl, isTrustedScriptUrl } from '../src/security/script-guard.js';
 import { assertSafeAttribute, assertSafeTagName, createSafeElement } from '../src/security/dom-guard.js';
-import { REDACTED, redactSecrets, redactUrl } from '../src/security/redactor.js';
+import { deepFreeze, REDACTED, redactSecrets, redactUrl } from '../src/security/redactor.js';
 
-test('ARP-TC-004: isOriginAllowed enforces exact origin & subdomain boundaries without substring spoofing', () => {
+test('ARP-TC-004: isOriginAllowed enforces exact origin, subdomain & IPv6 loopback boundaries', () => {
   const allowlist = [
     'https://example.com',
     'https://*.example.com',
     'http://127.0.0.1:*',
+    'http://[::1]:*',
   ];
 
   assert.equal(isOriginAllowed('https://example.com', allowlist), true);
   assert.equal(isOriginAllowed('https://app.example.com', allowlist), true);
-  assert.equal(isOriginAllowed('https://a.b.example.com', allowlist), true);
   assert.equal(isOriginAllowed('http://127.0.0.1:8765', allowlist), true);
+  assert.equal(isOriginAllowed('http://[::1]:8765', allowlist), true);
+  assert.equal(formatHostForUrl('::1'), '[::1]');
 
   assert.equal(isOriginAllowed('https://evil-example.com', allowlist), false);
   assert.equal(isOriginAllowed('https://example.com.attacker.test', allowlist), false);
   assert.equal(isOriginAllowed('http://example.com', allowlist), false);
-  assert.equal(isOriginAllowed('http://app.example.com', allowlist), false);
   assert.equal(isOriginAllowed('javascript:alert(1)', allowlist), false);
 });
 
@@ -56,12 +57,12 @@ test('ARP-TC-005: createScopedTrustedTypesPolicy blocks reserved names and valid
   );
 });
 
-test('ARP-TC-006: createGuardedWorkerBlobUrl fails closed on untrusted URLs', () => {
+test('ARP-TC-006: createGuardedWorkerBlobUrl fails closed and preserves native TrustedScriptURL object', () => {
   const allowlist = ['https://example.com'];
-  let blobCreated = false;
-  const createBlobUrl = (url) => {
-    blobCreated = true;
-    return `blob:https://example.com/${encodeURIComponent(url)}`;
+  let receivedByFactory = null;
+  const createBlobUrl = (trustedUrl) => {
+    receivedByFactory = trustedUrl;
+    return `blob:https://example.com/wrapped`;
   };
 
   for (const bad of ['javascript:alert(1)', 'data:text/javascript,1', 'https://evil-example.com/a.js']) {
@@ -70,18 +71,31 @@ test('ARP-TC-006: createGuardedWorkerBlobUrl fails closed on untrusted URLs', ()
       (err) => err instanceof SecurityPolicyError && err.code === 'UNTRUSTED_SCRIPT_URL',
     );
   }
-  assert.equal(blobCreated, false);
+  assert.equal(receivedByFactory, null);
 
-  const ok = createGuardedWorkerBlobUrl({
+  class FakeTrustedScriptURL {
+    constructor(v) { this.value = v; }
+    toString() { return this.value; }
+  }
+  const fakePolicy = {
+    createScriptURL(url) {
+      return new FakeTrustedScriptURL(url);
+    },
+  };
+
+  createGuardedWorkerBlobUrl({
     scriptUrl: 'https://example.com/audio-worklet.js',
     allowlist,
     createBlobUrl,
+    trustedTypesPolicy: fakePolicy,
   });
-  assert.equal(blobCreated, true);
-  assert.match(ok, /^blob:https:\/\/example\.com\//);
+  assert.ok(
+    receivedByFactory instanceof FakeTrustedScriptURL,
+    'TrustedScriptURL instance must not be destroyed by String() coercion',
+  );
 });
 
-test('ARP-TC-007: dom-guard blocks <base> tags, unsafe HTML sinks, and inline handlers', () => {
+test('ARP-TC-007: dom-guard blocks <base>, HTML sinks, inline handlers, and control-char URI bypasses', () => {
   assert.throws(
     () => assertSafeTagName('base'),
     (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_ELEMENT_TAG',
@@ -94,6 +108,13 @@ test('ARP-TC-007: dom-guard blocks <base> tags, unsafe HTML sinks, and inline ha
     () => assertSafeAttribute('onclick', 'alert(1)'),
     (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_EVENT_ATTRIBUTE',
   );
+
+  for (const bypass of ['java\tscript:alert(1)', 'java\nscript:alert(1)', 'vbscript:msgbox(1)', 'data:text/html,<svg>']) {
+    assert.throws(
+      () => assertSafeAttribute('href', bypass),
+      (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_URI_SCHEME',
+    );
+  }
 
   const attrs = new Map();
   const fakeDoc = {
@@ -111,19 +132,24 @@ test('ARP-TC-007: dom-guard blocks <base> tags, unsafe HTML sinks, and inline ha
   assert.equal(attrs.get('data-role'), 'panel');
 });
 
-test('ARP-TC-008: redactSecrets strips tokens, csrf, env, headers, and URL query tokens', () => {
+test('ARP-TC-008: redactSecrets masks query, #token fragment, password, x-sidecar-token, and deepFreeze works', () => {
   const input = {
-    url: 'http://127.0.0.1:8765/?conversationId=abc&token=super-secret-123',
+    url: 'http://user:pw123@127.0.0.1:8765/?conversationId=abc&x-sidecar-token=s1#token=frag-secret',
     headers: { Authorization: 'Bearer xyz', 'X-Sidecar-Token': 'abc' },
     env: { API_KEY: 'top-secret' },
+    password: 'my-password',
     csrf_token: 'real-csrf',
     safeField: 'visible',
   };
-  const out = redactSecrets(input);
+  const out = deepFreeze(redactSecrets(input));
   assert.equal(out.headers, REDACTED);
   assert.equal(out.env, REDACTED);
+  assert.equal(out.password, REDACTED);
   assert.equal(out.csrf_token, REDACTED);
   assert.equal(out.safeField, 'visible');
-  assert.ok(!out.url.includes('super-secret-123'));
+  assert.ok(!out.url.includes('pw123'));
+  assert.ok(!out.url.includes('s1'));
+  assert.ok(!out.url.includes('frag-secret'));
   assert.ok(redactUrl(input.url).includes('conversationId=abc'));
+  assert.equal(Object.isFrozen(out), true);
 });

@@ -1,16 +1,21 @@
-import { isLoopbackHostname, SecurityPolicyError } from '../../security/origin-policy.js';
+import {
+  formatHostForUrl,
+  isLoopbackHostname,
+  SecurityPolicyError,
+} from '../../security/origin-policy.js';
 
 function assertLoopbackSidecar(sidecar) {
   if (!sidecar || typeof sidecar !== 'object') {
     throw new SecurityPolicyError('INVALID_SIDECAR', 'Sidecar descriptor is required.');
   }
-  const host = sidecar.host || '127.0.0.1';
-  if (!isLoopbackHostname(host)) {
+  const rawHost = sidecar.host || '127.0.0.1';
+  if (!isLoopbackHostname(rawHost)) {
     throw new SecurityPolicyError(
       'NON_LOOPBACK_SIDECAR',
-      'Sidecar relay only permits loopback (127.0.0.1 / localhost) sidecar servers.',
+      'Sidecar relay only permits loopback (127.0.0.1 / localhost / ::1) sidecar servers.',
     );
   }
+  const host = formatHostForUrl(rawHost);
   const port = Number(sidecar.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new SecurityPolicyError('INVALID_SIDECAR_PORT', 'Sidecar port must be a valid TCP port.');
@@ -24,14 +29,15 @@ export function createAntigravitySidecarAdapter({ fetchImpl = globalThis.fetch }
   }
 
   return {
+    /**
+     * Builds the loopback sidecar UI URL without embedding secrets in query parameters.
+     * Authentication tokens are sent strictly via the `X-Sidecar-Token` request header.
+     */
     buildUiUrl({ sidecar, conversationId = '' }) {
       const { host, port } = assertLoopbackSidecar(sidecar);
       const url = new URL(`http://${host}:${port}/`);
       if (conversationId) {
         url.searchParams.set('conversationId', String(conversationId));
-      }
-      if (sidecar.token) {
-        url.searchParams.set('token', String(sidecar.token));
       }
       return url.toString();
     },

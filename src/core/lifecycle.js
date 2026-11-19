@@ -84,8 +84,32 @@ export class DisposableStore {
 }
 
 /**
+ * Serializes async critical sections in FIFO order.
+ */
+export class AsyncMutex {
+  #tail = Promise.resolve();
+
+  async runExclusive(taskFn) {
+    if (typeof taskFn !== 'function') {
+      throw new TypeError('AsyncMutex taskFn must be a function.');
+    }
+    const prev = this.#tail;
+    let release;
+    this.#tail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      return await taskFn();
+    } finally {
+      release();
+    }
+  }
+}
+
+/**
  * Composable, arbitrary-order safe hook chain that preserves host guard semantics.
- * Removing any handler never breaks remaining handlers or the underlying host callback.
+ * Catches both synchronous throws and async promise rejections from handlers.
  */
 export class EventChain {
   #handlers = new Map();
@@ -125,8 +149,21 @@ export class EventChain {
     let invoked = 0;
     for (const { handler, label } of [...this.#handlers.values()]) {
       try {
-        handler(...args);
+        const result = handler(...args);
         invoked += 1;
+        if (result && typeof result.then === 'function') {
+          result.catch((err) => {
+            if (this.#diagnostics) {
+              this.#diagnostics.emit({
+                level: 'error',
+                code: 'EVENT_CHAIN_ASYNC_HANDLER_FAILED',
+                source: 'core.lifecycle',
+                message: `Async handler "${label}" rejected during dispatch`,
+                detail: err,
+              });
+            }
+          });
+        }
       } catch (err) {
         if (this.#diagnostics) {
           this.#diagnostics.emit({
