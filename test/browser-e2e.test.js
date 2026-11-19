@@ -574,6 +574,9 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
       // Idempotent second bookmarklet tap toggles drawer open without duplicating root
       if (sc.mode === 'bookmarklet') {
         await page.click('#run-bookmarklet');
+        await page.waitForFunction(() => window.antigravityRemoteHost?.renderer?.isOpen() === true, null, {
+          timeout: 5000,
+        });
         const bmCheck = await page.evaluate(() => ({
           hostCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
           reopened: window.antigravityRemoteHost.renderer.isOpen(),
