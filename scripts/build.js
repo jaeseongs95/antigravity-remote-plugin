@@ -20,12 +20,15 @@ const SOURCE_FILES = [
   'src/bridges/dom-overlay-bridge.js',
   'src/bridges/sidecar-ui-bridge.js',
   'src/bridges/mcp-extension-slot.js',
+  'src/bridges/remote-translator-engine.js',
   'src/adapters/antigravity/discovery-adapter.js',
   'src/adapters/antigravity/frame-adapter.js',
   'src/adapters/antigravity/sidecar-adapter.js',
   'src/adapters/antigravity/settings-adapter.js',
   'src/adapters/antigravity/theme-workspace-adapter.js',
+  'src/adapters/antigravity/remote-dock-ui.js',
   'src/runtime/bootstrap.js',
+  'src/runtime/remote-web-entry.js',
 ];
 
 function sha256(content) {
@@ -38,6 +41,24 @@ function resolveOutDir(argv) {
     return resolve(ROOT, argv[flagIdx + 1].trim());
   }
   return join(ROOT, 'dist');
+}
+
+function buildUserscriptHeader(version) {
+  return [
+    '// ==UserScript==',
+    '// @name         Antigravity Remote Companion',
+    '// @namespace    https://github.com/jaeseongs95/antigravity-remote-plugin',
+    `// @version      ${version}`,
+    '// @description  Cross-device (iOS/Android/Desktop) remote web companion for Antigravity ko-translator, statusbar, and mcp-manager.',
+    '// @author       jaeseongs95',
+    '// @match        https://antigravity.google.com/*',
+    '// @match        https://*.antigravity.google.com/*',
+    '// @grant        GM_xmlhttpRequest',
+    '// @connect      translate.googleapis.com',
+    '// @run-at       document-idle',
+    '// ==/UserScript==',
+    '',
+  ].join('\n');
 }
 
 async function runBuild() {
@@ -61,12 +82,16 @@ async function runBuild() {
     };
   });
 
+  // 1) Standalone ESM library bundle
   const virtualEntry = [
     `export const BUILD_VERSION = ${JSON.stringify(pkg.version)};`,
-    ...SOURCE_FILES.map((relPath) => `export * from './${relPath}';`),
+    ...SOURCE_FILES.filter((p) => p !== 'src/runtime/remote-web-entry.js').map(
+      (relPath) => `export * from './${relPath}';`,
+    ),
+    `export { mountAntigravityRemoteCompanion } from './src/runtime/remote-web-entry.js';`,
   ].join('\n');
 
-  const result = await esbuild({
+  const esmResult = await esbuild({
     stdin: {
       contents: virtualEntry,
       resolveDir: ROOT,
@@ -87,16 +112,44 @@ async function runBuild() {
     },
   });
 
-  const output = result.outputFiles?.[0];
-  if (!output) {
-    throw new Error('esbuild produced no output bundle.');
+  // 2) Cross-device Userscript (.user.js) IIFE bundle
+  const userscriptResult = await esbuild({
+    entryPoints: [join(ROOT, 'src/runtime/remote-web-entry.js')],
+    bundle: true,
+    format: 'iife',
+    platform: 'browser',
+    target: 'es2022',
+    write: false,
+    legalComments: 'none',
+  });
+
+  // 3) Self-contained minified Bookmarklet (bookmarklet.txt)
+  const bookmarkletResult = await esbuild({
+    entryPoints: [join(ROOT, 'src/runtime/remote-web-entry.js')],
+    bundle: true,
+    format: 'iife',
+    platform: 'browser',
+    target: 'es2022',
+    minify: true,
+    write: false,
+    legalComments: 'none',
+  });
+
+  const esmOut = esmResult.outputFiles?.[0];
+  const userscriptOut = userscriptResult.outputFiles?.[0];
+  const bookmarkletOut = bookmarkletResult.outputFiles?.[0];
+  if (!esmOut || !userscriptOut || !bookmarkletOut) {
+    throw new Error('esbuild failed to emit one or more required bundles.');
   }
 
-  const bundleSource = `${output.text.replace(/\r\n/g, '\n').trimEnd()}\n`;
-  mkdirSync(outDir, { recursive: true });
+  const bundleSource = `${esmOut.text.replace(/\r\n/g, '\n').trimEnd()}\n`;
+  const userscriptSource = `${buildUserscriptHeader(pkg.version)}${userscriptOut.text.replace(/\r\n/g, '\n').trimEnd()}\n`;
+  const bookmarkletSource = `javascript:${bookmarkletOut.text.replace(/\r\n/g, '\n').trim()}\n`;
 
-  const bundlePath = join(outDir, 'remote_bridge.js');
-  writeFileSync(bundlePath, bundleSource, 'utf8');
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, 'remote_bridge.js'), bundleSource, 'utf8');
+  writeFileSync(join(outDir, 'antigravity-remote.user.js'), userscriptSource, 'utf8');
+  writeFileSync(join(outDir, 'bookmarklet.txt'), bookmarkletSource, 'utf8');
 
   const manifest = {
     name: pkg.name,
@@ -104,15 +157,31 @@ async function runBuild() {
     bundler: 'esbuild',
     entry: 'dist/remote_bridge.js',
     entrySha256: sha256(bundleSource),
+    artifacts: {
+      esm: {
+        path: 'dist/remote_bridge.js',
+        sha256: sha256(bundleSource),
+        bytes: Buffer.byteLength(bundleSource, 'utf8'),
+      },
+      userscript: {
+        path: 'dist/antigravity-remote.user.js',
+        sha256: sha256(userscriptSource),
+        bytes: Buffer.byteLength(userscriptSource, 'utf8'),
+      },
+      bookmarklet: {
+        path: 'dist/bookmarklet.txt',
+        sha256: sha256(bookmarkletSource),
+        bytes: Buffer.byteLength(bookmarkletSource, 'utf8'),
+      },
+    },
     moduleCount: moduleEntries.length,
     modules: moduleEntries,
   };
 
-  const manifestPath = join(outDir, 'manifest.json');
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  writeFileSync(join(outDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
   console.log(
-    `[build] ${pkg.name} v${pkg.version} (esbuild): ${moduleEntries.length} modules -> dist/remote_bridge.js (${manifest.entrySha256.slice(0, 12)})`,
+    `[build] ${pkg.name} v${pkg.version} (esbuild): ${moduleEntries.length} modules -> remote_bridge.js (${manifest.entrySha256.slice(0, 12)}), antigravity-remote.user.js (${manifest.artifacts.userscript.sha256.slice(0, 12)}), bookmarklet.txt (${manifest.artifacts.bookmarklet.sha256.slice(0, 12)})`,
   );
 }
 

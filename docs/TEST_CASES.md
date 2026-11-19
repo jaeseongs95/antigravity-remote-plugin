@@ -1,14 +1,14 @@
-# Test Cases — antigravity-remote-plugin v1.1.0
+# Test Cases — antigravity-remote-plugin v2.0.0
 
-26 automated test cases (`ARP-TC-001` through `ARP-TC-026`) covering vendor independence, security invariants, concurrency safety, real loopback HTTP integration, `esbuild` standalone bundle execution, official Antigravity `sidecar_sdk` remote panel integration, and real Playwright Chromium Desktop + Mobile viewport E2E.
+26 automated test cases (`ARP-TC-001` through `ARP-TC-026`) covering vendor independence, security invariants, concurrency safety, real loopback HTTP integration, `esbuild` 3-artifact standalone/userscript/bookmarklet builds, remote DOM translator engine, and real Playwright Chromium Desktop + Mobile viewport E2E.
 
 ## 1. Architecture & Vendor-Independence Boundary (`test/architecture-boundary.test.js`)
 
 | ID | Case | Expected Oracle |
 |---|---|---|
 | ARP-TC-001 | Static scan of `src/core/`, `src/security/`, and `src/bridges/` for vendor literals, domain leakage, and reverse adapter->bridge imports | 0 matches across all files |
-| ARP-TC-002 | Static scan of entire `src/` and `sidecars/` for direct HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
-| ARP-TC-003 | Static scan of entire `src/` and `sidecars/` for forbidden legacy patterns and empty catch blocks (`catch {}`, `catch (e) {}`) | 0 matches across all files |
+| ARP-TC-002 | Static scan of entire `src/` for direct HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
+| ARP-TC-003 | Static scan of entire `src/` for forbidden legacy patterns and empty catch blocks (`catch {}`, `catch (e) {}`) | 0 matches across all files |
 
 ## 2. Security Invariants (`test/security.test.js`)
 
@@ -55,10 +55,10 @@
 | ARP-TC-022 | `test/integration-loopback.test.js`: real `node:http` loopback RPC & Sidecar servers tested against both `bootstrap.js` and standalone `dist/remote_bridge.js` | End-to-end mount, `X-Sidecar-Token` API relay, theme/workspace sync, and teardown pass |
 | ARP-TC-023 | `test/browser-e2e.test.js`: real Playwright Chromium enforcing `require-trusted-types-for 'script'` CSP verifying native `window.fetch` orchestrator, TrustedTypes reuse, Worker `blob:` execution, real iframe `load` + `postMessage` round-trip, and real cross-origin `DOMException` handling | Native `TrustedScriptURL` Worker returns `'worker-pong'`, sidecar iframe receives 2 messages after `load` and replies, cross-origin throws `CROSS_ORIGIN_IFRAME_DENIED` |
 
-## 7. v1.1.0 Trusted Library Bundler, Official Sidecar Backend & Mobile-First Responsive UI E2E
+## 7. v2.0.0 Multi-Target Build (Userscript + Bookmarklet), Remote DOM Translator Engine & Cross-Device E2E
 
 | ID | Case | Expected Oracle |
 |---|---|---|
-| ARP-TC-024 | `test/build.test.js`: verifies `esbuild`-bundled `dist/remote_bridge.js` determinism, version `1.1.0` sync, `bundler: "esbuild"` metadata in `dist/manifest.json`, and zero regex stripping regressions | Deterministic SHA-256 across repeated builds; `bundler === 'esbuild'`; standalone isolated `tmpdir` import exposes `BUILD_VERSION`, `bootstrapAntigravityRemoteBridge`, `RemoteOrchestrator` |
-| ARP-TC-025 | `test/sidecar-panel.test.js`: real `node:http` loopback LanguageServer (`GetAllPlugins`, `GetSidecars`) + `antigravity-statusbar` Sidecar tested via `createRemotePanelHandlers` (`GET /api/health`, `GET /api/state`, `POST /api/statusbar/telemetry`, `POST /api/statusbar/context-limit`, `POST /api/statusbar/compact`, `GET /api/mcp/summary`) and `sidecars/remote-panel/sidecar.json` schema validation | Secrets/tokens stripped from `/api/state` and `/api/mcp/summary`; statusbar telemetry/compact relayed via `X-Sidecar-Token`; `sidecar.json` declares `has_web_ui: true` and `SIDECAR_UI_ENTRYPOINT_AUX_PANE` |
-| ARP-TC-026 | `test/browser-e2e.test.js`: real Playwright Chromium E2E on both Desktop (`1280x800`) and Mobile (`390x844`, `hasTouch: true`, `isMobile: true`) viewports loading `sidecars/remote-panel/ui/*` under strict CSP (`default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'`) with real `preload.js` `theme-change`/`workspace-change` and `X-Sidecar-Token` header injection | 0 console/page/CSP errors; horizontal overflow `<= 0` on 390px mobile; primary interactive buttons meet `>= 44px` touch height; tab switch, telemetry refresh, compact action, error retry, and `theme-change` CSS variable sync all succeed |
+| ARP-TC-024 | `test/build.test.js`: verifies `esbuild` deterministic generation of `dist/remote_bridge.js`, `dist/antigravity-remote.user.js` (with `==UserScript==` metadata, `@match`, `@grant GM_xmlhttpRequest`), `dist/bookmarklet.txt` (`javascript:` prefix), and `dist/manifest.json` SHA-256 digests | Byte-for-byte deterministic across isolated `--out-dir` runs; all 3 artifact digests match `dist/manifest.json`; standalone ESM import exposes `BUILD_VERSION === '2.0.0'` |
+| ARP-TC-025 | `test/remote-translator.test.js`: verifies vendor-independent `createRemoteTranslatorEngine` against a real `node:http` translation endpoint — translates visible text nodes, excludes `pre`/`code`/`textarea`/`input`/`[contenteditable]`, preserves inline code/paths/URLs, blocks unsafe non-HTTPS endpoints, translates dynamically added nodes, and restores original text on disable/`dispose()` | All prose nodes translated via real HTTP; 0 code/input nodes mutated; original text 100% restored on OFF/`dispose()` |
+| ARP-TC-026 | `test/browser-e2e.test.js`: real Playwright Chromium E2E on both Desktop (`1280x800`) and Mobile (`390x844`, `hasTouch: true`, `isMobile: true`) injecting BOTH real `dist/antigravity-remote.user.js` and real `dist/bookmarklet.txt` into a mock Antigravity remote web page | Floating companion dock mounts with `>= 44px` touch target and `0px` horizontal overflow; 1-tap Korean translation translates real DOM prose while preserving `<code>`/`<pre>` and restores originals on OFF; Statusbar & MCP Manager buttons emit validated `toggle-aux-pane` messages; `Escape` closes popover and returns focus; 0 console/page errors |

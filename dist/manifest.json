@@ -1,10 +1,27 @@
 {
   "name": "antigravity-remote-plugin",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "bundler": "esbuild",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "23e9b9adf51bea6898421fec1fa91c87b9b50961b932af7d1535e30c06e23732",
-  "moduleCount": 18,
+  "entrySha256": "9b0d042d2c737b1999cb543990992fb19bcf426352c9fe5c0405f392fb47b7c2",
+  "artifacts": {
+    "esm": {
+      "path": "dist/remote_bridge.js",
+      "sha256": "9b0d042d2c737b1999cb543990992fb19bcf426352c9fe5c0405f392fb47b7c2",
+      "bytes": 97880
+    },
+    "userscript": {
+      "path": "dist/antigravity-remote.user.js",
+      "sha256": "a8da4c4903a532458e49a1b6136f3c5cff2cb8cf91db74eb706afcd66ec08604",
+      "bytes": 33404
+    },
+    "bookmarklet": {
+      "path": "dist/bookmarklet.txt",
+      "sha256": "e273d8c61a8077c125bfa7b4f0e9246876d1102a11cab10ab4acd2c52ac4eaef",
+      "bytes": 17160
+    }
+  },
+  "moduleCount": 21,
   "modules": [
     {
       "path": "src/security/redactor.js",
@@ -67,6 +84,11 @@
       "bytes": 5195
     },
     {
+      "path": "src/bridges/remote-translator-engine.js",
+      "sha256": "28c5c0fda649bdc7f5e7d120aeba174d4d11223791fb93119a942a32918f58b8",
+      "bytes": 9323
+    },
+    {
       "path": "src/adapters/antigravity/discovery-adapter.js",
       "sha256": "09f7756752f6d9a8868e6bda35e14e74006339725d79aa4afb376eb2520deb82",
       "bytes": 4610
@@ -92,9 +114,19 @@
       "bytes": 1427
     },
     {
+      "path": "src/adapters/antigravity/remote-dock-ui.js",
+      "sha256": "ebd92db3e9c2ca41030f657b3ff83acbae8049b864d7b68f3684edd2aa9a900c",
+      "bytes": 10545
+    },
+    {
       "path": "src/runtime/bootstrap.js",
       "sha256": "dcf032b4a5de137ec0ba0e82dee169e42fb706afc0e8c43fece8f2bc1b1c3f9d",
       "bytes": 4531
+    },
+    {
+      "path": "src/runtime/remote-web-entry.js",
+      "sha256": "d008444bf17ea629b49b505413d84359f6cc21babb22a6f5dfe1dc90d72a57aa",
+      "bytes": 6165
     }
   ]
 }

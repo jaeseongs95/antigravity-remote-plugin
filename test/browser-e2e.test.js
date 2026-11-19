@@ -5,7 +5,6 @@ import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
-import { createSidecarServer } from '../sidecars/remote-panel/server.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -58,93 +57,6 @@ function startHttpServer(handler) {
       resolveSrv({ server, port: server.address().port });
     });
   });
-}
-
-function readJsonBody(req) {
-  return new Promise((resolveBody) => {
-    let raw = '';
-    req.on('data', (chunk) => {
-      raw += chunk;
-    });
-    req.on('end', () => {
-      resolveBody(raw ? JSON.parse(raw) : {});
-    });
-  });
-}
-
-class E2EResponse {
-  constructor(body, { contentType = 'text/plain', status = 200, headers = {} } = {}) {
-    this.body = body;
-    this.contentType = contentType;
-    this.status = status;
-    this.headers = headers;
-  }
-}
-
-function createE2ESidecarAppClass({ token, preloadJs }) {
-  return class E2ESidecarApp {
-    #pages = new Map();
-    #apis = new Map();
-    #server = null;
-    port = 0;
-
-    page(path, handler) {
-      this.#pages.set(path, handler);
-    }
-
-    api(path, handler, method = 'POST') {
-      if (!this.#apis.has(path)) {
-        this.#apis.set(path, new Map());
-      }
-      this.#apis.get(path).set(method.toUpperCase(), handler);
-    }
-
-    async run() {
-      this.#pages.set('/preload.js', () => new E2EResponse(preloadJs, {
-        contentType: 'application/javascript; charset=utf-8',
-      }));
-      const server = createServer(async (req, res) => {
-        const url = new URL(req.url, 'http://127.0.0.1');
-        if (req.method !== 'GET' && token) {
-          const provided = req.headers['x-sidecar-token'] || url.searchParams.get('token');
-          if (provided !== token) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'unauthorized' }));
-            return;
-          }
-        }
-        if (req.method === 'GET' && this.#pages.has(url.pathname)) {
-          const out = await this.#pages.get(url.pathname)();
-          res.writeHead(out.status || 200, { 'Content-Type': out.contentType, ...(out.headers || {}) });
-          res.end(out.body);
-          return;
-        }
-        if (this.#apis.has(url.pathname) && this.#apis.get(url.pathname).has(req.method)) {
-          const body = req.method === 'GET' ? {} : await readJsonBody(req);
-          const out = await this.#apis.get(url.pathname).get(req.method)(body);
-          res.writeHead(out.status || 200, { 'Content-Type': out.contentType, ...(out.headers || {}) });
-          res.end(out.body);
-          return;
-        }
-        res.writeHead(404);
-        res.end('Not found');
-      });
-      await new Promise((res) => {
-        this.#server = server.listen(0, '127.0.0.1', () => {
-          this.port = server.address().port;
-          res();
-        });
-      });
-      return server;
-    }
-
-    async close() {
-      if (this.#server) {
-        await new Promise((res) => this.#server.close(res));
-        this.#server = null;
-      }
-    }
-  };
 }
 
 test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestrator, TrustedTypes reuse, Worker Blob, iframe load/postMessage/SOURCE_MISMATCH, same-origin ORIGIN_MISMATCH & promotion, dispose(), and cross-origin DOMException', async () => {
@@ -306,7 +218,6 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
             onSidecarEvent: (evt) => receivedInbound.push(evt),
           });
 
-          // F4-4: Second bootstrapAntigravityRemoteBridge reuses default policy 'antigravity-remote-bridge-v1' without TypeError.
           const runtimeSecond = bootstrapAntigravityRemoteBridge({
             lsAddress: '127.0.0.1:' + lsPort,
             csrfToken,
@@ -337,7 +248,6 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
           results.inboundType = receivedInbound[0]?.type || null;
           results.inboundReceivedCount = receivedInbound[0]?.payload?.receivedCount || 0;
 
-          // F4-1: Spoofed source postMessage must be blocked with SOURCE_MISMATCH.
           const spoofRes = runtime.bridges.statusbar.handleInboundMessage({
             origin: 'http://127.0.0.1:' + sidecarPort,
             source: window,
@@ -345,7 +255,6 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
           });
           results.spoofBlockedReason = spoofRes.reason;
 
-          // F4-2: Same-origin iframe ORIGIN_MISMATCH rejection and valid promotion.
           const sameIframe = document.createElement('iframe');
           sameIframe.src = hostOrigin + '/same-origin-frame';
           await new Promise((r) => {
@@ -376,7 +285,6 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
           }
           results.crossOriginErrorCode = crossErrorCode;
 
-          // F4-3: dispose() must tear down overlay (koOverlayStarted === false).
           runtime.orchestrator.dispose();
           results.koOverlayAfterDispose = koOverlayStarted;
 
@@ -440,148 +348,76 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
     await context.close();
   } finally {
     await browser.close();
+    hostSrv.server.closeAllConnections?.();
+    lsSrv.server.closeAllConnections?.();
+    sidecarSrv.server.closeAllConnections?.();
     await new Promise((r) => hostSrv.server.close(r));
     await new Promise((r) => lsSrv.server.close(r));
     await new Promise((r) => sidecarSrv.server.close(r));
   }
 });
 
-test('ARP-TC-026: Playwright Desktop & Mobile (390x844 touch) E2E via real server.mjs verifies CSP, all-tab overflow, 44px touch targets, initial workspaceUris, keyboard tabs, compact disabled guard, and retry', async () => {
-  const REAL_CSRF = 'e2e-real-server-csrf-1234';
-  const REAL_SIDECAR_TOKEN = 'e2e-statusbar-tok-9999';
-  const UI_TOKEN = 'pw-mobile-sidecar-token-7777';
+test('ARP-TC-026: Playwright Desktop & Mobile (390x844 touch) E2E injects real dist/antigravity-remote.user.js and dist/bookmarklet.txt to verify live DOM translation, code preservation, companion sidecar triggers, 44px touch targets, and 0 overflow', async () => {
+  const userscriptSource = readFileSync(join(ROOT, 'dist/antigravity-remote.user.js'), 'utf8');
+  const bookmarkletSource = readFileSync(join(ROOT, 'dist/bookmarklet.txt'), 'utf8').trim();
+  assert.ok(bookmarkletSource.startsWith('javascript:'));
+  const bookmarkletCode = bookmarkletSource.slice('javascript:'.length);
 
-  let statusbarRunning = true;
-  let disableStatusbarAfterCompact = false;
-  let failNextLs = false;
-  let compactCalls = 0;
-  const seenStateRequests = [];
-
-  const statusbarSrv = await startHttpServer(async (req, res) => {
-    if (req.headers['x-sidecar-token'] !== REAL_SIDECAR_TOKEN) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'unauthorized' }));
-      return;
-    }
-    await readJsonBody(req);
-    if (req.url === '/api/telemetry') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ usedTokens: 60000, maxTokenLimit: 200000 }));
-      return;
-    }
-    if (req.url === '/api/compact') {
-      compactCalls += 1;
-      if (disableStatusbarAfterCompact) {
-        statusbarRunning = false;
-        disableStatusbarAfterCompact = false;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ compacted: true }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+  const translateSrv = await startHttpServer((req, res) => {
+    const parsed = new URL(req.url, 'http://127.0.0.1');
+    const q = parsed.searchParams.get('q') || '';
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify([[[`[번역] ${q}`, q, null, null, 10]]]));
   });
 
-  const lsSrv = await startHttpServer(async (req, res) => {
-    if (req.headers['x-codeium-csrf-token'] !== REAL_CSRF) {
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'forbidden' }));
+  const remoteWebSrv = await startHttpServer((req, res) => {
+    if (req.url === '/favicon.ico') {
+      res.writeHead(204);
+      res.end();
       return;
     }
-    const body = await readJsonBody(req);
-    if (failNextLs) {
-      failNextLs = false;
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'temporary gateway error' }));
-      return;
-    }
-    if (req.url.endsWith('/GetAllPlugins')) {
-      seenStateRequests.push({
-        workspaceUris: body.workspaceUris || [],
-        contentType: req.headers['content-type'] || '',
-      });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        plugins: [
-          { name: 'antigravity-statusbar', path: '/plugins/antigravity-statusbar', disabled: false, isGlobal: true },
-          { name: 'antigravity-mcp-manager', path: '/plugins/antigravity-mcp-manager', disabled: false, isGlobal: true },
-        ],
-      }));
-      return;
-    }
-    if (req.url.endsWith('/GetSidecars')) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        sidecars: statusbarRunning
-          ? [{
-              sidecarId: 'antigravity-statusbar/statusbar',
-              pluginName: 'antigravity-statusbar',
-              host: '127.0.0.1',
-              port: statusbarSrv.port,
-              token: REAL_SIDECAR_TOKEN,
-              running: true,
-            }]
-          : [],
-      }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Antigravity Remote Mock</title>
+      </head>
+      <body style="margin:0;padding:16px;font-family:sans-serif;">
+        <main>
+          <p id="thought-1">Thinking about cross-device remote plugin architecture.</p>
+          <pre id="code-pre">npm run verify</pre>
+          <code id="code-inline">const untouched = 123;</code>
+          <textarea id="chat-input">User draft prompt</textarea>
+        </main>
+        <script>
+          window.__auxEvents = [];
+          window.addEventListener('message', (e) => {
+            if (e.data && e.data.type === 'toggle-aux-pane') {
+              window.__auxEvents.push(e.data.payload);
+            }
+          });
+        </script>
+      </body>
+      </html>`);
   });
-
-  const preloadShim = `
-    (function() {
-      const token = new URLSearchParams(window.location.search).get('token');
-      window.addEventListener('message', (event) => {
-        if (event.data && event.data.type === 'theme-change') {
-          for (const [k, v] of Object.entries(event.data.payload.cssVariables || {})) {
-            document.documentElement.style.setProperty(k, v);
-          }
-        }
-      });
-      window.sidecar = {
-        async getWorkspaceUris() {
-          return ['file:///initial-e2e-workspace'];
-        },
-        fetch(url, options = {}) {
-          const headers = new Headers(options.headers || {});
-          if (token) headers.set('X-Sidecar-Token', token);
-          window.__lastFetchContentType = headers.get('Content-Type') || '';
-          return fetch(url, { ...options, headers });
-        },
-        onWorkspaceChange() { return () => {}; }
-      };
-    })();
-  `;
-
-  const sidecarServer = await createSidecarServer({
-    SidecarAppClass: createE2ESidecarAppClass({ token: UI_TOKEN, preloadJs: preloadShim }),
-    ResponseClass: E2EResponse,
-    env: {
-      ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${lsSrv.port}`,
-      ANTIGRAVITY_CSRF_TOKEN: REAL_CSRF,
-    },
-  });
-  await sidecarServer.start();
 
   const browser = await launchChromium();
   try {
-    const profiles = [
-      { name: 'desktop', viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false },
-      { name: 'mobile', viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
+    const scenarios = [
+      { mode: 'userscript', viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false },
+      { mode: 'bookmarklet', viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
     ];
 
-    for (const profile of profiles) {
-      statusbarRunning = true;
-      disableStatusbarAfterCompact = false;
-      failNextLs = false;
-      seenStateRequests.length = 0;
-
+    for (const sc of scenarios) {
       const context = await browser.newContext({
-        viewport: profile.viewport,
-        isMobile: profile.isMobile,
-        hasTouch: profile.hasTouch,
+        viewport: sc.viewport,
+        isMobile: sc.isMobile,
+        hasTouch: sc.hasTouch,
       });
       const page = await context.newPage();
       const errors = [];
@@ -592,83 +428,86 @@ test('ARP-TC-026: Playwright Desktop & Mobile (390x844 touch) E2E via real serve
         }
       });
 
-      await page.goto(`http://127.0.0.1:${sidecarServer.app.port}/?token=${UI_TOKEN}`, { waitUntil: 'networkidle' });
-      await page.waitForFunction(
-        () => document.getElementById('connection-badge')?.dataset?.state === 'ok',
+      const remoteOrigin = `http://127.0.0.1:${remoteWebSrv.port}`;
+      await page.goto(`${remoteOrigin}/`, { waitUntil: 'networkidle' });
+
+      // Configure test origin allowlist & loopback mock translate endpoint.
+      await page.evaluate(
+        ({ origin, translatePort, withGm }) => {
+          window.__ARP_ALLOWED_ORIGINS__ = [origin];
+          window.__ARP_TRANSLATE_ENDPOINT__ = `http://127.0.0.1:${translatePort}/translate_a/single`;
+          if (withGm) {
+            window.GM_xmlhttpRequest = ({ url, onload, onerror }) => {
+              fetch(url)
+                .then(async (r) => onload({ status: r.status, responseText: await r.text() }))
+                .catch((err) => onerror(err));
+            };
+          }
+        },
+        { origin: remoteOrigin, translatePort: translateSrv.port, withGm: sc.mode === 'userscript' },
       );
 
-      // F2: Verify initial getWorkspaceUris() was sent on first load and Content-Type header was set.
-      assert.deepEqual(seenStateRequests[0]?.workspaceUris, ['file:///initial-e2e-workspace']);
-      const lastCt = await page.evaluate(() => window.__lastFetchContentType);
-      assert.equal(lastCt, 'application/json');
+      // Inject REAL built artifact (userscript or bookmarklet).
+      await page.addScriptTag({
+        content: sc.mode === 'userscript' ? userscriptSource : bookmarkletCode,
+      });
 
-      // NB3: Check horizontal overflow across ALL 3 tabs + >= 44px touch targets.
-      const checkOverflow = () =>
-        page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      // Wait for real DOM translation to finish.
+      await page.waitForFunction(
+        () => document.getElementById('thought-1')?.textContent?.startsWith('[번역]'),
+      );
 
-      assert.ok((await checkOverflow()) <= 0, `${profile.name}: overflow on statusbar tab`);
-      const minBtnHeight = await page.evaluate(() => {
-        const heights = ['#refresh-btn', '#compact-btn', '#tab-statusbar', '#tab-plugins', '#tab-diagnostics']
+      // Verify code blocks and inputs were NEVER mutated.
+      assert.equal(await page.textContent('#code-pre'), 'npm run verify');
+      assert.equal(await page.textContent('#code-inline'), 'const untouched = 123;');
+      assert.equal(await page.inputValue('#chat-input'), 'User draft prompt');
+
+      // Open dock popover & verify 44px touch targets + 0 horizontal overflow.
+      await page.click('#arp-dock-pill');
+      const metrics = await page.evaluate(() => {
+        const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+        const heights = ['#arp-dock-pill', '#arp-toggle-translate', '#arp-open-statusbar', '#arp-open-mcp']
           .map((sel) => document.querySelector(sel).getBoundingClientRect().height);
-        return Math.min(...heights);
+        return { overflow, minHeight: Math.min(...heights) };
       });
-      assert.ok(minBtnHeight >= 44, `${profile.name}: touch target height < 44px (${minBtnHeight}px)`);
+      assert.ok(metrics.overflow <= 0, `${sc.mode}: horizontal overflow (${metrics.overflow}px)`);
+      assert.ok(metrics.minHeight >= 44, `${sc.mode}: button height < 44px (${metrics.minHeight}px)`);
 
-      const summaryText = await page.textContent('#telemetry-summary');
-      assert.ok(summaryText.includes('60,000') && summaryText.includes('30%'));
-
-      // Verify theme-change CSS variable sync via preload.js.
-      await page.evaluate(() => {
-        window.postMessage({ type: 'theme-change', payload: { cssVariables: { '--background': 'rgb(18, 22, 28)' } } }, '*');
-      });
-      const appliedBg = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--background').trim());
-      assert.equal(appliedBg, 'rgb(18, 22, 28)');
-
-      // NB3: Keyboard ArrowRight tab navigation across Plugins & Diagnostics + overflow checks.
-      await page.focus('#tab-statusbar');
-      await page.keyboard.press('ArrowRight');
-      assert.equal(await page.getAttribute('#tab-plugins', 'aria-selected'), 'true');
-      assert.ok((await checkOverflow()) <= 0, `${profile.name}: overflow on plugins tab`);
-      assert.ok((await page.textContent('#plugins-list')).includes('antigravity-statusbar'));
-
-      await page.keyboard.press('ArrowRight');
-      assert.equal(await page.getAttribute('#tab-diagnostics', 'aria-selected'), 'true');
-      assert.ok((await checkOverflow()) <= 0, `${profile.name}: overflow on diagnostics tab`);
-      assert.ok((await page.textContent('#diagnostics-list')).includes('explicit-confirmation-required'));
-
-      await page.keyboard.press('ArrowRight');
-      assert.equal(await page.getAttribute('#tab-statusbar', 'aria-selected'), 'true');
-
-      // F2: Verify compact action keeps #compact-btn disabled when statusbar becomes inactive during post-compact refresh.
-      const beforeCompact = compactCalls;
-      disableStatusbarAfterCompact = true;
-      await page.click('#compact-btn');
-      await page.waitForFunction(
-        () => document.getElementById('telemetry-summary')?.textContent?.includes('비활성'),
+      // Toggle translation OFF -> original English prose restored immediately.
+      await page.click('#arp-toggle-translate');
+      assert.equal(
+        await page.textContent('#thought-1'),
+        'Thinking about cross-device remote plugin architecture.',
       );
-      assert.equal(compactCalls, beforeCompact + 1);
-      assert.equal(await page.isDisabled('#compact-btn'), true, `${profile.name}: compact-btn must stay disabled when statusbar becomes inactive`);
 
-      assert.deepEqual(errors, [], `${profile.name}: unexpected browser/CSP errors`);
+      // Trigger Statusbar & MCP Manager companion sidecars.
+      await page.click('#arp-open-statusbar');
+      await page.click('#arp-open-mcp');
+      await page.waitForFunction(() => window.__auxEvents.length === 2);
+      const auxEvents = await page.evaluate(() => window.__auxEvents);
+      assert.equal(auxEvents[0].sidecarId, 'antigravity-statusbar/statusbar');
+      assert.equal(auxEvents[1].sidecarId, 'antigravity-mcp-manager/mcp_manager');
 
-      // Verify error banner, #retry-btn >= 44px height, and retry recovery.
-      statusbarRunning = true;
-      failNextLs = true;
-      await page.click('#refresh-btn');
-      await page.waitForFunction(() => !document.getElementById('error-banner').hidden);
-      const retryHeight = await page.evaluate(() => document.getElementById('retry-btn').getBoundingClientRect().height);
-      assert.ok(retryHeight >= 44, `${profile.name}: retry-btn height < 44px (${retryHeight}px)`);
-      await page.click('#retry-btn');
-      await page.waitForFunction(() => document.getElementById('error-banner').hidden && document.getElementById('connection-badge')?.dataset?.state === 'ok');
+      // Escape closes popover and returns focus to pill button.
+      await page.keyboard.press('Escape');
+      assert.equal(await page.getAttribute('#arp-dock-pill', 'aria-expanded'), 'false');
 
-      const unexpectedAfterRetry = errors.filter((msg) => !msg.includes('status of 502'));
-      assert.deepEqual(unexpectedAfterRetry, [], `${profile.name}: unexpected errors during retry`);
+      // Repeated bookmarklet execution toggles popover idempotently (no duplicate root).
+      if (sc.mode === 'bookmarklet') {
+        await page.addScriptTag({ content: bookmarkletCode });
+        const rootCount = await page.evaluate(() => document.querySelectorAll('#arp-remote-dock-root-v2').length);
+        assert.equal(rootCount, 1);
+        assert.equal(await page.getAttribute('#arp-dock-pill', 'aria-expanded'), 'true');
+      }
+
+      assert.deepEqual(errors, [], `${sc.mode}: unexpected browser errors`);
       await context.close();
     }
   } finally {
     await browser.close();
-    await sidecarServer.close();
-    await new Promise((r) => lsSrv.server.close(r));
-    await new Promise((r) => statusbarSrv.server.close(r));
+    remoteWebSrv.server.closeAllConnections?.();
+    translateSrv.server.closeAllConnections?.();
+    await new Promise((r) => remoteWebSrv.server.close(r));
+    await new Promise((r) => translateSrv.server.close(r));
   }
 });

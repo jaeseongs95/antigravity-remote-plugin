@@ -2,33 +2,35 @@
 
 [한국어 문서 (Korean README)](./README.ko.md)
 
-**Version:** `1.1.0`
+**Version:** `2.0.0`
 
-`antigravity-remote-plugin` is a vendor-independent remote web bridge plugin designed to separate remote web control responsibilities from desktop-native Antigravity companion plugins (`antigravity-statusbar`, `antigravity-ko-translator`, and `antigravity-mcp-manager`).
+`antigravity-remote-plugin` is a vendor-independent, cross-device (**iOS Safari, Android Chrome/Firefox/Edge, and Desktop browsers**) remote web companion for Google Antigravity's official Remote Control web interface. It connects your remote browser session to the companion plugin ecosystem (`ko-thought-translator`, `antigravity-statusbar`, and `antigravity-mcp-manager`) without modifying `app.asar` or running custom tunnels.
+
+## Quick Start (All Devices)
+
+### Option 1 — Automatic Userscript (Recommended)
+Runs automatically whenever you open `https://antigravity.google.com/*`.
+- **iOS Safari**: Install the free **Userscripts** Safari extension and add `dist/antigravity-remote.user.js`.
+- **Android (Firefox / Edge / Kiwi)** & **Desktop (Chrome / Edge / Firefox / Safari)**: Install **Tampermonkey** or **Violentmonkey** and import `dist/antigravity-remote.user.js`.
+
+### Option 2 — Zero-Install Bookmarklet (iOS Safari, Android Chrome, Desktop)
+1. Copy the single-line `javascript:...` snippet from `dist/bookmarklet.txt`.
+2. Save it as a browser bookmark (e.g., `Antigravity Remote`).
+3. Open Antigravity Remote Control in your browser and tap the bookmark once to activate the floating companion dock (tap again to toggle the menu).
+
+## Features
+- **Live Remote Korean Translation (`ko-thought-translator`)**: Real-time DOM translation of visible prose and thinking blocks while strictly preserving `<code>`, `<pre>`, terminals, inputs, inline code, URLs, and file paths. Automatically blocks `local-llm` over remote web and uses `GM_xmlhttpRequest` (userscript) or `fetch` (bookmarklet). One-tap OFF immediately restores original text.
+- **Companion Sidecar Quick Actions (`antigravity-statusbar` & `antigravity-mcp-manager`)**: Connects to Antigravity's official `AUX_PANE` sidecar gateway (`antigravity-statusbar/statusbar`, `antigravity-mcp-manager/mcp_manager`) via validated `toggle-aux-pane` messages.
+- **Mobile-First Minimal Floating Dock**: Unobtrusive `44x44px` touch pill respecting `safe-area-inset`, `0px` horizontal overflow on `390px` mobile screens, automatic light/dark theme sync, `Escape` focus return, and zero `innerHTML`.
 
 ## Architecture
-
-The project follows a Hexagonal (Ports & Adapters) architecture with strict dependency boundaries:
-
-- `src/core/`: Vendor-independent orchestration (`RemoteOrchestrator`), deterministic lifecycle management (`DisposableStore`, `EventChain`, `SingleFlight`), port validators, and structured diagnostics (`DiagnosticsBus`).
-- `src/security/`: Vendor-independent security invariants — exact origin/subdomain allowlists (`origin-policy.js`), scoped TrustedTypes policy creation (`trusted-types.js`), Worker/AudioWorklet script URL guards (`script-guard.js`), safe DOM builder (`dom-guard.js`), and secret redaction (`redactor.js`).
-- `src/bridges/`: Standardized, host-agnostic extension bridges:
-  - `dom-overlay-bridge.js`: Least-privilege pure DOM lifecycle (`mount`/`updateSettings`/`dispose`) for overlays such as `antigravity-ko-translator`.
-  - `sidecar-ui-bridge.js`: Official `sidecar_sdk`-compatible UI and JSON API relay (`/api/telemetry`, `/api/context-limit`, `/api/compact`) and validated `postMessage` synchronization (`theme-change`, `workspace-change`) for sidecar plugins such as `antigravity-statusbar`.
-  - `mcp-extension-slot.js`: Decoupled optional extension slot for future remote MCP management with hard guards against unconfirmed remote `stdio` execution and protected config writes.
-- `src/adapters/antigravity/`: All Antigravity-specific Connect RPC (`GetAllPlugins`, `GetSidecars`), loopback sidecar relay (`X-Sidecar-Token`), remote frame promotion, settings sanitization, and server-side Sidecar panel handlers (`sidecar-host.js`).
-- `sidecars/remote-panel/`: Official Antigravity `sidecar_sdk` UI Extension (`sidecar.json`, `server.mjs`, and mobile-first responsive `ui/` under strict CSP). Runs on desktop Auxiliary Side Pane and on mobile browsers (`iOS Safari` / `Android Chrome`) through Antigravity's built-in per-sidecar remote gateway without browser extensions or custom tunnels.
-- `src/runtime/bootstrap.js`: Composition root wiring adapters and companion bridges.
-
-## Security & Compatibility Invariants
-
-- **Authoritative Discovery Only**: Plugin and sidecar activation is determined exclusively from host `GetAllPlugins` and `GetSidecars` responses. Legacy merged injection files and binary `app.asar` patching are permanently prohibited.
-- **CSP & TrustedTypes Compliance**: Zero HTML sink assignments (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`), zero `<base>` tag injection, and zero creation of reserved TrustedTypes policies (`default`, `dompurify`, `angular`).
-- **Least Privilege**: Pure DOM overlays never receive RPC clients, CSRF tokens, or sidecar tokens. Sensitive fields (`token`, `csrf`, `env`, `headers`) are redacted from diagnostics and previews.
-- **No Protobuf Mutation**: Host protobuf message objects are never mutated.
+- `src/core/`: Vendor-independent orchestration (`RemoteOrchestrator`), lifecycle (`DisposableStore`, `AsyncMutex`, `EventChain`, `SingleFlight`), port contracts, and diagnostics (`DiagnosticsBus`).
+- `src/security/`: Origin/subdomain allowlists, scoped TrustedTypes policies, Worker Blob guards, safe DOM creation, and secret redaction.
+- `src/bridges/`: Vendor-independent bridges (`dom-overlay-bridge.js`, `sidecar-ui-bridge.js`, `mcp-extension-slot.js`, `remote-translator-engine.js`).
+- `src/adapters/antigravity/`: Antigravity RPC, frame, sidecar, settings, theme/workspace, and floating companion dock (`remote-dock-ui.js`) adapters.
+- `src/runtime/`: Composition roots (`bootstrap.js`, `remote-web-entry.js`).
 
 ## Build & Verification
-
 Requires Node.js `>= 20.0.0`.
 
 ```bash
@@ -36,10 +38,10 @@ npm ci
 npm run verify
 ```
 
-This runs `scripts/build.js` (`esbuild`) to emit `dist/remote_bridge.js` and `dist/manifest.json`, then executes the full 26-case `node --test` suite (including Playwright Desktop + Mobile `390x844` E2E) documented in [docs/TEST_CASES.md](./docs/TEST_CASES.md).
+`scripts/build.js` (`esbuild`) emits `dist/remote_bridge.js`, `dist/antigravity-remote.user.js`, `dist/bookmarklet.txt`, and `dist/manifest.json`, then runs all 26 test cases (`ARP-TC-001`–`ARP-TC-026`) including Playwright Desktop + Mobile (`390x844` touch) E2E.
 
 ## Release Notes
-
+- [v2.0.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v2.0.0.md)
 - [v1.1.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.1.0.md)
 - [v1.0.1 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.0.1.md)
 - [v1.0.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.0.0.md)
