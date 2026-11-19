@@ -32,7 +32,16 @@ function sha256(content) {
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
+function resolveOutDir(argv) {
+  const flagIdx = argv.indexOf('--out-dir');
+  if (flagIdx !== -1 && typeof argv[flagIdx + 1] === 'string' && argv[flagIdx + 1].trim()) {
+    return resolve(ROOT, argv[flagIdx + 1].trim());
+  }
+  return join(ROOT, 'dist');
+}
+
 async function runBuild() {
+  const outDir = resolveOutDir(process.argv.slice(2));
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   const pluginManifest = JSON.parse(readFileSync(join(ROOT, 'plugin.json'), 'utf8'));
 
@@ -84,10 +93,9 @@ async function runBuild() {
   }
 
   const bundleSource = `${output.text.replace(/\r\n/g, '\n').trimEnd()}\n`;
-  const distDir = join(ROOT, 'dist');
-  mkdirSync(distDir, { recursive: true });
+  mkdirSync(outDir, { recursive: true });
 
-  const bundlePath = join(distDir, 'remote_bridge.js');
+  const bundlePath = join(outDir, 'remote_bridge.js');
   writeFileSync(bundlePath, bundleSource, 'utf8');
 
   const manifest = {
@@ -100,7 +108,7 @@ async function runBuild() {
     modules: moduleEntries,
   };
 
-  const manifestPath = join(distDir, 'manifest.json');
+  const manifestPath = join(outDir, 'manifest.json');
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
   console.log(
