@@ -1,37 +1,13 @@
 import { AsyncMutex, DisposableStore } from '../core/lifecycle.js';
 import { validateSettingsReadPort } from '../core/ports.js';
 import { SecurityPolicyError } from '../security/origin-policy.js';
-import { isSensitiveKey } from '../security/redactor.js';
+import { stripSensitiveDeep } from '../security/redactor.js';
 
-export function stripSensitiveSettings(rawSettings, depth = 0, seen = new WeakSet()) {
-  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+export function stripSensitiveSettings(rawSettings) {
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
     return Object.freeze({});
   }
-  const input = typeof rawSettings === 'object' ? rawSettings : {};
-  if (seen.has(input)) {
-    return Object.freeze({});
-  }
-  seen.add(input);
-  const clean = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (isSensitiveKey(key) || typeof value === 'function') {
-      continue;
-    }
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      clean[key] = stripSensitiveSettings(value, depth + 1, seen);
-    } else if (Array.isArray(value)) {
-      clean[key] = Object.freeze(
-        value.map((item) =>
-          item && typeof item === 'object' && !Array.isArray(item)
-            ? stripSensitiveSettings(item, depth + 1, seen)
-            : item,
-        ),
-      );
-    } else {
-      clean[key] = value;
-    }
-  }
-  return Object.freeze(clean);
+  return stripSensitiveDeep(rawSettings) || Object.freeze({});
 }
 
 /**
@@ -82,7 +58,7 @@ export function createDomOverlayBridge({
     pluginAliases: [...pluginAliases],
     requireSidecar: false,
 
-    async mount({ frame, diagnostics }) {
+    async mount({ frame, plugin = null, diagnostics }) {
       if (!frame || !frame.win || !frame.doc) {
         throw new SecurityPolicyError(
           'MISSING_PROMOTED_FRAME',
@@ -99,8 +75,9 @@ export function createDomOverlayBridge({
 
         teardownCurrent();
 
+        const resolvedPluginName = plugin?.name || pluginName;
         const rawSettings = settingsPort
-          ? await settingsPort.readPluginSettings(pluginName)
+          ? await settingsPort.readPluginSettings(resolvedPluginName)
           : {};
 
         if (myEpoch !== mountEpoch) {

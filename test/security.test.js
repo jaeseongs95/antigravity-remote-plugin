@@ -8,7 +8,7 @@ import {
   isTrustedWorkerOrScriptUrl,
 } from '../src/security/script-guard.js';
 import { assertSafeAttribute, assertSafeTagName, createSafeElement } from '../src/security/dom-guard.js';
-import { deepFreeze, REDACTED, redactSecrets, redactUrl } from '../src/security/redactor.js';
+import { deepFreeze, REDACTED, redactSecrets, redactUrl, stripSensitiveDeep } from '../src/security/redactor.js';
 
 test('ARP-TC-004: isOriginAllowed enforces exact origin, subdomain & IPv6 loopback boundaries', () => {
   const allowlist = [
@@ -183,4 +183,18 @@ test('ARP-TC-008: redactSecrets masks query, #token fragment, password, x-sideca
   assert.ok(!out.url.includes('frag-secret'));
   assert.ok(redactUrl(input.url).includes('conversationId=abc'));
   assert.equal(Object.isFrozen(out), true);
+
+  // stripSensitiveDeep: 2D arrays, function elements, and shared non-cyclic DAG refs.
+  const shared = { label: 'shared-ok', token: 'drop-me' };
+  const cleaned = stripSensitiveDeep({
+    refA: shared,
+    refB: shared,
+    matrix: [[{ secret: 'x', ok: 1 }, () => 'fn']],
+  });
+  assert.equal(cleaned.refA.label, 'shared-ok');
+  assert.equal(cleaned.refB.label, 'shared-ok');
+  assert.equal('token' in cleaned.refA, false);
+  assert.equal(cleaned.matrix[0].length, 1);
+  assert.equal(cleaned.matrix[0][0].ok, 1);
+  assert.equal('secret' in cleaned.matrix[0][0], false);
 });

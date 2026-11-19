@@ -1,4 +1,4 @@
-import { isSensitiveKey } from '../../security/redactor.js';
+import { stripSensitiveDeep } from '../../security/redactor.js';
 
 export const DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER = 'google-translate';
 
@@ -42,7 +42,8 @@ export function sanitizeTranslatorSettings(
     }
   }
 
-  if (sanitized.provider.toLowerCase() === 'local-llm') {
+  const lowerProvider = sanitized.provider.toLowerCase();
+  if (lowerProvider === 'local-llm' || (lowerProvider === 'custom-https' && !sanitized.customEndpoint)) {
     sanitized.provider = sanitized.customEndpoint ? 'custom-https' : remoteFallbackProvider;
   }
 
@@ -53,35 +54,11 @@ export function sanitizeTranslatorSettings(
   return Object.freeze(locked);
 }
 
-function sanitizeGenericSettings(rawSettings, depth = 0, seen = new WeakSet()) {
-  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+function sanitizeGenericSettings(rawSettings) {
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
     return Object.freeze({});
   }
-  const input = typeof rawSettings === 'object' ? rawSettings : {};
-  if (seen.has(input)) {
-    return Object.freeze({});
-  }
-  seen.add(input);
-  const clean = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (isSensitiveKey(key) || typeof value === 'function') {
-      continue;
-    }
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      clean[key] = sanitizeGenericSettings(value, depth + 1, seen);
-    } else if (Array.isArray(value)) {
-      clean[key] = Object.freeze(
-        value.map((item) =>
-          item && typeof item === 'object' && !Array.isArray(item)
-            ? sanitizeGenericSettings(item, depth + 1, seen)
-            : item,
-        ),
-      );
-    } else {
-      clean[key] = value;
-    }
-  }
-  return Object.freeze(clean);
+  return stripSensitiveDeep(rawSettings) || Object.freeze({});
 }
 
 export function createAntigravitySettingsAdapter({

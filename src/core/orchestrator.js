@@ -104,7 +104,7 @@ export class RemoteOrchestrator {
       const startEpoch = this.#epoch;
       const frame = await this.#framePort.acquireActiveFrame();
       if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
+        return { mountedIds: [], skippedIds: [], failedIds: [] };
       }
 
       this.#activeFrame = frame;
@@ -139,16 +139,17 @@ export class RemoteOrchestrator {
 
   async #reconcileLocked(runEpoch, context) {
     if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
+      return { mountedIds: [], skippedIds: [], failedIds: [] };
     }
 
     const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
     if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
+      return { mountedIds: [], skippedIds: [], failedIds: [] };
     }
 
     const mountedIds = [];
     const skippedIds = [];
+    const failedIds = [];
 
     for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
       if (runEpoch !== this.#epoch || this.#store.isDisposed) {
@@ -204,6 +205,7 @@ export class RemoteOrchestrator {
         mountedIds.push(bridgeId);
       } catch (err) {
         this.#safeDisposeBridge(bridgeId, bridge);
+        failedIds.push(bridgeId);
         this.#diagnostics.emit({
           level: 'error',
           code: 'BRIDGE_MOUNT_FAILED',
@@ -214,7 +216,7 @@ export class RemoteOrchestrator {
       }
     }
 
-    return { mountedIds, skippedIds };
+    return { mountedIds, skippedIds, failedIds };
   }
 
   getMountedBridgeIds() {

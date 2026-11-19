@@ -123,6 +123,48 @@ export function redactSecrets(value, depth = 0, seen = new WeakSet()) {
   return out;
 }
 
+export function stripSensitiveDeep(value, depth = 0, seen = new WeakSet()) {
+  if (depth > 8 || value === null || value === undefined || typeof value === 'function') {
+    return undefined;
+  }
+  if (typeof value !== 'object') {
+    return value;
+  }
+  if (seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const arr = [];
+      for (const item of value) {
+        if (typeof item === 'function') {
+          continue;
+        }
+        const cleaned = stripSensitiveDeep(item, depth + 1, seen);
+        if (cleaned !== undefined || item === null) {
+          arr.push(cleaned === undefined ? null : cleaned);
+        }
+      }
+      return Object.freeze(arr);
+    }
+
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (isSensitiveKey(k) || typeof v === 'function') {
+        continue;
+      }
+      const cleaned = stripSensitiveDeep(v, depth + 1, seen);
+      if (cleaned !== undefined || v === null) {
+        out[k] = cleaned === undefined ? null : cleaned;
+      }
+    }
+    return Object.freeze(out);
+  } finally {
+    seen.delete(value);
+  }
+}
+
 export function deepFreeze(value, seen = new WeakSet()) {
   if (value === null || typeof value !== 'object' || seen.has(value)) {
     return value;
@@ -998,7 +1040,7 @@ export class RemoteOrchestrator {
       const startEpoch = this.#epoch;
       const frame = await this.#framePort.acquireActiveFrame();
       if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
+        return { mountedIds: [], skippedIds: [], failedIds: [] };
       }
 
       this.#activeFrame = frame;
@@ -1033,16 +1075,17 @@ export class RemoteOrchestrator {
 
   async #reconcileLocked(runEpoch, context) {
     if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
+      return { mountedIds: [], skippedIds: [], failedIds: [] };
     }
 
     const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
     if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
+      return { mountedIds: [], skippedIds: [], failedIds: [] };
     }
 
     const mountedIds = [];
     const skippedIds = [];
+    const failedIds = [];
 
     for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
       if (runEpoch !== this.#epoch || this.#store.isDisposed) {
@@ -1098,6 +1141,7 @@ export class RemoteOrchestrator {
         mountedIds.push(bridgeId);
       } catch (err) {
         this.#safeDisposeBridge(bridgeId, bridge);
+        failedIds.push(bridgeId);
         this.#diagnostics.emit({
           level: 'error',
           code: 'BRIDGE_MOUNT_FAILED',
@@ -1108,7 +1152,7 @@ export class RemoteOrchestrator {
       }
     }
 
-    return { mountedIds, skippedIds };
+    return { mountedIds, skippedIds, failedIds };
   }
 
   getMountedBridgeIds() {
@@ -1169,35 +1213,11 @@ export class RemoteOrchestrator {
 }
 
 // --- module: src/bridges/dom-overlay-bridge.js ---
-export function stripSensitiveSettings(rawSettings, depth = 0, seen = new WeakSet()) {
-  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+export function stripSensitiveSettings(rawSettings) {
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
     return Object.freeze({});
   }
-  const input = typeof rawSettings === 'object' ? rawSettings : {};
-  if (seen.has(input)) {
-    return Object.freeze({});
-  }
-  seen.add(input);
-  const clean = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (isSensitiveKey(key) || typeof value === 'function') {
-      continue;
-    }
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      clean[key] = stripSensitiveSettings(value, depth + 1, seen);
-    } else if (Array.isArray(value)) {
-      clean[key] = Object.freeze(
-        value.map((item) =>
-          item && typeof item === 'object' && !Array.isArray(item)
-            ? stripSensitiveSettings(item, depth + 1, seen)
-            : item,
-        ),
-      );
-    } else {
-      clean[key] = value;
-    }
-  }
-  return Object.freeze(clean);
+  return stripSensitiveDeep(rawSettings) || Object.freeze({});
 }
 
 /**
@@ -1248,7 +1268,7 @@ export function createDomOverlayBridge({
     pluginAliases: [...pluginAliases],
     requireSidecar: false,
 
-    async mount({ frame, diagnostics }) {
+    async mount({ frame, plugin = null, diagnostics }) {
       if (!frame || !frame.win || !frame.doc) {
         throw new SecurityPolicyError(
           'MISSING_PROMOTED_FRAME',
@@ -1265,8 +1285,9 @@ export function createDomOverlayBridge({
 
         teardownCurrent();
 
+        const resolvedPluginName = plugin?.name || pluginName;
         const rawSettings = settingsPort
-          ? await settingsPort.readPluginSettings(pluginName)
+          ? await settingsPort.readPluginSettings(resolvedPluginName)
           : {};
 
         if (myEpoch !== mountEpoch) {
@@ -2015,8 +2036,9 @@ export function createAntigravityFrameAdapter({
     validateScriptUrl: (url) => isTrustedWorkerOrScriptUrl(url, allowedOrigins),
   });
 
+  const guardFn = typeof hostLoadGuard === 'function' ? hostLoadGuard : null;
   const frameChain = new EventChain({
-    hostGuard: hostLoadGuard,
+    hostGuard: null,
     diagnostics,
   });
 
@@ -2024,6 +2046,14 @@ export function createAntigravityFrameAdapter({
   if (initialFrame !== null) {
     assertValidFrame(initialFrame, allowedOrigins, 'initial remote frame');
     currentFrame = initialFrame;
+  }
+
+  function applyAndDispatchFrame(nextFrame) {
+    if (guardFn && guardFn(nextFrame) === false) {
+      return { allowed: false, invoked: 0 };
+    }
+    currentFrame = nextFrame;
+    return frameChain.dispatch(nextFrame);
   }
 
   return {
@@ -2044,8 +2074,7 @@ export function createAntigravityFrameAdapter({
       if (nextFrame !== null) {
         assertValidFrame(nextFrame, allowedOrigins, 'promoted frame');
       }
-      currentFrame = nextFrame;
-      return frameChain.dispatch(nextFrame);
+      return applyAndDispatchFrame(nextFrame);
     },
 
     /**
@@ -2108,9 +2137,8 @@ export function createAntigravityFrameAdapter({
         iframeEl,
         conversationId,
       };
-      currentFrame = promoted;
-      frameChain.dispatch(promoted);
-      return promoted;
+      const dispatchResult = applyAndDispatchFrame(promoted);
+      return dispatchResult.allowed ? promoted : null;
     },
 
     createSafeWorkerBlobUrl({ scriptUrl, createBlobUrl }) {
@@ -2232,7 +2260,8 @@ export function sanitizeTranslatorSettings(
     }
   }
 
-  if (sanitized.provider.toLowerCase() === 'local-llm') {
+  const lowerProvider = sanitized.provider.toLowerCase();
+  if (lowerProvider === 'local-llm' || (lowerProvider === 'custom-https' && !sanitized.customEndpoint)) {
     sanitized.provider = sanitized.customEndpoint ? 'custom-https' : remoteFallbackProvider;
   }
 
@@ -2243,35 +2272,11 @@ export function sanitizeTranslatorSettings(
   return Object.freeze(locked);
 }
 
-function sanitizeGenericSettings(rawSettings, depth = 0, seen = new WeakSet()) {
-  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+function sanitizeGenericSettings(rawSettings) {
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
     return Object.freeze({});
   }
-  const input = typeof rawSettings === 'object' ? rawSettings : {};
-  if (seen.has(input)) {
-    return Object.freeze({});
-  }
-  seen.add(input);
-  const clean = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (isSensitiveKey(key) || typeof value === 'function') {
-      continue;
-    }
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      clean[key] = sanitizeGenericSettings(value, depth + 1, seen);
-    } else if (Array.isArray(value)) {
-      clean[key] = Object.freeze(
-        value.map((item) =>
-          item && typeof item === 'object' && !Array.isArray(item)
-            ? sanitizeGenericSettings(item, depth + 1, seen)
-            : item,
-        ),
-      );
-    } else {
-      clean[key] = value;
-    }
-  }
-  return Object.freeze(clean);
+  return stripSensitiveDeep(rawSettings) || Object.freeze({});
 }
 
 export function createAntigravitySettingsAdapter({
@@ -2359,10 +2364,12 @@ export const ANTIGRAVITY_SIDECAR_INBOUND_EVENTS = Object.freeze([
   'request-credential-refresh',
 ]);
 
-const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
+export const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
   /(?:^|\/)\.gemini\/config\/config\.json$/i,
+  /(?:^|\/)\.gemini\/config\/mcp_config\.json$/i,
   /(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i,
   /(?:^|\/)\.gemini\/config\/plugins\/[^/]+\/mcp_config\.json$/i,
+  /(?:^|\/)\.gemini\/config\/plugins\/[^/]+\/config\.json$/i,
 ]);
 
 export function bootstrapAntigravityRemoteBridge({

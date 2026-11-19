@@ -42,8 +42,9 @@ export function createAntigravityFrameAdapter({
     validateScriptUrl: (url) => isTrustedWorkerOrScriptUrl(url, allowedOrigins),
   });
 
+  const guardFn = typeof hostLoadGuard === 'function' ? hostLoadGuard : null;
   const frameChain = new EventChain({
-    hostGuard: hostLoadGuard,
+    hostGuard: null,
     diagnostics,
   });
 
@@ -51,6 +52,14 @@ export function createAntigravityFrameAdapter({
   if (initialFrame !== null) {
     assertValidFrame(initialFrame, allowedOrigins, 'initial remote frame');
     currentFrame = initialFrame;
+  }
+
+  function applyAndDispatchFrame(nextFrame) {
+    if (guardFn && guardFn(nextFrame) === false) {
+      return { allowed: false, invoked: 0 };
+    }
+    currentFrame = nextFrame;
+    return frameChain.dispatch(nextFrame);
   }
 
   return {
@@ -71,8 +80,7 @@ export function createAntigravityFrameAdapter({
       if (nextFrame !== null) {
         assertValidFrame(nextFrame, allowedOrigins, 'promoted frame');
       }
-      currentFrame = nextFrame;
-      return frameChain.dispatch(nextFrame);
+      return applyAndDispatchFrame(nextFrame);
     },
 
     /**
@@ -135,9 +143,8 @@ export function createAntigravityFrameAdapter({
         iframeEl,
         conversationId,
       };
-      currentFrame = promoted;
-      frameChain.dispatch(promoted);
-      return promoted;
+      const dispatchResult = applyAndDispatchFrame(promoted);
+      return dispatchResult.allowed ? promoted : null;
     },
 
     createSafeWorkerBlobUrl({ scriptUrl, createBlobUrl }) {

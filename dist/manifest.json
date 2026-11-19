@@ -2,13 +2,13 @@
   "name": "antigravity-remote-plugin",
   "version": "1.0.0",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "a8a224efea3bd9a9363066f23d467170740713a5c30a77ba3e224808d7e60cf8",
+  "entrySha256": "c7c5f58043f0fbbb2584999908c7e5185953e53872257e8b930716c0f99ee218",
   "moduleCount": 18,
   "modules": [
     {
       "path": "src/security/redactor.js",
-      "sha256": "d8409a4f834863452c37ba1e8fadae28c901d33914d7a6bb9bd67423877742d6",
-      "bytes": 3346
+      "sha256": "f2d7232c399fb31caaf10398068c9bd7da2d3b8de131552a83775d88575bb4d2",
+      "bytes": 4486
     },
     {
       "path": "src/security/origin-policy.js",
@@ -47,13 +47,13 @@
     },
     {
       "path": "src/core/orchestrator.js",
-      "sha256": "136b2138711a4c641088cde5aa2adaa9bce878ae61364701c70f9ee0680cf831",
-      "bytes": 8461
+      "sha256": "143ecd3606950095ea3ca6dbd6219ddc345e2c21cb22e63b9864c8d8386073c7",
+      "bytes": 8577
     },
     {
       "path": "src/bridges/dom-overlay-bridge.js",
-      "sha256": "c33c2d47df2380cda0506be431e349bb0c46b543734e93776ee2a0e0d6696352",
-      "bytes": 5240
+      "sha256": "5ebe27a55e4f7f6fe174772eca52a8250c2e440534317fc7d3c833945eb96677",
+      "bytes": 4585
     },
     {
       "path": "src/bridges/sidecar-ui-bridge.js",
@@ -72,8 +72,8 @@
     },
     {
       "path": "src/adapters/antigravity/frame-adapter.js",
-      "sha256": "f09294fd1f9e0f24727cb6103a0732f56d7f4bfe4279b9b1147b2c3f3762bf28",
-      "bytes": 4705
+      "sha256": "4fc1260048a27d8c021fae0473c22386dae030e631b4142c55cf0640313ccaa1",
+      "bytes": 4996
     },
     {
       "path": "src/adapters/antigravity/sidecar-adapter.js",
@@ -82,8 +82,8 @@
     },
     {
       "path": "src/adapters/antigravity/settings-adapter.js",
-      "sha256": "992a8c7200bbe6717f2ee699e2d2b1b12f367d4091dd2a4c04a94213a1946dce",
-      "bytes": 3265
+      "sha256": "c99e57518e35e100dd7ba6c7c032d572b94b08cdebabccb991f481d007649e0e",
+      "bytes": 2628
     },
     {
       "path": "src/adapters/antigravity/theme-workspace-adapter.js",
@@ -92,8 +92,8 @@
     },
     {
       "path": "src/runtime/bootstrap.js",
-      "sha256": "46bdec2dfcd2f629976c56b11563a60f4dd0574d13c91df523941389f7879837",
-      "bytes": 4412
+      "sha256": "dcf032b4a5de137ec0ba0e82dee169e42fb706afc0e8c43fece8f2bc1b1c3f9d",
+      "bytes": 4531
     }
   ]
 }

@@ -30,10 +30,12 @@ export const ANTIGRAVITY_SIDECAR_INBOUND_EVENTS = Object.freeze([
   'request-credential-refresh',
 ]);
 
-const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
+export const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
   /(?:^|\/)\.gemini\/config\/config\.json$/i,
+  /(?:^|\/)\.gemini\/config\/mcp_config\.json$/i,
   /(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i,
   /(?:^|\/)\.gemini\/config\/plugins\/[^/]+\/mcp_config\.json$/i,
+  /(?:^|\/)\.gemini\/config\/plugins\/[^/]+\/config\.json$/i,
 ]);
 
 export function bootstrapAntigravityRemoteBridge({

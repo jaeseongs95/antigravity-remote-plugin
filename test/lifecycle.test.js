@@ -122,7 +122,18 @@ test('ARP-TC-012: RemoteOrchestrator mounts only active plugins and disposes cle
   const result = await orchestrator.start();
   assert.deepEqual(result.mountedIds, ['b-active']);
   assert.deepEqual(result.skippedIds, ['b-disabled', 'b-missing']);
+  assert.deepEqual(result.failedIds, []);
   assert.deepEqual(mounted, ['b-active']);
+
+  // Failing bridge mount must be reported in failedIds.
+  orchestrator.registerBridge({
+    id: 'b-failing',
+    pluginName: 'active-overlay',
+    async mount() { throw new Error('boom'); },
+    dispose() {},
+  });
+  const failRes = await orchestrator.reconcile();
+  assert.deepEqual(failRes.failedIds, ['b-failing']);
 
   orchestrator.dispose();
   assert.deepEqual(disposed, ['b-active']);

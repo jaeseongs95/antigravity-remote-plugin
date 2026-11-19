@@ -118,6 +118,48 @@ export function redactSecrets(value, depth = 0, seen = new WeakSet()) {
   return out;
 }
 
+export function stripSensitiveDeep(value, depth = 0, seen = new WeakSet()) {
+  if (depth > 8 || value === null || value === undefined || typeof value === 'function') {
+    return undefined;
+  }
+  if (typeof value !== 'object') {
+    return value;
+  }
+  if (seen.has(value)) {
+    return undefined;
+  }
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const arr = [];
+      for (const item of value) {
+        if (typeof item === 'function') {
+          continue;
+        }
+        const cleaned = stripSensitiveDeep(item, depth + 1, seen);
+        if (cleaned !== undefined || item === null) {
+          arr.push(cleaned === undefined ? null : cleaned);
+        }
+      }
+      return Object.freeze(arr);
+    }
+
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (isSensitiveKey(k) || typeof v === 'function') {
+        continue;
+      }
+      const cleaned = stripSensitiveDeep(v, depth + 1, seen);
+      if (cleaned !== undefined || v === null) {
+        out[k] = cleaned === undefined ? null : cleaned;
+      }
+    }
+    return Object.freeze(out);
+  } finally {
+    seen.delete(value);
+  }
+}
+
 export function deepFreeze(value, seen = new WeakSet()) {
   if (value === null || typeof value !== 'object' || seen.has(value)) {
     return value;

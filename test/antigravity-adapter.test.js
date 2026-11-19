@@ -96,6 +96,15 @@ test('ARP-TC-018: AntigravitySettingsAdapter applies translator fallback and gen
   assert.equal(safeTranslator.provider, 'google-translate');
   assert.equal(safeTranslator.customEndpoint, null);
 
+  // custom-https with missing/invalid customEndpoint must fall back to google-translate.
+  const customMissingAdapter = createAntigravitySettingsAdapter({
+    async readSettingsFile() {
+      return { provider: 'custom-https', customEndpoint: null };
+    },
+  });
+  const safeCustomFallback = await customMissingAdapter.readPluginSettings('antigravity-ko-translator');
+  assert.equal(safeCustomFallback.provider, 'google-translate');
+
   const safeOther = await adapter.readPluginSettings('antigravity-statusbar');
   assert.equal(safeOther.refreshMs, 1000);
   assert.equal('api_key' in safeOther, false);
@@ -145,4 +154,16 @@ test('ARP-TC-021: AntigravityFrameAdapter translates cross-origin DOMException a
 
   const acquired = await adapter.acquireActiveFrame();
   assert.equal(acquired, promoted);
+
+  // hostLoadGuard returning false must NOT overwrite currentFrame.
+  let allowLoad = true;
+  const guardedAdapter = createAntigravityFrameAdapter({
+    hostLoadGuard: () => allowLoad,
+  });
+  const firstFrame = { win: { id: 1 }, doc: {}, origin: 'https://antigravity.google.com' };
+  const secondFrame = { win: { id: 2 }, doc: {}, origin: 'https://antigravity.google.com' };
+  assert.equal(guardedAdapter.notifyFramePromoted(firstFrame).allowed, true);
+  allowLoad = false;
+  assert.equal(guardedAdapter.notifyFramePromoted(secondFrame).allowed, false);
+  assert.equal(await guardedAdapter.acquireActiveFrame(), firstFrame);
 });

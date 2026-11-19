@@ -7,6 +7,7 @@ import { createMcpExtensionSlot } from '../src/bridges/mcp-extension-slot.js';
 import { sanitizeTranslatorSettings } from '../src/adapters/antigravity/settings-adapter.js';
 import { createAntigravityThemeWorkspaceAdapter } from '../src/adapters/antigravity/theme-workspace-adapter.js';
 import {
+  ANTIGRAVITY_PROTECTED_MCP_PATHS,
   ANTIGRAVITY_SIDECAR_INBOUND_EVENTS,
   ANTIGRAVITY_STATUSBAR_API_PATHS,
 } from '../src/runtime/bootstrap.js';
@@ -29,12 +30,15 @@ test('ARP-TC-013: DomOverlayBridge validates SettingsReadPort, enforces least pr
   let updated = null;
   let disposedCount = 0;
 
+  let requestedPluginName = null;
   const bridge = createDomOverlayBridge({
     id: 'ko-overlay',
     pluginName: 'antigravity-ko-translator',
+    pluginAliases: ['ko-thought-translator'],
     sanitizeSettings: sanitizeTranslatorSettings,
     settingsPort: {
-      async readPluginSettings() {
+      async readPluginSettings(name) {
+        requestedPluginName = name;
         return {
           enabled: true,
           translateThinking: true,
@@ -57,8 +61,9 @@ test('ARP-TC-013: DomOverlayBridge validates SettingsReadPort, enforces least pr
   });
 
   const frame = { win: { name: 'promoted' }, doc: { nodeType: 9 } };
-  await bridge.mount({ frame, diagnostics: new DiagnosticsBus() });
+  await bridge.mount({ frame, plugin: { name: 'ko-thought-translator' }, diagnostics: new DiagnosticsBus() });
 
+  assert.equal(requestedPluginName, 'ko-thought-translator');
   assert.equal(started, true);
   assert.deepEqual(Object.keys(receivedArgs).sort(), ['doc', 'onStatus', 'settings', 'win']);
   assert.equal(receivedArgs.settings.provider, 'google-translate');
@@ -234,7 +239,7 @@ test('ARP-TC-015: McpExtensionSlot rejects NUL/control chars, traversal, null pa
   const slot = createMcpExtensionSlot({
     id: 'mcp-slot',
     pluginName: 'antigravity-mcp-manager',
-    protectedConfigPatterns: [/(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i],
+    protectedConfigPatterns: ANTIGRAVITY_PROTECTED_MCP_PATHS,
   });
   await slot.mount({ diagnostics: new DiagnosticsBus() });
 
@@ -263,7 +268,9 @@ test('ARP-TC-015: McpExtensionSlot rejects NUL/control chars, traversal, null pa
     '/home/user/.gemini/config/./config.json',
     '/home/user/.gemini/config/sub/../config.json',
     '/home/user/.gemini//config//config.json',
+    '~/.gemini/config/mcp_config.json',
     '~/.gemini/antigravity/mcp_config.json',
+    '~/.gemini/config/plugins/my-plugin/config.json',
     '/home/user/.gemini/config/plugins/foo/../bar/mcp_config.json',
   ]) {
     await assert.rejects(
