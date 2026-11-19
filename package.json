@@ -1,0 +1,20 @@
+{
+  "name": "antigravity-remote-plugin",
+  "version": "0.1.0",
+  "description": "Vendor-independent remote web bridge plugin for Antigravity companion extensions and sidecars",
+  "type": "module",
+  "main": "src/runtime/bootstrap.js",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test test/*.test.js",
+    "verify": "npm run build && npm test"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaeseongs95/antigravity-remote-plugin.git"
+  },
+  "license": "MIT"
+}

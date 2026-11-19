@@ -1,0 +1,94 @@
+{
+  "name": "antigravity-remote-plugin",
+  "version": "0.1.0",
+  "entry": "dist/remote_bridge.js",
+  "entrySha256": "4ad025d858552ca25cf53f470f3afc5b063aca0359017b18fa21b93c4b34f5c9",
+  "moduleCount": 17,
+  "modules": [
+    {
+      "path": "src/security/redactor.js",
+      "sha256": "070abf54dd2430952cec93fef56bd5b387791faf2ff43cf9104c4607369670fe",
+      "bytes": 2324
+    },
+    {
+      "path": "src/security/origin-policy.js",
+      "sha256": "51623cd4a0ad7d2ae9dbe598f59bacfc009802c3d6d9fdece0da20480d61da52",
+      "bytes": 3252
+    },
+    {
+      "path": "src/security/trusted-types.js",
+      "sha256": "1baf612ff592d6d22879e93f9fa13660ef1b23913588d0f111b553cee4f0d820",
+      "bytes": 2195
+    },
+    {
+      "path": "src/security/script-guard.js",
+      "sha256": "d2987595f2dc49cb0fb9dc0ae1dc3671764ce35acc86f2447314d823419eb4b4",
+      "bytes": 1551
+    },
+    {
+      "path": "src/security/dom-guard.js",
+      "sha256": "5efb61653ff7c1cb24b6c8206e82e79d7a7389ecb7a3fce2c8f50b276d7f1300",
+      "bytes": 2473
+    },
+    {
+      "path": "src/core/diagnostics.js",
+      "sha256": "2302007ce6ae7803e897fbd9e70518d7d06be61819cc19665c720862a73d7292",
+      "bytes": 1439
+    },
+    {
+      "path": "src/core/lifecycle.js",
+      "sha256": "49e0d7878f2ee53dd2f7755a89a901a4cbf635b3811ed08cf477e442148c0b26",
+      "bytes": 4059
+    },
+    {
+      "path": "src/core/ports.js",
+      "sha256": "8261d322ed926fa784923effe5b6db2275904b05d054632e023c6af37b7026cf",
+      "bytes": 2081
+    },
+    {
+      "path": "src/core/orchestrator.js",
+      "sha256": "a595d8c18e43c620f4fb16c31343e8a350f606508de584fa98626123ec8383cb",
+      "bytes": 5453
+    },
+    {
+      "path": "src/bridges/dom-overlay-bridge.js",
+      "sha256": "3a92cdf8887b4bc452e52d5db79ce3a74e3dfb0659be6371e9d780f9786b21a9",
+      "bytes": 4539
+    },
+    {
+      "path": "src/bridges/sidecar-ui-bridge.js",
+      "sha256": "5468fe7aaa73cfbea50a558c47dd7bee8ef4b00536a33d66e1f345d8de3322f1",
+      "bytes": 5032
+    },
+    {
+      "path": "src/bridges/mcp-extension-slot.js",
+      "sha256": "4e05076d36809623ab64573648ce2633be318a60c78650b16a9903cb179dccd8",
+      "bytes": 2963
+    },
+    {
+      "path": "src/adapters/antigravity/discovery-adapter.js",
+      "sha256": "d5527c28ebed8879a505dd0f77af02dc3c33dcb9b75585ccb799c1d24f2f397e",
+      "bytes": 3675
+    },
+    {
+      "path": "src/adapters/antigravity/frame-adapter.js",
+      "sha256": "af6e5a7a1ffa871df91688c00087d075331fa6beddd994278c32000f139a9955",
+      "bytes": 1857
+    },
+    {
+      "path": "src/adapters/antigravity/sidecar-adapter.js",
+      "sha256": "fd914d03265bcbd64a9ca83d5c4ce5185559bdd6049f4ec82c4599d2402d0549",
+      "bytes": 2233
+    },
+    {
+      "path": "src/adapters/antigravity/settings-adapter.js",
+      "sha256": "ea27d26ea84f389fa5c24d2f2abaddb6f42973c0232e513970a4029e49c288fa",
+      "bytes": 728
+    },
+    {
+      "path": "src/runtime/bootstrap.js",
+      "sha256": "acfb170fca0256fd14db5571483c2bb3a58f9fff1fb78635bdab00559ac33598",
+      "bytes": 2975
+    }
+  ]
+}
