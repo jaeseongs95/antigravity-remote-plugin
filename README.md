@@ -2,7 +2,7 @@
 
 [한국어 문서 (Korean README)](./README.ko.md)
 
-**Version:** `1.0.1`
+**Version:** `1.1.0`
 
 `antigravity-remote-plugin` is a vendor-independent remote web bridge plugin designed to separate remote web control responsibilities from desktop-native Antigravity companion plugins (`antigravity-statusbar`, `antigravity-ko-translator`, and `antigravity-mcp-manager`).
 
@@ -16,7 +16,8 @@ The project follows a Hexagonal (Ports & Adapters) architecture with strict depe
   - `dom-overlay-bridge.js`: Least-privilege pure DOM lifecycle (`mount`/`updateSettings`/`dispose`) for overlays such as `antigravity-ko-translator`.
   - `sidecar-ui-bridge.js`: Official `sidecar_sdk`-compatible UI and JSON API relay (`/api/telemetry`, `/api/context-limit`, `/api/compact`) and validated `postMessage` synchronization (`theme-change`, `workspace-change`) for sidecar plugins such as `antigravity-statusbar`.
   - `mcp-extension-slot.js`: Decoupled optional extension slot for future remote MCP management with hard guards against unconfirmed remote `stdio` execution and protected config writes.
-- `src/adapters/antigravity/`: All Antigravity-specific Connect RPC (`GetAllPlugins`, `GetSidecars`), loopback sidecar relay (`X-Sidecar-Token`), remote frame promotion, and settings sanitization adapters.
+- `src/adapters/antigravity/`: All Antigravity-specific Connect RPC (`GetAllPlugins`, `GetSidecars`), loopback sidecar relay (`X-Sidecar-Token`), remote frame promotion, settings sanitization, and server-side Sidecar panel handlers (`sidecar-host.js`).
+- `sidecars/remote-panel/`: Official Antigravity `sidecar_sdk` UI Extension (`sidecar.json`, `server.mjs`, and mobile-first responsive `ui/` under strict CSP). Runs on desktop Auxiliary Side Pane and on mobile browsers (`iOS Safari` / `Android Chrome`) through Antigravity's built-in per-sidecar remote gateway without browser extensions or custom tunnels.
 - `src/runtime/bootstrap.js`: Composition root wiring adapters and companion bridges.
 
 ## Security & Compatibility Invariants
@@ -31,12 +32,14 @@ The project follows a Hexagonal (Ports & Adapters) architecture with strict depe
 Requires Node.js `>= 20.0.0`.
 
 ```bash
+npm ci
 npm run verify
 ```
 
-This runs `scripts/build.js` to emit `dist/remote_bridge.js` and `dist/manifest.json`, then executes the full `node --test` suite documented in [docs/TEST_CASES.md](./docs/TEST_CASES.md).
+This runs `scripts/build.js` (`esbuild`) to emit `dist/remote_bridge.js` and `dist/manifest.json`, then executes the full 26-case `node --test` suite (including Playwright Desktop + Mobile `390x844` E2E) documented in [docs/TEST_CASES.md](./docs/TEST_CASES.md).
 
 ## Release Notes
 
+- [v1.1.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.1.0.md)
 - [v1.0.1 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.0.1.md)
 - [v1.0.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.0.0.md)

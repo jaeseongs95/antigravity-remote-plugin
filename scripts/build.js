@@ -2,11 +2,11 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { build as esbuild } from 'esbuild';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
 
-// Ordered in strict topological dependency order for standalone ESM bundling.
 const SOURCE_FILES = [
   'src/security/redactor.js',
   'src/security/origin-policy.js',
@@ -32,14 +32,7 @@ function sha256(content) {
   return createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
-function stripRelativeImports(source) {
-  return source.replace(
-    /^import\s+[\s\S]*?from\s+['"]\.\.?\/[^'"]+['"];\s*$/gm,
-    '',
-  ).trim();
-}
-
-function build() {
+async function runBuild() {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   const pluginManifest = JSON.parse(readFileSync(join(ROOT, 'plugin.json'), 'utf8'));
 
@@ -49,37 +42,58 @@ function build() {
     );
   }
 
-  const moduleEntries = [];
-  const bundledChunks = [
-    `// antigravity-remote-plugin v${pkg.version} — standalone self-contained ESM bundle`,
-    `// Generated deterministically from ${SOURCE_FILES.length} source modules.`,
-    `export const BUILD_VERSION = ${JSON.stringify(pkg.version)};`,
-    '',
-  ];
-
-  for (const relPath of SOURCE_FILES) {
+  const moduleEntries = SOURCE_FILES.map((relPath) => {
     const absPath = join(ROOT, relPath);
     const content = readFileSync(absPath, 'utf8').replace(/\r\n/g, '\n');
-    moduleEntries.push({
+    return {
       path: relPath,
       sha256: sha256(content),
       bytes: Buffer.byteLength(content, 'utf8'),
-    });
-    bundledChunks.push(`// --- module: ${relPath} ---`);
-    bundledChunks.push(stripRelativeImports(content));
-    bundledChunks.push('');
+    };
+  });
+
+  const virtualEntry = [
+    `export const BUILD_VERSION = ${JSON.stringify(pkg.version)};`,
+    ...SOURCE_FILES.map((relPath) => `export * from './${relPath}';`),
+  ].join('\n');
+
+  const result = await esbuild({
+    stdin: {
+      contents: virtualEntry,
+      resolveDir: ROOT,
+      sourcefile: 'virtual-remote-bridge-entry.js',
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    target: 'es2022',
+    write: false,
+    legalComments: 'none',
+    banner: {
+      js: [
+        `// antigravity-remote-plugin v${pkg.version} — standalone self-contained ESM bundle`,
+        `// Built deterministically with esbuild from ${SOURCE_FILES.length} source modules.`,
+      ].join('\n'),
+    },
+  });
+
+  const output = result.outputFiles?.[0];
+  if (!output) {
+    throw new Error('esbuild produced no output bundle.');
   }
 
+  const bundleSource = `${output.text.replace(/\r\n/g, '\n').trimEnd()}\n`;
   const distDir = join(ROOT, 'dist');
   mkdirSync(distDir, { recursive: true });
 
-  const bundleSource = `${bundledChunks.join('\n').trimEnd()}\n`;
   const bundlePath = join(distDir, 'remote_bridge.js');
   writeFileSync(bundlePath, bundleSource, 'utf8');
 
   const manifest = {
     name: pkg.name,
     version: pkg.version,
+    bundler: 'esbuild',
     entry: 'dist/remote_bridge.js',
     entrySha256: sha256(bundleSource),
     moduleCount: moduleEntries.length,
@@ -90,8 +104,8 @@ function build() {
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 
   console.log(
-    `[build] ${pkg.name} v${pkg.version}: ${moduleEntries.length} modules -> dist/remote_bridge.js (${manifest.entrySha256.slice(0, 12)})`,
+    `[build] ${pkg.name} v${pkg.version} (esbuild): ${moduleEntries.length} modules -> dist/remote_bridge.js (${manifest.entrySha256.slice(0, 12)})`,
   );
 }
 
-build();
+await runBuild();

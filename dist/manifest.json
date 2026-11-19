@@ -1,8 +1,9 @@
 {
   "name": "antigravity-remote-plugin",
-  "version": "1.0.1",
+  "version": "1.1.0",
+  "bundler": "esbuild",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "2fddb473c7af825cdf0c1b9c40031ac7ed9b4ebdc80550d83d1cde3cd45bde2b",
+  "entrySha256": "75ca90062ca795d11030b57e67e3ff6897d4e6fba079889eb080aa17393d3e59",
   "moduleCount": 18,
   "modules": [
     {

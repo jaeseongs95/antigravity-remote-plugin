@@ -2,7 +2,7 @@
 
 [English README](./README.md)
 
-**버전:** `1.0.1`
+**버전:** `1.1.0`
 
 `antigravity-remote-plugin`은 데스크톱 네이티브 전용 동반 플러그인(`antigravity-statusbar`, `antigravity-ko-translator`, `antigravity-mcp-manager`)으로부터 원격 웹 제어 책임을 완전히 분리하기 위해 설계된 벤더 독립적 원격 브리지 플러그인입니다.
 
@@ -16,7 +16,8 @@
   - `dom-overlay-bridge.js`: `antigravity-ko-translator` 등 순수 DOM 오버레이를 위한 최소 권한 수명주기(`mount`/`updateSettings`/`dispose`) 브리지.
   - `sidecar-ui-bridge.js`: `antigravity-statusbar` 등 공식 `sidecar_sdk` 기반 사이드카의 UI·JSON API(`/api/telemetry`, `/api/context-limit`, `/api/compact`) 중계 및 오리진 검증 `postMessage`(`theme-change`, `workspace-change`) 브리지.
   - `mcp-extension-slot.js`: 향후 원격 MCP 관리를 위한 독립 확장 슬롯(사용자 미확인 원격 `stdio` 실행 및 보호 설정 파일 수정 차단 포함).
-- `src/adapters/antigravity/`: Antigravity 전용 Connect RPC(`GetAllPlugins`, `GetSidecars`), 루프백 사이드카 중계(`X-Sidecar-Token`), 원격 프레임 승격 및 읽기 전용 설정 정제 어댑터.
+- `src/adapters/antigravity/`: Antigravity 전용 Connect RPC(`GetAllPlugins`, `GetSidecars`), 루프백 사이드카 중계(`X-Sidecar-Token`), 원격 프레임 승격, 읽기 전용 설정 정제, 서버 측 Sidecar 패널 핸들러(`sidecar-host.js`).
+- `sidecars/remote-panel/`: Antigravity 공식 `sidecar_sdk` 기반 UI 확장(`sidecar.json`, `server.mjs`, 엄격 CSP 준수 모바일 우선 반응형 `ui/`). 데스크톱 앱 보조 패널(`AUX_PANE`)과 모바일 브라우저(`iOS Safari` / `Android Chrome`, 플랫폼 내장 per-sidecar 원격 게이트웨이 경유) 모두에서 별도 브라우저 확장이나 커스텀 터널 없이 동작합니다.
 - `src/runtime/bootstrap.js`: 어댑터와 동반 브리지를 조립하는 단일 진입점.
 
 ## 보안 및 호환성 불변식
@@ -31,12 +32,14 @@
 Node.js `>= 20.0.0` 환경이 필요합니다.
 
 ```bash
+npm ci
 npm run verify
 ```
 
-위 명령은 `scripts/build.js`로 `dist/remote_bridge.js`와 `dist/manifest.json`을 생성한 뒤 [docs/TEST_CASES.md](./docs/TEST_CASES.md)에 정의된 전체 `node --test` 스위트를 실행합니다.
+위 명령은 `scripts/build.js`(`esbuild`)로 `dist/remote_bridge.js`와 `dist/manifest.json`을 생성한 뒤 [docs/TEST_CASES.md](./docs/TEST_CASES.md)에 정의된 전체 26개 `node --test` 스위트(Playwright 데스크톱 + 모바일 `390x844` E2E 포함)를 실행합니다.
 
 ## 릴리스 노트
 
+- [v1.1.0 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v1.1.0.md)
 - [v1.0.1 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v1.0.1.md)
 - [v1.0.0 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v1.0.0.md)

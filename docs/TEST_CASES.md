@@ -1,6 +1,6 @@
-# Test Cases — antigravity-remote-plugin v1.0.1
+# Test Cases — antigravity-remote-plugin v1.1.0
 
-23 automated test cases (`ARP-TC-001` through `ARP-TC-023`) covering vendor independence, security invariants, concurrency safety, real loopback HTTP integration, standalone bundle execution, and real headless Chromium browser E2E.
+26 automated test cases (`ARP-TC-001` through `ARP-TC-026`) covering vendor independence, security invariants, concurrency safety, real loopback HTTP integration, `esbuild` standalone bundle execution, official Antigravity `sidecar_sdk` remote panel integration, and real Playwright Chromium Desktop + Mobile viewport E2E.
 
 ## 1. Architecture & Vendor-Independence Boundary (`test/architecture-boundary.test.js`)
 
@@ -53,4 +53,12 @@
 |---|---|---|
 | ARP-TC-019 | `test/build.test.js`: verifies all 18 module SHA-256 digests in `dist/manifest.json`, zero `../src/` imports, and isolated `tmpdir` standalone `import()` | All 18 checksums match; standalone bundle imports cleanly without `src/` |
 | ARP-TC-022 | `test/integration-loopback.test.js`: real `node:http` loopback RPC & Sidecar servers tested against both `bootstrap.js` and standalone `dist/remote_bridge.js` | End-to-end mount, `X-Sidecar-Token` API relay, theme/workspace sync, and teardown pass |
-| ARP-TC-023 | `test/browser-e2e.test.js`: real headless Chromium (CDP) enforcing `require-trusted-types-for 'script'` CSP verifying native TrustedTypes reuse, Worker `blob:` execution, real iframe `load` + `postMessage` round-trip, and real cross-origin `DOMException` handling | Native `TrustedScriptURL` Worker returns `'worker-pong'`, sidecar iframe receives 2 messages after `load` and replies, cross-origin throws `CROSS_ORIGIN_IFRAME_DENIED` |
+| ARP-TC-023 | `test/browser-e2e.test.js`: real Playwright Chromium enforcing `require-trusted-types-for 'script'` CSP verifying native `window.fetch` orchestrator, TrustedTypes reuse, Worker `blob:` execution, real iframe `load` + `postMessage` round-trip, and real cross-origin `DOMException` handling | Native `TrustedScriptURL` Worker returns `'worker-pong'`, sidecar iframe receives 2 messages after `load` and replies, cross-origin throws `CROSS_ORIGIN_IFRAME_DENIED` |
+
+## 7. v1.1.0 Trusted Library Bundler, Official Sidecar Backend & Mobile-First Responsive UI E2E
+
+| ID | Case | Expected Oracle |
+|---|---|---|
+| ARP-TC-024 | `test/build.test.js`: verifies `esbuild`-bundled `dist/remote_bridge.js` determinism, version `1.1.0` sync, `bundler: "esbuild"` metadata in `dist/manifest.json`, and zero regex stripping regressions | Deterministic SHA-256 across repeated builds; `bundler === 'esbuild'`; standalone isolated `tmpdir` import exposes `BUILD_VERSION`, `bootstrapAntigravityRemoteBridge`, `RemoteOrchestrator` |
+| ARP-TC-025 | `test/sidecar-panel.test.js`: real `node:http` loopback LanguageServer (`GetAllPlugins`, `GetSidecars`) + `antigravity-statusbar` Sidecar tested via `createRemotePanelHandlers` (`GET /api/health`, `GET /api/state`, `POST /api/statusbar/telemetry`, `POST /api/statusbar/context-limit`, `POST /api/statusbar/compact`, `GET /api/mcp/summary`) and `sidecars/remote-panel/sidecar.json` schema validation | Secrets/tokens stripped from `/api/state` and `/api/mcp/summary`; statusbar telemetry/compact relayed via `X-Sidecar-Token`; `sidecar.json` declares `has_web_ui: true` and `SIDECAR_UI_ENTRYPOINT_AUX_PANE` |
+| ARP-TC-026 | `test/browser-e2e.test.js`: real Playwright Chromium E2E on both Desktop (`1280x800`) and Mobile (`390x844`, `hasTouch: true`, `isMobile: true`) viewports loading `sidecars/remote-panel/ui/*` under strict CSP (`default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'`) with real `preload.js` `theme-change`/`workspace-change` and `X-Sidecar-Token` header injection | 0 console/page/CSP errors; horizontal overflow `<= 0` on 390px mobile; primary interactive buttons meet `>= 44px` touch height; tab switch, telemetry refresh, compact action, error retry, and `theme-change` CSS variable sync all succeed |
