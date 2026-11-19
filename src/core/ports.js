@@ -17,6 +17,14 @@ export const PORT_CONTRACTS = Object.freeze({
   SettingsReadPort: Object.freeze(['readPluginSettings']),
   ThemeWorkspaceSyncPort: Object.freeze(['getThemeVariables', 'getWorkspaceUris', 'subscribe']),
   ExtensionBridgePort: Object.freeze(['id', 'pluginName', 'mount', 'dispose']),
+  HostSurfacePort: Object.freeze([
+    'mountSlot',
+    'unmountSlot',
+    'injectStyle',
+    'removeStyle',
+    'onDispose',
+    'dispose',
+  ]),
 });
 
 export function validateDiscoveryPort(port) {
@@ -37,6 +45,10 @@ export function validateSettingsReadPort(port) {
 
 export function validateThemeWorkspaceSyncPort(port) {
   return assertPort(port, 'ThemeWorkspaceSyncPort', PORT_CONTRACTS.ThemeWorkspaceSyncPort);
+}
+
+export function validateHostSurfacePort(port) {
+  return assertPort(port, 'HostSurfacePort', PORT_CONTRACTS.HostSurfacePort);
 }
 
 export function validateBridgeDescriptor(bridge) {

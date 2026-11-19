@@ -83,12 +83,16 @@ test('ARP-TC-002: entire src/ contains zero HTML sink calls or assignments', () 
   assert.deepEqual(violations, []);
 });
 
-test('ARP-TC-003: entire src/ contains zero forbidden legacy patterns or empty catch blocks', () => {
+test('ARP-TC-003: entire src/ contains zero forbidden legacy patterns, production test hooks, wildcard postMessage, or empty catch blocks', () => {
   const forbidden = [
     /app\.asar/i,
     /statusbar_autoinject/i,
     /agy-statusbar-code/i,
     /window\.agyMcpManager/,
+    /__ARP_ALLOWED_ORIGINS__/,
+    /__ARP_TRANSLATE_ENDPOINT__/,
+    /__agyCreateKoTranslator/,
+    /postMessage\s*\([^)]*,\s*['"]\*['"]\s*\)/,
     /catch\s*(?:\([^)]*\))?\s*\{\s*\}/,
   ];
   const violations = [];

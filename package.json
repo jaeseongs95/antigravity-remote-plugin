@@ -1,7 +1,7 @@
 {
   "name": "antigravity-remote-plugin",
   "version": "2.0.0",
-  "description": "Vendor-independent remote web bridge plugin for Antigravity companion extensions and sidecars",
+  "description": "Vendor-independent AddonManifest.v1 companion and RemotePlugin.v1 declarative slot host for cross-device remote browsers",
   "type": "module",
   "main": "src/runtime/bootstrap.js",
   "scripts": {

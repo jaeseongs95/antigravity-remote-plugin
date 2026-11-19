@@ -2,7 +2,7 @@
   "name": "antigravity-remote-plugin",
   "displayName": "Antigravity Remote Plugin",
   "version": "2.0.0",
-  "description": "Vendor-independent remote web bridge for companion UI overlays and sidecar extensions without app.asar patching.",
+  "description": "Vendor-independent AddonManifest.v1 companion & RemotePlugin.v1 slot-based declarative host for cross-device remote browsers without app.asar patching.",
   "author": "jaeseongs95",
   "repository": "https://github.com/jaeseongs95/antigravity-remote-plugin"
 }

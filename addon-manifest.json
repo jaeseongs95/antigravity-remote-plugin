@@ -1,0 +1,32 @@
+{
+  "$schema": "https://github.com/jaeseongs95/antigravity-native-addon-host/schemas/addon-manifest.v1.schema.json",
+  "schemaVersion": 1,
+  "pluginId": "antigravity-remote-plugin",
+  "displayName": "Antigravity Remote Plugin",
+  "version": "2.0.0",
+  "compatibility": {
+    "hostProfile": "antigravity-desktop",
+    "minHostVersion": "1.0.1"
+  },
+  "capabilities": [
+    "renderer"
+  ],
+  "entry": {
+    "rendererScript": "dist/addon-renderer.js"
+  },
+  "uiSlots": [
+    {
+      "slot": "settings-pane",
+      "slotId": "antigravity-remote-plugin.settings",
+      "exclusive": false,
+      "scope": "addon-owned-slot"
+    }
+  ],
+  "isolation": {
+    "noTranslate": true,
+    "i18nSelfManaged": true,
+    "respectsNoTranslate": true,
+    "storageNamespace": "antigravity-remote-plugin"
+  },
+  "loadOrder": 200
+}

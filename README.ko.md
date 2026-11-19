@@ -4,24 +4,25 @@
 
 **버전:** `2.0.0`
 
-`antigravity-remote-plugin`은 구글 Antigravity 공식 원격 제어(Remote Control) 웹 환경에서 **전 기기(iOS Safari · Android Chrome/Firefox/Edge · 데스크톱 전 브라우저)** 사용자가 동반 플러그인(`ko-thought-translator`, `antigravity-statusbar`, `antigravity-mcp-manager`)을 실제로 연동해 사용할 수 있도록 만든 벤더 독립적 원격 컴패니언입니다.
+`antigravity-remote-plugin`은 `app.asar` 직접 패치와 동반 플러그인 내부 하드코딩 없이, **데스크톱 `AddonManifest.v1` 규격 애드온**과 **전 기기(iOS Safari · Android Chrome/Firefox/Edge · 데스크톱) 원격 웹 `RemotePlugin.v1` 선언적 슬롯 호스트**를 SOLID 헥사고날 아키텍처로 통합 제공하는 벤더 독립 플러그인입니다.
 
-## 빠른 시작 (전 기기 지원)
+## 표준 규약
+- **데스크톱 네이티브 애드온 (`AddonManifest.v1`)**: [addon-manifest.json](./addon-manifest.json) — `capabilities: ["renderer"]`, 비독점 `settings-pane` 슬롯(`antigravity-remote-plugin.settings`), `isolation.noTranslate: true`, `i18nSelfManaged: true`, `storageNamespace: "antigravity-remote-plugin"`을 선언하며, 모든 DOM·스타일·해제는 `antigravity-native-addon-host`의 capability API(`addonHost.mountSlot`, `addonHost.injectStyle`, `addonHost.onDispose`)에만 위임합니다.
+- **원격 웹 플러그인 표준 (`RemotePlugin.v1`)**: [docs/SPEC_REMOTE_PLUGIN_V1.md](./docs/SPEC_REMOTE_PLUGIN_V1.md) — 각 동반 플러그인이 표준 인터페이스를 구현하고 자신의 UI 슬롯(`status-bar`, `settings-pane`, `aux-pane`, `overlay`, `sidebar`, `title-bar`, `composer-toolbar`, `modal`, `theme`, `custom`)을 선언하면, 호스트가 Closed Shadow DOM 안에서 각 플러그인의 지정 배치대로 안전하게(`innerHTML` 0건) 렌더링합니다.
 
-### 방법 1 — 자동 실행 유저스크립트 (권장)
-`https://antigravity.google.com/*`에 접속하면 매번 누르지 않아도 자동으로 실행됩니다.
-- **iOS Safari**: 무료 **Userscripts** Safari 확장을 설치하고 `dist/antigravity-remote.user.js`를 추가합니다.
-- **Android (Firefox / Edge / Kiwi)** 및 **데스크톱 (Chrome / Edge / Firefox / Safari)**: **Tampermonkey** 또는 **Violentmonkey**에 `dist/antigravity-remote.user.js`를 등록합니다.
+## 빠른 시작
 
-### 방법 2 — 무설치 북마클릿 (iOS Safari · Android Chrome · 데스크톱 전 브라우저)
-1. `dist/bookmarklet.txt`의 한 줄 `javascript:...` 코드를 복사합니다.
-2. 브라우저 북마크로 저장합니다(예: `Antigravity Remote`).
-3. 원격 제어 페이지에서 북마크를 한 번 탭하면 우하단 플로팅 독이 실행됩니다(다시 탭하면 메뉴 열기/닫기).
+### 1. 데스크톱 (`antigravity-native-addon-host` v1.0.1+)
+`app.asar`를 직접 수정하지 않고 공용 네이티브 애드온 호스트로 검증 및 등록합니다:
 
-## 주요 기능
-- **원격 실시간 한글 번역 (`ko-thought-translator`)**: 사고 과정과 정적 UI 텍스트를 실시간 번역하면서 `<code>`, `<pre>`, 터미널, 입력창, 인라인 코드·경로·URL은 원형 그대로 보존합니다. 원격 웹에서는 `local-llm`을 자동 차단하고 `GM_xmlhttpRequest`(유저스크립트) 또는 `fetch`(북마클릿)로 번역하며, 끄기 시 즉시 원문으로 복원합니다.
-- **동반 사이드카 빠른 연동 (`antigravity-statusbar` · `antigravity-mcp-manager`)**: Antigravity 공식 `AUX_PANE` 게이트웨이(`antigravity-statusbar/statusbar`, `antigravity-mcp-manager/mcp_manager`)로 `toggle-aux-pane` 메시지를 전송해 보조 패널을 바로 열 수 있습니다.
-- **모바일 우선 미니멀 플로팅 독**: `44x44px` 터치 영역, `safe-area-inset` 대응, `390px` 모바일 가로 오버플로 `0px`, 다크/라이트 테마 자동 동기화, `Escape` 닫기·초점 복귀, `innerHTML` 0건.
+```bash
+node "<addon-host>/bin/addon-host.js" --validate addon-manifest.json
+node "<addon-host>/bin/addon-host.js" --register "<설치된-플러그인-폴더>/addon-manifest.json"
+```
+
+### 2. 외부 · 모바일 브라우저 (`https://antigravity.google.com/*`)
+- **유저스크립트 (권장)**: `dist/antigravity-remote.user.js`를 iOS Safari(`Userscripts`), Android(`Firefox`/`Edge`/`Kiwi`), 데스크톱(`Tampermonkey`/`Violentmonkey`)에 등록합니다 (`@grant none`).
+- **무설치 북마클릿**: `dist/bookmarklet.txt`의 한 줄 `javascript:...` 코드를(또는 데스크톱 설정 패널의 1클릭 복사 버튼으로) 북마크에 저장해 탭 한 번으로 실행·토글합니다.
 
 ## 빌드 및 검증
 Node.js `>= 20.0.0` 환경이 필요합니다.
@@ -31,7 +32,7 @@ npm ci
 npm run verify
 ```
 
-`scripts/build.js`(`esbuild`)가 `dist/remote_bridge.js`, `dist/antigravity-remote.user.js`, `dist/bookmarklet.txt`, `dist/manifest.json`을 생성하고 Playwright 데스크톱 + 모바일(`390x844` 터치) E2E를 포함한 26개 테스트 케이스(`ARP-TC-001`~`ARP-TC-026`)를 검증합니다.
+`scripts/build.js`(`esbuild`)가 `dist/remote_bridge.js`, `dist/addon-renderer.js`, `dist/antigravity-remote.user.js`, `dist/bookmarklet.txt`, `dist/manifest.json`을 결정적으로 생성하고, `addon-host --validate` 및 Playwright 데스크톱 + 모바일(`390x844` 터치) E2E를 포함한 29개 테스트 케이스(`ARP-TC-001`~`ARP-TC-029`)를 검증합니다.
 
 ## 릴리스 노트
 - [v2.0.0 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v2.0.0.md)

@@ -4,31 +4,35 @@
 
 **Version:** `2.0.0`
 
-`antigravity-remote-plugin` is a vendor-independent, cross-device (**iOS Safari, Android Chrome/Firefox/Edge, and Desktop browsers**) remote web companion for Google Antigravity's official Remote Control web interface. It connects your remote browser session to the companion plugin ecosystem (`ko-thought-translator`, `antigravity-statusbar`, and `antigravity-mcp-manager`) without modifying `app.asar` or running custom tunnels.
+`antigravity-remote-plugin` is a vendor-independent, SOLID hexagonal **AddonManifest.v1 Desktop companion** and **RemotePlugin.v1 cross-device declarative slot host** (**iOS Safari, Android Chrome/Firefox/Edge, and Desktop browsers**) for Google Antigravity's official Remote Control web interface — with zero `app.asar` patching and zero hardcoded companion plugin internals.
 
-## Quick Start (All Devices)
+## Standards & Specifications
+- **Desktop Native Addon (`AddonManifest.v1`)**: [addon-manifest.json](./addon-manifest.json) — declares `capabilities: ["renderer"]`, non-exclusive `settings-pane` slot (`antigravity-remote-plugin.settings`), `isolation.noTranslate: true`, `i18nSelfManaged: true`, and `storageNamespace: "antigravity-remote-plugin"`. Delegates 100% of DOM/style mounting to `antigravity-native-addon-host` (`addonHost.mountSlot`, `addonHost.injectStyle`, `addonHost.onDispose`).
+- **Remote Web Plugin Contract (`RemotePlugin.v1`)**: [docs/SPEC_REMOTE_PLUGIN_V1.md](./docs/SPEC_REMOTE_PLUGIN_V1.md) — companion plugins implement `RemotePlugin.v1` and declare their own UI slot (`status-bar`, `settings-pane`, `aux-pane`, `overlay`, `sidebar`, `title-bar`, `composer-toolbar`, `modal`, `theme`, `custom`); the host renders each plugin declaratively inside a Closed Shadow DOM in its declared placement.
 
-### Option 1 — Automatic Userscript (Recommended)
-Runs automatically whenever you open `https://antigravity.google.com/*`.
-- **iOS Safari**: Install the free **Userscripts** Safari extension and add `dist/antigravity-remote.user.js`.
-- **Android (Firefox / Edge / Kiwi)** & **Desktop (Chrome / Edge / Firefox / Safari)**: Install **Tampermonkey** or **Violentmonkey** and import `dist/antigravity-remote.user.js`.
+## Quick Start
 
-### Option 2 — Zero-Install Bookmarklet (iOS Safari, Android Chrome, Desktop)
-1. Copy the single-line `javascript:...` snippet from `dist/bookmarklet.txt`.
-2. Save it as a browser bookmark (e.g., `Antigravity Remote`).
-3. Open Antigravity Remote Control in your browser and tap the bookmark once to activate the floating companion dock (tap again to toggle the menu).
+### 1. Desktop (via `antigravity-native-addon-host` v1.0.1+)
+Validate and register `addon-manifest.json` using the shared native addon host (never patch `app.asar` directly):
 
-## Features
-- **Live Remote Korean Translation (`ko-thought-translator`)**: Real-time DOM translation of visible prose and thinking blocks while strictly preserving `<code>`, `<pre>`, terminals, inputs, inline code, URLs, and file paths. Automatically blocks `local-llm` over remote web and uses `GM_xmlhttpRequest` (userscript) or `fetch` (bookmarklet). One-tap OFF immediately restores original text.
-- **Companion Sidecar Quick Actions (`antigravity-statusbar` & `antigravity-mcp-manager`)**: Connects to Antigravity's official `AUX_PANE` sidecar gateway (`antigravity-statusbar/statusbar`, `antigravity-mcp-manager/mcp_manager`) via validated `toggle-aux-pane` messages.
-- **Mobile-First Minimal Floating Dock**: Unobtrusive `44x44px` touch pill respecting `safe-area-inset`, `0px` horizontal overflow on `390px` mobile screens, automatic light/dark theme sync, `Escape` focus return, and zero `innerHTML`.
+```bash
+node "<addon-host>/bin/addon-host.js" --validate addon-manifest.json
+node "<addon-host>/bin/addon-host.js" --register "<installed-plugin-dir>/addon-manifest.json"
+```
 
-## Architecture
-- `src/core/`: Vendor-independent orchestration (`RemoteOrchestrator`), lifecycle (`DisposableStore`, `AsyncMutex`, `EventChain`, `SingleFlight`), port contracts, and diagnostics (`DiagnosticsBus`).
-- `src/security/`: Origin/subdomain allowlists, scoped TrustedTypes policies, Worker Blob guards, safe DOM creation, and secret redaction.
-- `src/bridges/`: Vendor-independent bridges (`dom-overlay-bridge.js`, `sidecar-ui-bridge.js`, `mcp-extension-slot.js`, `remote-translator-engine.js`).
-- `src/adapters/antigravity/`: Antigravity RPC, frame, sidecar, settings, theme/workspace, and floating companion dock (`remote-dock-ui.js`) adapters.
-- `src/runtime/`: Composition roots (`bootstrap.js`, `remote-web-entry.js`).
+### 2. Remote / Mobile Browsers (`https://antigravity.google.com/*`)
+- **Userscript (Recommended)**: Install `dist/antigravity-remote.user.js` in iOS Safari (`Userscripts`), Android (`Firefox`/`Edge`/`Kiwi` + `Tampermonkey`/`Violentmonkey`), or Desktop (`Tampermonkey`/`Violentmonkey`). Uses `@grant none`.
+- **Zero-Install Bookmarklet**: Copy the single-line `javascript:...` snippet from `dist/bookmarklet.txt` (or 1-click copy from the Desktop Settings panel) into a browser bookmark and tap once to activate/toggle.
+
+## Architecture (SOLID Hexagonal Ports & Adapters)
+- `src/core/`: Vendor- and runtime-neutral contracts (`HostSurfacePort`, `RemotePlugin.v1` contract & validator, `RemotePluginRegistry`, `DeclarativeSlotRenderer`, `DesktopCompanionView`, `RemoteOrchestrator`, lifecycle primitives, `DiagnosticsBus`). **0 vendor literals.**
+- `src/security/`: Origin/subdomain allowlists, scoped TrustedTypes policies, Worker Blob guards, safe DOM creation (`0 innerHTML`), closed `MessageChannel` nonce handshake (`plugin-handshake.js`), and secret redaction. **0 vendor literals.**
+- `src/bridges/`: Vendor-independent bridges (`dom-overlay-bridge.js`, `sidecar-ui-bridge.js`, `mcp-extension-slot.js`). **0 vendor literals.**
+- `src/adapters/`:
+  - `addon-host/addon-host-surface-adapter.js`: `HostSurfacePort` adapter strictly over `addonHost` capability API.
+  - `remote-web/shadow-surface-adapter.js`: `HostSurfacePort` adapter backed by Closed Shadow DOM.
+  - `antigravity/`: Antigravity RPC, frame, sidecar, settings, and theme/workspace adapters.
+- `src/runtime/`: Side-effect-free library composition roots (`bootstrap.js`, `remote-host-runtime.js`) separated from auto-executing entries (`remote-web-entry.js`, `addon-renderer-entry.js`).
 
 ## Build & Verification
 Requires Node.js `>= 20.0.0`.
@@ -38,7 +42,7 @@ npm ci
 npm run verify
 ```
 
-`scripts/build.js` (`esbuild`) emits `dist/remote_bridge.js`, `dist/antigravity-remote.user.js`, `dist/bookmarklet.txt`, and `dist/manifest.json`, then runs all 26 test cases (`ARP-TC-001`–`ARP-TC-026`) including Playwright Desktop + Mobile (`390x844` touch) E2E.
+`scripts/build.js` (`esbuild`) deterministically emits `dist/remote_bridge.js`, `dist/addon-renderer.js`, `dist/antigravity-remote.user.js`, `dist/bookmarklet.txt`, and `dist/manifest.json`, then runs all 29 test cases (`ARP-TC-001`–`ARP-TC-029`) including `addon-host --validate` and real Playwright Desktop + Mobile (`390x844` touch) E2E.
 
 ## Release Notes
 - [v2.0.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v2.0.0.md)

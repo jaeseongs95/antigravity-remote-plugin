@@ -357,57 +357,32 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
   }
 });
 
-test('ARP-TC-026: Playwright Desktop & Mobile (390x844 touch) E2E injects real dist/antigravity-remote.user.js and dist/bookmarklet.txt to verify live DOM translation, code preservation, companion sidecar triggers, 44px touch targets, and 0 overflow', async () => {
+test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real Userscript & real javascript: Bookmarklet on https://antigravity.google.com/remote (zero prod test hooks), enforces fail-closed untrusted origin, and renders RemotePlugin.v1 plugins in their declared slots', async () => {
   const userscriptSource = readFileSync(join(ROOT, 'dist/antigravity-remote.user.js'), 'utf8');
-  const bookmarkletSource = readFileSync(join(ROOT, 'dist/bookmarklet.txt'), 'utf8').trim();
-  assert.ok(bookmarkletSource.startsWith('javascript:'));
-  const bookmarkletCode = bookmarkletSource.slice('javascript:'.length);
-
-  const translateSrv = await startHttpServer((req, res) => {
-    const parsed = new URL(req.url, 'http://127.0.0.1');
-    const q = parsed.searchParams.get('q') || '';
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-    });
-    res.end(JSON.stringify([[[`[번역] ${q}`, q, null, null, 10]]]));
-  });
-
-  const remoteWebSrv = await startHttpServer((req, res) => {
-    if (req.url === '/favicon.ico') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!doctype html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Antigravity Remote Mock</title>
-      </head>
-      <body style="margin:0;padding:16px;font-family:sans-serif;">
-        <main>
-          <p id="thought-1">Thinking about cross-device remote plugin architecture.</p>
-          <pre id="code-pre">npm run verify</pre>
-          <code id="code-inline">const untouched = 123;</code>
-          <textarea id="chat-input">User draft prompt</textarea>
-        </main>
-        <script>
-          window.__auxEvents = [];
-          window.addEventListener('message', (e) => {
-            if (e.data && e.data.type === 'toggle-aux-pane') {
-              window.__auxEvents.push(e.data.payload);
-            }
-          });
-        </script>
-      </body>
-      </html>`);
-  });
+  const bookmarkletHref = readFileSync(join(ROOT, 'dist/bookmarklet.txt'), 'utf8').trim();
+  assert.ok(bookmarkletHref.startsWith('javascript:'));
 
   const browser = await launchChromium();
   try {
+    // 1) Fail-closed check on untrusted origin (zero test hooks in production bundle!)
+    {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      await page.route('https://evil.example/**', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: '<!doctype html><html><body><h1>Untrusted</h1></body></html>',
+        }),
+      );
+      await page.goto('https://evil.example/remote', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: userscriptSource });
+      const mountedOnEvil = await page.evaluate(() => Boolean(window.antigravityRemoteHost));
+      assert.equal(mountedOnEvil, false, 'Production bundle must refuse to mount on untrusted origin');
+      await context.close();
+    }
+
+    // 2) Trusted real origin https://antigravity.google.com/remote on Desktop (Userscript) and Mobile 390x844 (real javascript: Bookmarklet)
     const scenarios = [
       { mode: 'userscript', viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false },
       { mode: 'bookmarklet', viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
@@ -428,86 +403,322 @@ test('ARP-TC-026: Playwright Desktop & Mobile (390x844 touch) E2E injects real d
         }
       });
 
-      const remoteOrigin = `http://127.0.0.1:${remoteWebSrv.port}`;
-      await page.goto(`${remoteOrigin}/`, { waitUntil: 'networkidle' });
-
-      // Configure test origin allowlist & loopback mock translate endpoint.
-      await page.evaluate(
-        ({ origin, translatePort, withGm }) => {
-          window.__ARP_ALLOWED_ORIGINS__ = [origin];
-          window.__ARP_TRANSLATE_ENDPOINT__ = `http://127.0.0.1:${translatePort}/translate_a/single`;
-          if (withGm) {
-            window.GM_xmlhttpRequest = ({ url, onload, onerror }) => {
-              fetch(url)
-                .then(async (r) => onload({ status: r.status, responseText: await r.text() }))
-                .catch((err) => onerror(err));
-            };
-          }
-        },
-        { origin: remoteOrigin, translatePort: translateSrv.port, withGm: sc.mode === 'userscript' },
+      await page.route('https://antigravity.google.com/**', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          headers: {
+            'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'",
+          },
+          body: `<!doctype html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Antigravity Remote Web</title>
+            </head>
+            <body style="margin:0;padding:16px;font-family:sans-serif;">
+              <main><p id="host-content">Remote Session Active</p></main>
+            </body>
+            </html>`,
+        }),
       );
 
-      // Inject REAL built artifact (userscript or bookmarklet).
-      await page.addScriptTag({
-        content: sc.mode === 'userscript' ? userscriptSource : bookmarkletCode,
-      });
+      await page.goto('https://antigravity.google.com/remote', { waitUntil: 'domcontentloaded' });
 
-      // Wait for real DOM translation to finish.
-      await page.waitForFunction(
-        () => document.getElementById('thought-1')?.textContent?.startsWith('[번역]'),
-      );
-
-      // Verify code blocks and inputs were NEVER mutated.
-      assert.equal(await page.textContent('#code-pre'), 'npm run verify');
-      assert.equal(await page.textContent('#code-inline'), 'const untouched = 123;');
-      assert.equal(await page.inputValue('#chat-input'), 'User draft prompt');
-
-      // Open dock popover & verify 44px touch targets + 0 horizontal overflow.
-      await page.click('#arp-dock-pill');
-      const metrics = await page.evaluate(() => {
-        const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
-        const heights = ['#arp-dock-pill', '#arp-toggle-translate', '#arp-open-statusbar', '#arp-open-mcp']
-          .map((sel) => document.querySelector(sel).getBoundingClientRect().height);
-        return { overflow, minHeight: Math.min(...heights) };
-      });
-      assert.ok(metrics.overflow <= 0, `${sc.mode}: horizontal overflow (${metrics.overflow}px)`);
-      assert.ok(metrics.minHeight >= 44, `${sc.mode}: button height < 44px (${metrics.minHeight}px)`);
-
-      // Toggle translation OFF -> original English prose restored immediately.
-      await page.click('#arp-toggle-translate');
-      assert.equal(
-        await page.textContent('#thought-1'),
-        'Thinking about cross-device remote plugin architecture.',
-      );
-
-      // Trigger Statusbar & MCP Manager companion sidecars.
-      await page.click('#arp-open-statusbar');
-      await page.click('#arp-open-mcp');
-      await page.waitForFunction(() => window.__auxEvents.length === 2);
-      const auxEvents = await page.evaluate(() => window.__auxEvents);
-      assert.equal(auxEvents[0].sidecarId, 'antigravity-statusbar/statusbar');
-      assert.equal(auxEvents[1].sidecarId, 'antigravity-mcp-manager/mcp_manager');
-
-      // Escape closes popover and returns focus to pill button.
-      await page.keyboard.press('Escape');
-      assert.equal(await page.getAttribute('#arp-dock-pill', 'aria-expanded'), 'false');
-
-      // Repeated bookmarklet execution toggles popover idempotently (no duplicate root).
-      if (sc.mode === 'bookmarklet') {
-        await page.addScriptTag({ content: bookmarkletCode });
-        const rootCount = await page.evaluate(() => document.querySelectorAll('#arp-remote-dock-root-v2').length);
-        assert.equal(rootCount, 1);
-        assert.equal(await page.getAttribute('#arp-dock-pill', 'aria-expanded'), 'true');
+      if (sc.mode === 'userscript') {
+        await page.addScriptTag({ content: userscriptSource });
+      } else {
+        // Real javascript: URL execution (not addScriptTag bypass!)
+        await page.evaluate((bmHref) => {
+          const a = document.createElement('a');
+          a.id = 'run-bookmarklet';
+          a.href = bmHref;
+          a.textContent = 'Run Bookmarklet';
+          document.body.appendChild(a);
+          a.click();
+        }, bookmarkletHref);
       }
 
+      await page.waitForFunction(() => Boolean(window.antigravityRemoteHost));
+
+      // Verify Closed Shadow DOM isolation: hostElement.shadowRoot MUST be null!
+      const shadowCheck = await page.evaluate(() => {
+        const hostEl = document.querySelector('[data-remote-host-surface="closed-shadow"]');
+        return {
+          exists: Boolean(hostEl),
+          shadowRootIsNull: hostEl ? hostEl.shadowRoot === null : false,
+          noTranslate: hostEl ? hostEl.getAttribute('translate') : null,
+        };
+      });
+      assert.equal(shadowCheck.exists, true);
+      assert.equal(shadowCheck.shadowRootIsNull, true);
+      assert.equal(shadowCheck.noTranslate, 'no');
+
+      // Register two plugins implementing RemotePlugin.v1 in their own declared slots (status-bar + settings-pane)
+      await page.evaluate(() => {
+        window.__confirmedRuns = 0;
+        window.antigravityRemoteHost.register({
+          contractVersion: 'remote-plugin.v1',
+          id: 'demo-statusbar',
+          version: '1.0.0',
+          displayName: { ko: '상태바', en: 'Statusbar' },
+          uiSlot: { slot: 'status-bar', slotId: 'demo-statusbar.root', exclusive: true },
+          capabilities: ['badge', 'panel'],
+          loadOrder: 10,
+          getSnapshot() {
+            return {
+              revision: 'sb-1',
+              badge: { text: { ko: '연결됨', en: 'Live' }, tone: 'ok' },
+              sections: [
+                {
+                  kind: 'metrics',
+                  items: [{ label: { ko: '컨텍스트', en: 'Context' }, value: '42%', tone: 'ok' }],
+                },
+              ],
+            };
+          },
+        });
+        window.antigravityRemoteHost.register({
+          contractVersion: 'remote-plugin.v1',
+          id: 'demo-settings-tool',
+          version: '1.0.0',
+          displayName: { ko: '도구 설정', en: 'Tool Settings' },
+          uiSlot: { slot: 'settings-pane', slotId: 'demo-settings-tool.pane', exclusive: false },
+          capabilities: ['panel', 'actions'],
+          loadOrder: 20,
+          getSnapshot() {
+            return {
+              revision: 'cfg-1',
+              sections: [
+                {
+                  kind: 'actions',
+                  items: [{ id: 'apply-stdio', label: { ko: 'Stdio 적용', en: 'Apply Stdio' }, style: 'danger' }],
+                },
+              ],
+            };
+          },
+          invoke(actionId, invocation) {
+            if (actionId === 'apply-stdio' && invocation.challengeResponse?.confirmed !== true) {
+              return {
+                status: 'confirmation_required',
+                challengeId: 'stdio-chg-1',
+                message: { ko: 'Stdio 명령을 승인하시겠습니까?', en: 'Approve stdio command?' },
+                confirmLabel: { ko: '승인', en: 'Approve' },
+              };
+            }
+            window.__confirmedRuns += 1;
+            return { status: 'ok', message: { ko: '적용됨', en: 'Applied' } };
+          },
+        });
+      });
+
+      // Wait for declarative slot render & inspect inside slot root via renderer API
+      const uiMetrics = await page.evaluate(async () => {
+        const h = window.antigravityRemoteHost;
+        await h.renderer.render();
+        const root = h.renderer.getSlotRoot();
+        const statusBar = root.querySelector('[data-remote-slot="status-bar"]');
+        const pill = root.querySelector('[data-rph-control="dock-pill"]');
+        pill.click();
+        await h.renderer.render();
+
+        const settingsGroup = root.querySelector('[data-remote-slot-group="settings-pane"]');
+        const langBtn = root.querySelector('[data-rph-control="lang-toggle"]');
+        const closeBtn = root.querySelector('[data-rph-control="close"]');
+        const actionBtn = root.querySelector('[data-action-id="apply-stdio"]');
+
+        const heights = [pill, langBtn, closeBtn, actionBtn].map((el) => el.getBoundingClientRect().height);
+        const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+
+        // Click risky action -> must show 2-step confirmation, NOT auto-confirm!
+        actionBtn.click();
+        await new Promise((r) => setTimeout(r, 30));
+        const runsBeforeConfirm = window.__confirmedRuns;
+        const confirmVisible = !root.querySelector('[data-rph-control="confirm-box"]').hidden;
+        root.querySelector('[data-rph-control="confirm-accept"]').click();
+        await new Promise((r) => setTimeout(r, 30));
+        const runsAfterConfirm = window.__confirmedRuns;
+
+        // Switch KO -> EN via host self-managed toggle
+        langBtn.click();
+        await new Promise((r) => setTimeout(r, 30));
+        const enTitle = root.querySelector('.rph-title').textContent;
+
+        return {
+          statusBarVisible: Boolean(statusBar && !statusBar.hidden && statusBar.textContent.includes('42%')),
+          settingsGroupMounted: Boolean(settingsGroup),
+          minHeight: Math.min(...heights),
+          overflow,
+          runsBeforeConfirm,
+          confirmVisible,
+          runsAfterConfirm,
+          enTitle,
+        };
+      });
+
+      assert.equal(uiMetrics.statusBarVisible, true, `${sc.mode}: status-bar plugin must render in status-bar slot`);
+      assert.equal(uiMetrics.settingsGroupMounted, true, `${sc.mode}: settings-pane plugin must render in settings-pane group`);
+      assert.ok(uiMetrics.minHeight >= 44, `${sc.mode}: touch target < 44px (${uiMetrics.minHeight}px)`);
+      assert.ok(uiMetrics.overflow <= 0, `${sc.mode}: horizontal overflow (${uiMetrics.overflow}px)`);
+      assert.equal(uiMetrics.runsBeforeConfirm, 0, `${sc.mode}: host must NEVER auto-confirm`);
+      assert.equal(uiMetrics.confirmVisible, true, `${sc.mode}: 2-step confirmation dialog must appear`);
+      assert.equal(uiMetrics.runsAfterConfirm, 1, `${sc.mode}: confirmed action must run once`);
+      assert.equal(uiMetrics.enTitle, 'Remote Plugin Host');
+
+      // Escape closes drawer and returns focus
+      await page.keyboard.press('Escape');
+      const closedAfterEscape = await page.evaluate(() => !window.antigravityRemoteHost.renderer.isOpen());
+      assert.equal(closedAfterEscape, true);
+
+      // Idempotent second bookmarklet tap toggles drawer open without duplicating root
+      if (sc.mode === 'bookmarklet') {
+        await page.click('#run-bookmarklet');
+        const bmCheck = await page.evaluate(() => ({
+          hostCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
+          reopened: window.antigravityRemoteHost.renderer.isOpen(),
+        }));
+        assert.equal(bmCheck.hostCount, 1);
+        assert.equal(bmCheck.reopened, true);
+      }
+
+      // Full dispose() removes host DOM & cleans global handle
+      await page.evaluate(() => window.antigravityRemoteHost.dispose());
+      const afterDispose = await page.evaluate(() => ({
+        hostCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
+        hasGlobal: 'antigravityRemoteHost' in window,
+      }));
+      assert.equal(afterDispose.hostCount, 0);
+      assert.equal(afterDispose.hasGlobal, false);
       assert.deepEqual(errors, [], `${sc.mode}: unexpected browser errors`);
+
       await context.close();
     }
   } finally {
     await browser.close();
-    remoteWebSrv.server.closeAllConnections?.();
-    translateSrv.server.closeAllConnections?.();
-    await new Promise((r) => remoteWebSrv.server.close(r));
-    await new Promise((r) => translateSrv.server.close(r));
+  }
+});
+
+test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js inside AddonManifest.v1 scoped addonHost sandbox and verifies full dispose teardown', async () => {
+  const addonRendererSource = readFileSync(join(ROOT, 'dist/addon-renderer.js'), 'utf8');
+  const srv = await startHttpServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><html><head><meta charset="utf-8"></head><body><main id="desktop-settings"></main></body></html>');
+  });
+
+  const browser = await launchChromium();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', (err) => errors.push(err.message));
+
+    await page.goto(`http://127.0.0.1:${srv.port}/`, { waitUntil: 'domcontentloaded' });
+    const result = await page.evaluate((rendererCode) => {
+      const slots = new Map();
+      const styles = new Map();
+      const disposers = [];
+      const addonHost = Object.freeze({
+        pluginId: 'antigravity-remote-plugin',
+        hostVersion: '1.0.1',
+        hostProfileId: 'antigravity-desktop',
+        storageNamespace: 'antigravity-remote-plugin',
+        ipcChannelPrefix: null,
+        getNoTranslateSelector() {
+          return '[data-addon-host-owner], [translate="no"], [data-agy-no-translate="true"]';
+        },
+        mountSlot(slotId) {
+          if (slotId !== 'antigravity-remote-plugin.settings') {
+            throw new Error(`ERR_UNDECLARED_SLOT:${slotId}`);
+          }
+          if (!slots.has(slotId)) {
+            const el = document.createElement('div');
+            el.setAttribute('translate', 'no');
+            el.setAttribute('data-addon-host-owner', 'antigravity-remote-plugin');
+            el.setAttribute('data-addon-host-slot', slotId);
+            document.getElementById('desktop-settings').appendChild(el);
+            slots.set(slotId, el);
+          }
+          return slots.get(slotId);
+        },
+        unmountSlot(slotId) {
+          const el = slots.get(slotId);
+          if (!el) return false;
+          el.remove();
+          slots.delete(slotId);
+          return true;
+        },
+        injectStyle(styleId, cssText) {
+          let st = styles.get(styleId);
+          if (!st) {
+            st = document.createElement('style');
+            st.setAttribute('data-addon-host-owner', 'antigravity-remote-plugin');
+            st.setAttribute('data-addon-host-style', `antigravity-remote-plugin:${styleId}`);
+            document.head.appendChild(st);
+            styles.set(styleId, st);
+          }
+          st.textContent = cssText;
+          return st;
+        },
+        removeStyle(styleId) {
+          const st = styles.get(styleId);
+          if (!st) return false;
+          st.remove();
+          styles.delete(styleId);
+          return true;
+        },
+        listOwnedSlots() {
+          return [...slots.keys()];
+        },
+        onDispose(fn) {
+          disposers.push(fn);
+        },
+        dispose() {
+          for (const fn of disposers.splice(0, disposers.length)) {
+            fn();
+          }
+          for (const el of slots.values()) el.remove();
+          slots.clear();
+          for (const st of styles.values()) st.remove();
+          styles.clear();
+        },
+      });
+
+      const run = new Function('addonHost', rendererCode);
+      run(addonHost);
+
+      const slotEl = document.querySelector('[data-addon-host-slot="antigravity-remote-plugin.settings"]');
+      const styleEl = document.querySelector('style[data-addon-host-owner="antigravity-remote-plugin"]');
+      const koTitle = slotEl?.querySelector('.drc-title')?.textContent || '';
+      slotEl?.querySelector('[data-drc-action="toggle-locale"]')?.click();
+      const enTitle = slotEl?.querySelector('.drc-title')?.textContent || '';
+
+      addonHost.dispose();
+      const remainingSlots = document.querySelectorAll('[data-addon-host-owner="antigravity-remote-plugin"]').length;
+      return {
+        mounted: Boolean(slotEl),
+        owner: slotEl?.getAttribute('data-addon-host-owner'),
+        noTranslate: slotEl?.getAttribute('translate'),
+        scopedStyle: Boolean(styleEl),
+        koTitle,
+        enTitle,
+        remainingSlots,
+      };
+    }, addonRendererSource);
+
+    assert.deepEqual(errors, []);
+    assert.equal(result.mounted, true);
+    assert.equal(result.owner, 'antigravity-remote-plugin');
+    assert.equal(result.noTranslate, 'no');
+    assert.equal(result.scopedStyle, true);
+    assert.equal(result.koTitle, '원격 플러그인 컴패니언');
+    assert.equal(result.enTitle, 'Remote Plugin Companion');
+    assert.equal(result.remainingSlots, 0);
+
+    await context.close();
+  } finally {
+    await browser.close();
+    srv.server.closeAllConnections?.();
+    await new Promise((r) => srv.server.close(r));
   }
 });

@@ -1,5 +1,5 @@
 // antigravity-remote-plugin v2.0.0 — standalone self-contained ESM bundle
-// Built deterministically with esbuild from 21 source modules.
+// Built deterministically with esbuild from 26 library modules.
 
 // src/security/redactor.js
 var SENSITIVE_KEY_PATTERN = /^(authorization|cookie|set-cookie|token|access_token|refresh_token|csrf|csrf_token|x-sidecar-token|x-csrf-token|x-api-key|api_key|apikey|secret|password|passwd|env|headers)$/i;
@@ -528,6 +528,135 @@ function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}) {
   return el;
 }
 
+// src/security/plugin-handshake.js
+var HANDSHAKE_PROTOCOL_TYPE = "remote-plugin-v1:handshake-init";
+var HANDSHAKE_ACK_TYPE = "remote-plugin-v1:handshake-ack";
+function generateHandshakeNonce(byteLength = 24) {
+  const bytes = new Uint8Array(byteLength);
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    throw new SecurityPolicyError(
+      "ERR_CRYPTO_UNAVAILABLE",
+      "Web Crypto API is required to generate cryptographic handshake nonces."
+    );
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
+  if (!win || typeof win.addEventListener !== "function") {
+    throw new SecurityPolicyError("ERR_INVALID_WINDOW", "A window with event listeners is required.");
+  }
+  if (!Array.isArray(allowedOrigins) || allowedOrigins.length === 0) {
+    throw new SecurityPolicyError("ERR_EMPTY_ALLOWLIST", "An explicit allowedOrigins array is required.");
+  }
+  if (typeof onPortConnected !== "function") {
+    throw new TypeError("onPortConnected callback is required.");
+  }
+  const pendingNonces = /* @__PURE__ */ new Set();
+  const activePorts = /* @__PURE__ */ new Set();
+  let disposed = false;
+  const onMessage = (event) => {
+    if (disposed || !event || typeof event !== "object") {
+      return;
+    }
+    if (!isOriginAllowed(event.origin, allowedOrigins)) {
+      return;
+    }
+    const data = event.data;
+    if (!data || typeof data !== "object" || data.type !== HANDSHAKE_PROTOCOL_TYPE) {
+      return;
+    }
+    if (typeof data.nonce !== "string" || !pendingNonces.has(data.nonce)) {
+      return;
+    }
+    const port = Array.isArray(event.ports) ? event.ports[0] : null;
+    if (!port || typeof port.postMessage !== "function") {
+      return;
+    }
+    pendingNonces.delete(data.nonce);
+    activePorts.add(port);
+    if (typeof port.start === "function") {
+      port.start();
+    }
+    port.postMessage({ type: HANDSHAKE_ACK_TYPE, accepted: true });
+    onPortConnected({
+      port,
+      origin: event.origin,
+      pluginId: typeof data.pluginId === "string" ? data.pluginId : null,
+      close() {
+        activePorts.delete(port);
+        if (typeof port.close === "function") {
+          port.close();
+        }
+      }
+    });
+  };
+  win.addEventListener("message", onMessage);
+  return Object.freeze({
+    issueNonce() {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_HANDSHAKE_DISPOSED", "Handshake host is disposed.");
+      }
+      const nonce = generateHandshakeNonce();
+      pendingNonces.add(nonce);
+      return nonce;
+    },
+    pendingCount() {
+      return pendingNonces.size;
+    },
+    activePortCount() {
+      return activePorts.size;
+    },
+    dispose() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      pendingNonces.clear();
+      if (typeof win.removeEventListener === "function") {
+        win.removeEventListener("message", onMessage);
+      }
+      for (const port of activePorts) {
+        if (typeof port.close === "function") {
+          port.close();
+        }
+      }
+      activePorts.clear();
+    }
+  });
+}
+function initiatePluginHandshake({
+  targetWindow,
+  targetOrigin,
+  allowedOrigins,
+  nonce,
+  pluginId,
+  MessageChannelCtor = globalThis.MessageChannel
+}) {
+  assertOriginAllowed(targetOrigin, allowedOrigins, "handshake targetOrigin");
+  if (typeof nonce !== "string" || nonce.length < 16) {
+    throw new SecurityPolicyError("ERR_INVALID_NONCE", "A cryptographic nonce is required.");
+  }
+  if (typeof MessageChannelCtor !== "function") {
+    throw new SecurityPolicyError("ERR_NO_MESSAGE_CHANNEL", "MessageChannel is unavailable.");
+  }
+  const channel = new MessageChannelCtor();
+  if (typeof channel.port1.start === "function") {
+    channel.port1.start();
+  }
+  targetWindow.postMessage(
+    {
+      type: HANDSHAKE_PROTOCOL_TYPE,
+      nonce,
+      pluginId: typeof pluginId === "string" ? pluginId : null
+    },
+    targetOrigin,
+    [channel.port2]
+  );
+  return channel.port1;
+}
+
 // src/core/diagnostics.js
 var DEFAULT_MAX_EVENTS = 200;
 var DiagnosticsBus = class {
@@ -772,7 +901,15 @@ var PORT_CONTRACTS = Object.freeze({
   SidecarRelayPort: Object.freeze(["requestJson", "buildUiUrl"]),
   SettingsReadPort: Object.freeze(["readPluginSettings"]),
   ThemeWorkspaceSyncPort: Object.freeze(["getThemeVariables", "getWorkspaceUris", "subscribe"]),
-  ExtensionBridgePort: Object.freeze(["id", "pluginName", "mount", "dispose"])
+  ExtensionBridgePort: Object.freeze(["id", "pluginName", "mount", "dispose"]),
+  HostSurfacePort: Object.freeze([
+    "mountSlot",
+    "unmountSlot",
+    "injectStyle",
+    "removeStyle",
+    "onDispose",
+    "dispose"
+  ])
 });
 function validateDiscoveryPort(port) {
   return assertPort(port, "HostDiscoveryPort", PORT_CONTRACTS.HostDiscoveryPort);
@@ -788,6 +925,9 @@ function validateSettingsReadPort(port) {
 }
 function validateThemeWorkspaceSyncPort(port) {
   return assertPort(port, "ThemeWorkspaceSyncPort", PORT_CONTRACTS.ThemeWorkspaceSyncPort);
+}
+function validateHostSurfacePort(port) {
+  return assertPort(port, "HostSurfacePort", PORT_CONTRACTS.HostSurfacePort);
 }
 function validateBridgeDescriptor(bridge) {
   if (!bridge || typeof bridge !== "object") {
@@ -1048,6 +1188,1616 @@ var RemoteOrchestrator = class {
     this.#activeFrame = null;
   }
 };
+
+// src/core/remote-plugin-contract.js
+var REMOTE_PLUGIN_CONTRACT_VERSION = "remote-plugin.v1";
+var ALLOWED_UI_SLOTS = Object.freeze([
+  "title-bar",
+  "sidebar",
+  "status-bar",
+  "composer-toolbar",
+  "settings-pane",
+  "aux-pane",
+  "modal",
+  "overlay",
+  "theme",
+  "custom"
+]);
+var ALLOWED_CAPABILITIES = Object.freeze([
+  "badge",
+  "panel",
+  "actions",
+  "subscribe"
+]);
+var ALLOWED_SLOT_SET = new Set(ALLOWED_UI_SLOTS);
+var ALLOWED_CAPABILITY_SET = new Set(ALLOWED_CAPABILITIES);
+var ALLOWED_TONES = /* @__PURE__ */ new Set(["neutral", "info", "ok", "warn", "error"]);
+var ALLOWED_BUTTON_STYLES = /* @__PURE__ */ new Set(["primary", "secondary", "danger"]);
+var ALLOWED_ACTION_STATUSES = /* @__PURE__ */ new Set([
+  "ok",
+  "confirmation_required",
+  "conflict",
+  "error"
+]);
+var FORBIDDEN_KEYS = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
+var PLUGIN_ID_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+var SLOT_ID_RE = /^[a-z0-9][a-z0-9._-]{1,95}$/;
+var ACTION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$/;
+var SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+var BIDI_CONTROL_RE = /[\u202A-\u202E\u2066-\u2069]/;
+var DANGEROUS_URI_RE = /(?:javascript|vbscript|data)\s*:/i;
+var RAW_MARKUP_RE = /<\s*(?:script|svg|iframe|object|embed|style|link|base)\b/i;
+var MAX_TEXT_LENGTH = 1e3;
+var MAX_SECTIONS = 24;
+var MAX_ITEMS_PER_SECTION = 64;
+function isPlainObject(val) {
+  if (!val || typeof val !== "object" || Array.isArray(val)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+function assertNoForbiddenKeys(obj, label) {
+  if (!obj || typeof obj !== "object") {
+    return;
+  }
+  for (const key of Object.keys(obj)) {
+    if (FORBIDDEN_KEYS.has(key)) {
+      throw new SecurityPolicyError(
+        "ERR_FORBIDDEN_KEY",
+        `Forbidden key "${key}" detected in ${label}.`
+      );
+    }
+  }
+}
+function assertSafeText(value, label, { maxLength = MAX_TEXT_LENGTH } = {}) {
+  if (typeof value !== "string") {
+    throw new SecurityPolicyError("ERR_INVALID_TEXT", `${label} must be a string.`);
+  }
+  if (value.length > maxLength) {
+    throw new SecurityPolicyError(
+      "ERR_TEXT_TOO_LONG",
+      `${label} exceeds maximum allowed length (${maxLength}).`
+    );
+  }
+  if (BIDI_CONTROL_RE.test(value)) {
+    throw new SecurityPolicyError(
+      "ERR_FORBIDDEN_BIDI_CONTROL",
+      `${label} contains forbidden bidirectional override control characters.`
+    );
+  }
+  const collapsed = value.replace(/[\u0000-\u0020\u007f]+/g, "");
+  if (DANGEROUS_URI_RE.test(collapsed)) {
+    throw new SecurityPolicyError(
+      "ERR_FORBIDDEN_URI_SCHEME",
+      `${label} contains a forbidden URI scheme.`
+    );
+  }
+  if (RAW_MARKUP_RE.test(value)) {
+    throw new SecurityPolicyError(
+      "ERR_FORBIDDEN_MARKUP",
+      `${label} contains forbidden active HTML or SVG markup.`
+    );
+  }
+  return value;
+}
+function assertSafeLocalizedText(value, label) {
+  if (typeof value === "string") {
+    return assertSafeText(value, label);
+  }
+  if (!isPlainObject(value)) {
+    throw new SecurityPolicyError(
+      "ERR_INVALID_LOCALIZED_TEXT",
+      `${label} must be a string or { ko, en } object.`
+    );
+  }
+  assertNoForbiddenKeys(value, label);
+  const hasKo = typeof value.ko === "string" && value.ko.length > 0;
+  const hasEn = typeof value.en === "string" && value.en.length > 0;
+  if (!hasKo && !hasEn) {
+    throw new SecurityPolicyError(
+      "ERR_EMPTY_LOCALIZED_TEXT",
+      `${label} must provide at least one non-empty "ko" or "en" string.`
+    );
+  }
+  const normalized = /* @__PURE__ */ Object.create(null);
+  if (hasKo) {
+    normalized.ko = assertSafeText(value.ko, `${label}.ko`);
+  }
+  if (hasEn) {
+    normalized.en = assertSafeText(value.en, `${label}.en`);
+  }
+  return Object.freeze(normalized);
+}
+function resolveLocalizedText(value, locale = "ko") {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  if (locale === "en") {
+    return typeof value.en === "string" ? value.en : typeof value.ko === "string" ? value.ko : "";
+  }
+  return typeof value.ko === "string" ? value.ko : typeof value.en === "string" ? value.en : "";
+}
+function validateRemotePlugin(plugin) {
+  if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) {
+    throw new SecurityPolicyError("ERR_INVALID_PLUGIN", "RemotePlugin.v1 descriptor must be an object.");
+  }
+  assertNoForbiddenKeys(plugin, "plugin");
+  if (plugin.contractVersion !== REMOTE_PLUGIN_CONTRACT_VERSION) {
+    throw new SecurityPolicyError(
+      "ERR_UNSUPPORTED_CONTRACT_VERSION",
+      `Plugin contractVersion must be "${REMOTE_PLUGIN_CONTRACT_VERSION}".`
+    );
+  }
+  if (typeof plugin.mount === "function") {
+    throw new SecurityPolicyError(
+      "ERR_IMPERATIVE_MOUNT_FORBIDDEN",
+      "RemotePlugin.v1 plugins must be declarative-only and cannot define imperative mount()."
+    );
+  }
+  if (typeof plugin.id !== "string" || !PLUGIN_ID_RE.test(plugin.id) || FORBIDDEN_KEYS.has(plugin.id)) {
+    throw new SecurityPolicyError("ERR_INVALID_PLUGIN_ID", "Invalid RemotePlugin.v1 id.");
+  }
+  if (typeof plugin.version !== "string" || !SEMVER_RE.test(plugin.version)) {
+    throw new SecurityPolicyError("ERR_INVALID_PLUGIN_VERSION", "Plugin version must be valid SemVer.");
+  }
+  const displayName = assertSafeLocalizedText(plugin.displayName, "plugin.displayName");
+  if (!isPlainObject(plugin.uiSlot)) {
+    throw new SecurityPolicyError("ERR_INVALID_UI_SLOT", "Plugin must declare a uiSlot object.");
+  }
+  assertNoForbiddenKeys(plugin.uiSlot, "plugin.uiSlot");
+  if (typeof plugin.uiSlot.slot !== "string" || !ALLOWED_SLOT_SET.has(plugin.uiSlot.slot)) {
+    throw new SecurityPolicyError(
+      "ERR_UNSUPPORTED_UI_SLOT",
+      `Unsupported uiSlot.slot "${String(plugin.uiSlot.slot)}".`
+    );
+  }
+  if (typeof plugin.uiSlot.slotId !== "string" || !SLOT_ID_RE.test(plugin.uiSlot.slotId) || FORBIDDEN_KEYS.has(plugin.uiSlot.slotId)) {
+    throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "Invalid uiSlot.slotId.");
+  }
+  const exclusive = Boolean(plugin.uiSlot.exclusive);
+  if (!Array.isArray(plugin.capabilities) || plugin.capabilities.length === 0) {
+    throw new SecurityPolicyError(
+      "ERR_INVALID_CAPABILITIES",
+      "Plugin must declare at least one capability."
+    );
+  }
+  const capabilities = [];
+  const seenCaps = /* @__PURE__ */ new Set();
+  for (const cap of plugin.capabilities) {
+    if (typeof cap !== "string" || !ALLOWED_CAPABILITY_SET.has(cap)) {
+      throw new SecurityPolicyError(
+        "ERR_UNSUPPORTED_CAPABILITY",
+        `Unsupported capability "${String(cap)}".`
+      );
+    }
+    if (!seenCaps.has(cap)) {
+      seenCaps.add(cap);
+      capabilities.push(cap);
+    }
+  }
+  if (typeof plugin.getSnapshot !== "function") {
+    throw new SecurityPolicyError(
+      "ERR_MISSING_GET_SNAPSHOT",
+      "RemotePlugin.v1 requires a getSnapshot(ctx) method."
+    );
+  }
+  if (seenCaps.has("actions") && typeof plugin.invoke !== "function") {
+    throw new SecurityPolicyError(
+      "ERR_MISSING_INVOKE",
+      'Plugin declaring "actions" capability must implement invoke(actionId, invocation, ctx).'
+    );
+  }
+  if (seenCaps.has("subscribe") && typeof plugin.subscribe !== "function") {
+    throw new SecurityPolicyError(
+      "ERR_MISSING_SUBSCRIBE",
+      'Plugin declaring "subscribe" capability must implement subscribe(onDirty, ctx).'
+    );
+  }
+  let loadOrder = 100;
+  if (plugin.loadOrder !== void 0) {
+    if (!Number.isInteger(plugin.loadOrder) || plugin.loadOrder < 0 || plugin.loadOrder > 1e3) {
+      throw new SecurityPolicyError(
+        "ERR_INVALID_LOAD_ORDER",
+        "Plugin loadOrder must be an integer between 0 and 1000."
+      );
+    }
+    loadOrder = plugin.loadOrder;
+  }
+  return Object.freeze({
+    contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
+    id: plugin.id,
+    version: plugin.version,
+    displayName,
+    uiSlot: Object.freeze({
+      slot: plugin.uiSlot.slot,
+      slotId: plugin.uiSlot.slotId,
+      exclusive
+    }),
+    capabilities: Object.freeze(capabilities),
+    loadOrder,
+    getSnapshot: plugin.getSnapshot.bind(plugin),
+    invoke: typeof plugin.invoke === "function" ? plugin.invoke.bind(plugin) : null,
+    subscribe: typeof plugin.subscribe === "function" ? plugin.subscribe.bind(plugin) : null,
+    dispose: typeof plugin.dispose === "function" ? plugin.dispose.bind(plugin) : null
+  });
+}
+function validateTone(tone, fallback = "neutral") {
+  if (tone === void 0) {
+    return fallback;
+  }
+  if (typeof tone !== "string" || !ALLOWED_TONES.has(tone)) {
+    throw new SecurityPolicyError("ERR_INVALID_TONE", `Invalid tone "${String(tone)}".`);
+  }
+  return tone;
+}
+function validateSection(section, index) {
+  const label = `snapshot.sections[${index}]`;
+  if (!isPlainObject(section)) {
+    throw new SecurityPolicyError("ERR_INVALID_SECTION", `${label} must be a plain object.`);
+  }
+  assertNoForbiddenKeys(section, label);
+  if (section.kind === "notice") {
+    return Object.freeze({
+      kind: "notice",
+      text: assertSafeLocalizedText(section.text, `${label}.text`),
+      tone: validateTone(section.tone, "info")
+    });
+  }
+  if (section.kind === "metrics") {
+    if (!Array.isArray(section.items) || section.items.length > MAX_ITEMS_PER_SECTION) {
+      throw new SecurityPolicyError("ERR_INVALID_SECTION_ITEMS", `${label}.items must be a bounded array.`);
+    }
+    const items = section.items.map((item, i) => {
+      if (!isPlainObject(item)) {
+        throw new SecurityPolicyError("ERR_INVALID_METRIC", `${label}.items[${i}] must be a plain object.`);
+      }
+      assertNoForbiddenKeys(item, `${label}.items[${i}]`);
+      return Object.freeze({
+        label: assertSafeLocalizedText(item.label, `${label}.items[${i}].label`),
+        value: assertSafeText(String(item.value ?? ""), `${label}.items[${i}].value`, { maxLength: 160 }),
+        tone: validateTone(item.tone, "neutral")
+      });
+    });
+    return Object.freeze({ kind: "metrics", items: Object.freeze(items) });
+  }
+  if (section.kind === "list") {
+    if (!Array.isArray(section.items) || section.items.length > MAX_ITEMS_PER_SECTION) {
+      throw new SecurityPolicyError("ERR_INVALID_SECTION_ITEMS", `${label}.items must be a bounded array.`);
+    }
+    const title = section.title !== void 0 ? assertSafeLocalizedText(section.title, `${label}.title`) : null;
+    const items = section.items.map((item, i) => {
+      if (!isPlainObject(item)) {
+        throw new SecurityPolicyError("ERR_INVALID_LIST_ITEM", `${label}.items[${i}] must be a plain object.`);
+      }
+      assertNoForbiddenKeys(item, `${label}.items[${i}]`);
+      return Object.freeze({
+        id: assertSafeText(String(item.id ?? i), `${label}.items[${i}].id`, { maxLength: 128 }),
+        primary: assertSafeLocalizedText(item.primary, `${label}.items[${i}].primary`),
+        secondary: item.secondary !== void 0 ? assertSafeLocalizedText(item.secondary, `${label}.items[${i}].secondary`) : null,
+        badge: item.badge !== void 0 ? assertSafeLocalizedText(item.badge, `${label}.items[${i}].badge`) : null
+      });
+    });
+    return Object.freeze({ kind: "list", title, items: Object.freeze(items) });
+  }
+  if (section.kind === "key-value") {
+    if (!Array.isArray(section.entries) || section.entries.length > MAX_ITEMS_PER_SECTION) {
+      throw new SecurityPolicyError("ERR_INVALID_SECTION_ITEMS", `${label}.entries must be a bounded array.`);
+    }
+    const title = section.title !== void 0 ? assertSafeLocalizedText(section.title, `${label}.title`) : null;
+    const entries = section.entries.map((entry, i) => {
+      if (!isPlainObject(entry)) {
+        throw new SecurityPolicyError("ERR_INVALID_ENTRY", `${label}.entries[${i}] must be a plain object.`);
+      }
+      assertNoForbiddenKeys(entry, `${label}.entries[${i}]`);
+      return Object.freeze({
+        key: assertSafeLocalizedText(entry.key, `${label}.entries[${i}].key`),
+        value: assertSafeText(String(entry.value ?? ""), `${label}.entries[${i}].value`, { maxLength: 240 })
+      });
+    });
+    return Object.freeze({ kind: "key-value", title, entries: Object.freeze(entries) });
+  }
+  if (section.kind === "actions") {
+    if (!Array.isArray(section.items) || section.items.length > MAX_ITEMS_PER_SECTION) {
+      throw new SecurityPolicyError("ERR_INVALID_SECTION_ITEMS", `${label}.items must be a bounded array.`);
+    }
+    const title = section.title !== void 0 ? assertSafeLocalizedText(section.title, `${label}.title`) : null;
+    const items = section.items.map((item, i) => {
+      if (!isPlainObject(item)) {
+        throw new SecurityPolicyError("ERR_INVALID_ACTION_ITEM", `${label}.items[${i}] must be a plain object.`);
+      }
+      assertNoForbiddenKeys(item, `${label}.items[${i}]`);
+      if (typeof item.id !== "string" || !ACTION_ID_RE.test(item.id)) {
+        throw new SecurityPolicyError("ERR_INVALID_ACTION_ID", `Invalid action id in ${label}.items[${i}].`);
+      }
+      const style = item.style === void 0 ? "secondary" : item.style;
+      if (typeof style !== "string" || !ALLOWED_BUTTON_STYLES.has(style)) {
+        throw new SecurityPolicyError("ERR_INVALID_BUTTON_STYLE", `Invalid action style "${String(style)}".`);
+      }
+      return Object.freeze({
+        id: item.id,
+        label: assertSafeLocalizedText(item.label, `${label}.items[${i}].label`),
+        style,
+        disabled: Boolean(item.disabled)
+      });
+    });
+    return Object.freeze({ kind: "actions", title, items: Object.freeze(items) });
+  }
+  throw new SecurityPolicyError(
+    "ERR_UNSUPPORTED_SECTION_KIND",
+    `Unsupported declarative section kind "${String(section.kind)}".`
+  );
+}
+function validatePluginSnapshot(snapshot) {
+  if (!isPlainObject(snapshot)) {
+    throw new SecurityPolicyError("ERR_INVALID_SNAPSHOT", "Plugin snapshot must be a plain object.");
+  }
+  assertNoForbiddenKeys(snapshot, "snapshot");
+  const revision = snapshot.revision !== void 0 && snapshot.revision !== null ? assertSafeText(String(snapshot.revision), "snapshot.revision", { maxLength: 128 }) : null;
+  let badge = null;
+  if (snapshot.badge !== void 0 && snapshot.badge !== null) {
+    if (!isPlainObject(snapshot.badge)) {
+      throw new SecurityPolicyError("ERR_INVALID_BADGE", "snapshot.badge must be a plain object.");
+    }
+    assertNoForbiddenKeys(snapshot.badge, "snapshot.badge");
+    badge = Object.freeze({
+      text: assertSafeLocalizedText(snapshot.badge.text, "snapshot.badge.text"),
+      tone: validateTone(snapshot.badge.tone, "neutral")
+    });
+  }
+  let notice = null;
+  if (snapshot.notice !== void 0 && snapshot.notice !== null) {
+    if (!isPlainObject(snapshot.notice)) {
+      throw new SecurityPolicyError("ERR_INVALID_NOTICE", "snapshot.notice must be a plain object.");
+    }
+    assertNoForbiddenKeys(snapshot.notice, "snapshot.notice");
+    notice = Object.freeze({
+      text: assertSafeLocalizedText(snapshot.notice.text, "snapshot.notice.text"),
+      tone: validateTone(snapshot.notice.tone, "info")
+    });
+  }
+  const rawSections = snapshot.sections === void 0 ? [] : snapshot.sections;
+  if (!Array.isArray(rawSections) || rawSections.length > MAX_SECTIONS) {
+    throw new SecurityPolicyError(
+      "ERR_INVALID_SECTIONS",
+      `snapshot.sections must be an array with at most ${MAX_SECTIONS} items.`
+    );
+  }
+  const sections = Object.freeze(rawSections.map((sec, idx) => validateSection(sec, idx)));
+  return Object.freeze({
+    revision,
+    badge,
+    notice,
+    sections
+  });
+}
+function validateActionInvocation(actionId, invocation = {}) {
+  if (typeof actionId !== "string" || !ACTION_ID_RE.test(actionId)) {
+    throw new SecurityPolicyError("ERR_INVALID_ACTION_ID", "Invalid actionId.");
+  }
+  if (!isPlainObject(invocation)) {
+    throw new SecurityPolicyError("ERR_INVALID_INVOCATION", "Action invocation must be a plain object.");
+  }
+  assertNoForbiddenKeys(invocation, "invocation");
+  const clean = /* @__PURE__ */ Object.create(null);
+  if (invocation.expectedRevision !== void 0 && invocation.expectedRevision !== null) {
+    clean.expectedRevision = assertSafeText(String(invocation.expectedRevision), "invocation.expectedRevision", {
+      maxLength: 128
+    });
+  }
+  if (invocation.params !== void 0 && invocation.params !== null) {
+    if (!isPlainObject(invocation.params)) {
+      throw new SecurityPolicyError("ERR_INVALID_PARAMS", "invocation.params must be a plain object.");
+    }
+    assertNoForbiddenKeys(invocation.params, "invocation.params");
+    const safeParams = /* @__PURE__ */ Object.create(null);
+    for (const [k, v] of Object.entries(invocation.params)) {
+      if (typeof v === "string") {
+        safeParams[k] = assertSafeText(v, `invocation.params.${k}`);
+      } else if (typeof v === "number" && Number.isFinite(v)) {
+        safeParams[k] = v;
+      } else if (typeof v === "boolean") {
+        safeParams[k] = v;
+      } else {
+        throw new SecurityPolicyError(
+          "ERR_INVALID_PARAM_VALUE",
+          `invocation.params.${k} must be a primitive string, finite number, or boolean.`
+        );
+      }
+    }
+    clean.params = Object.freeze(safeParams);
+  }
+  if (invocation.challengeResponse !== void 0 && invocation.challengeResponse !== null) {
+    if (!isPlainObject(invocation.challengeResponse)) {
+      throw new SecurityPolicyError(
+        "ERR_INVALID_CHALLENGE_RESPONSE",
+        "invocation.challengeResponse must be a plain object."
+      );
+    }
+    assertNoForbiddenKeys(invocation.challengeResponse, "invocation.challengeResponse");
+    const challengeId = assertSafeText(
+      String(invocation.challengeResponse.challengeId ?? ""),
+      "invocation.challengeResponse.challengeId",
+      { maxLength: 128 }
+    );
+    if (!challengeId) {
+      throw new SecurityPolicyError("ERR_INVALID_CHALLENGE_ID", "challengeId must be non-empty.");
+    }
+    if (typeof invocation.challengeResponse.confirmed !== "boolean") {
+      throw new SecurityPolicyError(
+        "ERR_INVALID_CHALLENGE_CONFIRMED",
+        "challengeResponse.confirmed must be a boolean."
+      );
+    }
+    clean.challengeResponse = Object.freeze({
+      challengeId,
+      confirmed: invocation.challengeResponse.confirmed
+    });
+  }
+  return Object.freeze(clean);
+}
+function redactLocalizedMessage(value, label) {
+  const validated = assertSafeLocalizedText(value, label);
+  if (typeof validated === "string") {
+    return redactUrl(validated);
+  }
+  const out = /* @__PURE__ */ Object.create(null);
+  if (validated.ko) {
+    out.ko = redactUrl(validated.ko);
+  }
+  if (validated.en) {
+    out.en = redactUrl(validated.en);
+  }
+  return Object.freeze(out);
+}
+function validateActionResult(result) {
+  if (!isPlainObject(result)) {
+    throw new SecurityPolicyError("ERR_INVALID_ACTION_RESULT", "ActionResult.v1 must be a plain object.");
+  }
+  assertNoForbiddenKeys(result, "actionResult");
+  if (typeof result.status !== "string" || !ALLOWED_ACTION_STATUSES.has(result.status)) {
+    throw new SecurityPolicyError(
+      "ERR_INVALID_ACTION_STATUS",
+      `Invalid ActionResult status "${String(result.status)}".`
+    );
+  }
+  if (result.status === "confirmation_required") {
+    const challengeId = assertSafeText(String(result.challengeId ?? ""), "actionResult.challengeId", {
+      maxLength: 128
+    });
+    if (!challengeId) {
+      throw new SecurityPolicyError(
+        "ERR_MISSING_CHALLENGE_ID",
+        "confirmation_required result must include a non-empty challengeId."
+      );
+    }
+    const message2 = redactLocalizedMessage(result.message, "actionResult.message");
+    const confirmLabel = result.confirmLabel !== void 0 ? assertSafeLocalizedText(result.confirmLabel, "actionResult.confirmLabel") : null;
+    return Object.freeze({
+      status: "confirmation_required",
+      challengeId,
+      message: message2,
+      confirmLabel
+    });
+  }
+  if (result.status === "conflict") {
+    const message2 = redactLocalizedMessage(
+      result.message ?? { ko: "\uC0C1\uD0DC\uAC00 \uBCC0\uACBD\uB418\uC5C8\uC2B5\uB2C8\uB2E4. \uC0C8\uB85C\uACE0\uCE68 \uD6C4 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.", en: "State changed. Refresh and retry." },
+      "actionResult.message"
+    );
+    const currentRevision = result.currentRevision !== void 0 && result.currentRevision !== null ? assertSafeText(String(result.currentRevision), "actionResult.currentRevision", { maxLength: 128 }) : null;
+    return Object.freeze({
+      status: "conflict",
+      message: message2,
+      currentRevision
+    });
+  }
+  if (result.status === "error") {
+    const message2 = redactLocalizedMessage(
+      result.message ?? { ko: "\uC791\uC5C5\uC744 \uC644\uB8CC\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.", en: "Action failed." },
+      "actionResult.message"
+    );
+    return Object.freeze({
+      status: "error",
+      message: message2
+    });
+  }
+  const message = result.message !== void 0 && result.message !== null ? redactLocalizedMessage(result.message, "actionResult.message") : null;
+  const revision = result.revision !== void 0 && result.revision !== null ? assertSafeText(String(result.revision), "actionResult.revision", { maxLength: 128 }) : null;
+  return Object.freeze({
+    status: "ok",
+    message,
+    revision
+  });
+}
+
+// src/core/remote-plugin-registry.js
+var hasOwn = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+var RemotePluginRegistry = class {
+  #plugins = /* @__PURE__ */ Object.create(null);
+  #exclusiveSlotOwners = /* @__PURE__ */ Object.create(null);
+  #slotIds = /* @__PURE__ */ Object.create(null);
+  #unsubscribers = /* @__PURE__ */ Object.create(null);
+  #listeners = /* @__PURE__ */ new Set();
+  #diagnostics;
+  #disposed = false;
+  constructor({ diagnostics = new DiagnosticsBus() } = {}) {
+    this.#diagnostics = diagnostics;
+  }
+  get diagnostics() {
+    return this.#diagnostics;
+  }
+  register(rawPlugin, { locale = "ko" } = {}) {
+    if (this.#disposed) {
+      throw new SecurityPolicyError("ERR_REGISTRY_DISPOSED", "Cannot register plugin on a disposed registry.");
+    }
+    const plugin = validateRemotePlugin(rawPlugin);
+    if (hasOwn(this.#plugins, plugin.id)) {
+      throw new SecurityPolicyError(
+        "ERR_DUPLICATE_PLUGIN_ID",
+        `Remote plugin "${plugin.id}" is already registered.`
+      );
+    }
+    if (hasOwn(this.#slotIds, plugin.uiSlot.slotId)) {
+      throw new SecurityPolicyError(
+        "ERR_DUPLICATE_SLOT_ID",
+        `UI slotId "${plugin.uiSlot.slotId}" is already claimed by "${this.#slotIds[plugin.uiSlot.slotId]}".`
+      );
+    }
+    if (plugin.uiSlot.exclusive && hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
+      throw new SecurityPolicyError(
+        "ERR_EXCLUSIVE_SLOT_CONFLICT",
+        `Exclusive slot "${plugin.uiSlot.slot}" is already owned by "${this.#exclusiveSlotOwners[plugin.uiSlot.slot]}".`
+      );
+    }
+    if (!plugin.uiSlot.exclusive && hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
+      throw new SecurityPolicyError(
+        "ERR_EXCLUSIVE_SLOT_CONFLICT",
+        `Slot "${plugin.uiSlot.slot}" is exclusively owned by "${this.#exclusiveSlotOwners[plugin.uiSlot.slot]}".`
+      );
+    }
+    if (plugin.uiSlot.exclusive) {
+      for (const existingId of Object.keys(this.#plugins)) {
+        if (this.#plugins[existingId].uiSlot.slot === plugin.uiSlot.slot) {
+          throw new SecurityPolicyError(
+            "ERR_EXCLUSIVE_SLOT_CONFLICT",
+            `Cannot claim exclusive slot "${plugin.uiSlot.slot}" while "${existingId}" is registered in it.`
+          );
+        }
+      }
+    }
+    this.#plugins[plugin.id] = plugin;
+    this.#slotIds[plugin.uiSlot.slotId] = plugin.id;
+    if (plugin.uiSlot.exclusive) {
+      this.#exclusiveSlotOwners[plugin.uiSlot.slot] = plugin.id;
+    }
+    if (plugin.capabilities.includes("subscribe") && typeof plugin.subscribe === "function") {
+      try {
+        const unsub = plugin.subscribe(
+          () => {
+            if (!this.#disposed && hasOwn(this.#plugins, plugin.id)) {
+              this.#emitChange({ type: "dirty", pluginId: plugin.id });
+            }
+          },
+          { locale }
+        );
+        if (typeof unsub === "function") {
+          this.#unsubscribers[plugin.id] = unsub;
+        }
+      } catch (err) {
+        this.#diagnostics.emit({
+          level: "error",
+          code: "PLUGIN_SUBSCRIBE_FAILED",
+          source: "core.remote-plugin-registry",
+          message: `Plugin "${plugin.id}" subscribe() threw`,
+          detail: err
+        });
+      }
+    }
+    this.#emitChange({ type: "registered", pluginId: plugin.id });
+    let active = true;
+    return () => {
+      if (!active) {
+        return;
+      }
+      active = false;
+      this.unregister(plugin.id);
+    };
+  }
+  unregister(pluginId) {
+    if (typeof pluginId !== "string" || !hasOwn(this.#plugins, pluginId)) {
+      return false;
+    }
+    const plugin = this.#plugins[pluginId];
+    delete this.#plugins[pluginId];
+    if (hasOwn(this.#slotIds, plugin.uiSlot.slotId) && this.#slotIds[plugin.uiSlot.slotId] === pluginId) {
+      delete this.#slotIds[plugin.uiSlot.slotId];
+    }
+    if (hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot) && this.#exclusiveSlotOwners[plugin.uiSlot.slot] === pluginId) {
+      delete this.#exclusiveSlotOwners[plugin.uiSlot.slot];
+    }
+    if (hasOwn(this.#unsubscribers, pluginId)) {
+      const unsub = this.#unsubscribers[pluginId];
+      delete this.#unsubscribers[pluginId];
+      try {
+        unsub();
+      } catch (err) {
+        this.#diagnostics.emit({
+          level: "error",
+          code: "PLUGIN_UNSUBSCRIBE_FAILED",
+          source: "core.remote-plugin-registry",
+          message: `Plugin "${pluginId}" unsubscribe failed`,
+          detail: err
+        });
+      }
+    }
+    if (typeof plugin.dispose === "function") {
+      try {
+        plugin.dispose();
+      } catch (err) {
+        this.#diagnostics.emit({
+          level: "error",
+          code: "PLUGIN_DISPOSE_FAILED",
+          source: "core.remote-plugin-registry",
+          message: `Plugin "${pluginId}" dispose() threw`,
+          detail: err
+        });
+      }
+    }
+    this.#emitChange({ type: "unregistered", pluginId });
+    return true;
+  }
+  get(pluginId) {
+    if (typeof pluginId !== "string" || !hasOwn(this.#plugins, pluginId)) {
+      return null;
+    }
+    return this.#plugins[pluginId];
+  }
+  list() {
+    return Object.keys(this.#plugins).map((id) => this.#plugins[id]).sort((a, b) => {
+      if (a.loadOrder !== b.loadOrder) {
+        return a.loadOrder - b.loadOrder;
+      }
+      return a.id.localeCompare(b.id);
+    });
+  }
+  listBySlot(slot) {
+    return this.list().filter((plugin) => plugin.uiSlot.slot === slot);
+  }
+  async readSnapshot(pluginId, ctx = { locale: "ko" }) {
+    const plugin = this.get(pluginId);
+    if (!plugin) {
+      return Object.freeze({ ok: false, error: "Plugin not registered." });
+    }
+    try {
+      const raw = await plugin.getSnapshot({ locale: ctx?.locale === "en" ? "en" : "ko" });
+      const snapshot = validatePluginSnapshot(raw);
+      return Object.freeze({ ok: true, snapshot });
+    } catch (err) {
+      const redacted = redactSecrets(err);
+      this.#diagnostics.emit({
+        level: "error",
+        code: "PLUGIN_SNAPSHOT_FAILED",
+        source: "core.remote-plugin-registry",
+        message: `Plugin "${pluginId}" snapshot failed`,
+        detail: err
+      });
+      return Object.freeze({
+        ok: false,
+        error: typeof redacted?.message === "string" && redacted.message ? redacted.message : "Snapshot failed."
+      });
+    }
+  }
+  async invokeAction(pluginId, actionId, invocation = {}, ctx = { locale: "ko" }) {
+    const plugin = this.get(pluginId);
+    if (!plugin) {
+      return validateActionResult({
+        status: "error",
+        message: { ko: "\uB4F1\uB85D\uB418\uC9C0 \uC54A\uC740 \uD50C\uB7EC\uADF8\uC778\uC785\uB2C8\uB2E4.", en: "Plugin is not registered." }
+      });
+    }
+    if (!plugin.capabilities.includes("actions") || typeof plugin.invoke !== "function") {
+      return validateActionResult({
+        status: "error",
+        message: { ko: "\uC561\uC158\uC744 \uC9C0\uC6D0\uD558\uC9C0 \uC54A\uB294 \uD50C\uB7EC\uADF8\uC778\uC785\uB2C8\uB2E4.", en: "Plugin does not support actions." }
+      });
+    }
+    let safeInvocation;
+    try {
+      safeInvocation = validateActionInvocation(actionId, invocation);
+    } catch (err) {
+      const redacted = redactSecrets(err);
+      return validateActionResult({
+        status: "error",
+        message: redacted?.message || "Invalid action invocation."
+      });
+    }
+    try {
+      const rawResult = await plugin.invoke(actionId, safeInvocation, {
+        locale: ctx?.locale === "en" ? "en" : "ko"
+      });
+      return validateActionResult(rawResult);
+    } catch (err) {
+      const redacted = redactSecrets(err);
+      this.#diagnostics.emit({
+        level: "error",
+        code: "PLUGIN_INVOKE_FAILED",
+        source: "core.remote-plugin-registry",
+        message: `Plugin "${pluginId}" invoke("${actionId}") failed`,
+        detail: err
+      });
+      return validateActionResult({
+        status: "error",
+        message: redacted?.message || "Plugin action failed."
+      });
+    }
+  }
+  onChange(listener) {
+    if (typeof listener !== "function") {
+      throw new TypeError("Registry onChange listener must be a function.");
+    }
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+  #emitChange(event) {
+    for (const listener of [...this.#listeners]) {
+      try {
+        listener(event);
+      } catch (err) {
+        this.#diagnostics.emit({
+          level: "error",
+          code: "REGISTRY_LISTENER_FAILED",
+          source: "core.remote-plugin-registry",
+          message: "Registry change listener threw",
+          detail: err
+        });
+      }
+    }
+  }
+  dispose() {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    for (const id of Object.keys(this.#plugins).reverse()) {
+      this.unregister(id);
+    }
+    this.#listeners.clear();
+  }
+};
+
+// src/core/declarative-slot-renderer.js
+var HOST_STYLE_ID = "remote-slot-host-css";
+var HOST_SLOT_ID = "remote-slot-host.root";
+var SLOT_LABELS = Object.freeze({
+  "title-bar": Object.freeze({ ko: "\uC0C1\uB2E8 \uD0C0\uC774\uD2C0 \uBC14", en: "Title Bar" }),
+  "status-bar": Object.freeze({ ko: "\uC0C1\uD0DC \uD45C\uC2DC\uC904", en: "Status Bar" }),
+  "composer-toolbar": Object.freeze({ ko: "\uC785\uB825 \uD234\uBC14", en: "Composer Toolbar" }),
+  sidebar: Object.freeze({ ko: "\uC0AC\uC774\uB4DC\uBC14", en: "Sidebar" }),
+  "settings-pane": Object.freeze({ ko: "\uC124\uC815 \uD328\uB110", en: "Settings Pane" }),
+  "aux-pane": Object.freeze({ ko: "\uBCF4\uC870 \uD328\uB110", en: "Aux Pane" }),
+  overlay: Object.freeze({ ko: "\uC624\uBC84\uB808\uC774", en: "Overlay" }),
+  modal: Object.freeze({ ko: "\uBAA8\uB2EC", en: "Modal" }),
+  theme: Object.freeze({ ko: "\uD14C\uB9C8", en: "Theme" }),
+  custom: Object.freeze({ ko: "\uC0AC\uC6A9\uC790 \uC9C0\uC815", en: "Custom" })
+});
+var STRINGS = Object.freeze({
+  ko: Object.freeze({
+    title: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uD638\uC2A4\uD2B8",
+    pillLabel: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uBA54\uB274 \uC5F4\uAE30",
+    pillText: "\uD50C\uB7EC\uADF8\uC778",
+    close: "\uB2EB\uAE30",
+    refresh: "\uC0C8\uB85C\uACE0\uCE68",
+    empty: "\uC5F0\uB3D9\uB41C RemotePlugin.v1 \uD50C\uB7EC\uADF8\uC778\uC774 \uC5C6\uC2B5\uB2C8\uB2E4. \uAC01 \uD50C\uB7EC\uADF8\uC778\uC774 \uD45C\uC900 \uC778\uD130\uD398\uC774\uC2A4\uB97C \uAD6C\uD604\uD574 \uB4F1\uB85D\uD558\uBA74 \uC9C0\uC815\uB41C UI \uC704\uCE58\uC5D0 \uD45C\uC2DC\uB429\uB2C8\uB2E4.",
+    confirmTitle: "\uC791\uC5C5 \uD655\uC778 \uD544\uC694",
+    confirmButton: "\uD655\uC778 \uD6C4 \uC2E4\uD589",
+    cancelButton: "\uCDE8\uC18C",
+    conflictRefresh: "\uB2E4\uC2DC \uBD88\uB7EC\uC624\uAE30",
+    langToggle: "EN",
+    langAria: "\uC601\uC5B4\uB85C \uC804\uD658",
+    snapshotError: "\uC2A4\uB0C5\uC0F7 \uB85C\uB4DC \uC624\uB958",
+    actionOk: "\uC791\uC5C5\uC774 \uC644\uB8CC\uB418\uC5C8\uC2B5\uB2C8\uB2E4."
+  }),
+  en: Object.freeze({
+    title: "Remote Plugin Host",
+    pillLabel: "Open Remote Plugins menu",
+    pillText: "Plugins",
+    close: "Close",
+    refresh: "Refresh",
+    empty: "No RemotePlugin.v1 plugins registered yet. Plugins implementing the standard interface appear in their declared UI slots.",
+    confirmTitle: "Confirmation Required",
+    confirmButton: "Confirm",
+    cancelButton: "Cancel",
+    conflictRefresh: "Reload",
+    langToggle: "KO",
+    langAria: "Switch to Korean",
+    snapshotError: "Snapshot error",
+    actionOk: "Action completed."
+  })
+});
+var HOST_CSS = [
+  `:host, .rph-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color-scheme: light dark; box-sizing: border-box; }`,
+  `.rph-root * { box-sizing: border-box; }`,
+  `.rph-titlebar { position: fixed; top: max(8px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); max-width: calc(100vw - 24px); z-index: 2147482990; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px; border-radius: 12px; border: 1px solid rgba(128,134,139,0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); box-shadow: 0 6px 20px rgba(0,0,0,0.24); }`,
+  `.rph-statusbar { position: fixed; left: max(10px, env(safe-area-inset-left)); bottom: max(12px, env(safe-area-inset-bottom)); max-width: calc(100vw - 132px); z-index: 2147482990; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 12px; border: 1px solid rgba(128,134,139,0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); box-shadow: 0 6px 20px rgba(0,0,0,0.24); }`,
+  `.rph-composerbar { position: fixed; left: max(10px, env(safe-area-inset-left)); bottom: max(68px, calc(env(safe-area-inset-bottom) + 58px)); max-width: calc(100vw - 24px); z-index: 2147482990; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px; border-radius: 12px; border: 1px solid rgba(128,134,139,0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); box-shadow: 0 6px 20px rgba(0,0,0,0.24); }`,
+  `.rph-dock { position: fixed; right: max(10px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); z-index: 2147483000; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }`,
+  `.rph-pill { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 999px; border: 1px solid rgba(128,134,139,0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.28); touch-action: manipulation; }`,
+  `.rph-badge-count { min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: #1a73e8; color: #ffffff; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }`,
+  `.rph-drawer { width: min(360px, calc(100vw - 20px)); max-height: calc(100vh - 96px); max-height: calc(100dvh - 96px); overflow-y: auto; border-radius: 14px; border: 1px solid rgba(128,134,139,0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); padding: 14px; box-shadow: 0 12px 32px rgba(0,0,0,0.38); display: flex; flex-direction: column; gap: 10px; }`,
+  `.rph-drawer[hidden], .rph-titlebar[hidden], .rph-statusbar[hidden], .rph-composerbar[hidden], .rph-confirm[hidden] { display: none; }`,
+  `.rph-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }`,
+  `.rph-title { margin: 0; font-size: 14px; font-weight: 700; }`,
+  `.rph-header-actions { display: inline-flex; align-items: center; gap: 6px; }`,
+  `.rph-btn { min-width: 44px; min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 1px solid rgba(128,134,139,0.35); background: rgba(128,134,139,0.14); color: inherit; font-size: 13px; font-weight: 600; cursor: pointer; touch-action: manipulation; }`,
+  `.rph-btn[data-style="primary"] { background: #1a73e8; border-color: #1a73e8; color: #ffffff; }`,
+  `.rph-btn[data-style="danger"] { background: #d93025; border-color: #d93025; color: #ffffff; }`,
+  `.rph-btn:disabled { opacity: 0.5; cursor: not-allowed; }`,
+  `.rph-btn:focus-visible, .rph-pill:focus-visible { outline: 2px solid #4d90fe; outline-offset: 2px; }`,
+  `.rph-slot-group { border-radius: 10px; border: 1px solid rgba(128,134,139,0.24); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
+  `.rph-slot-heading { font-size: 11px; font-weight: 700; text-transform: uppercase; opacity: 0.72; letter-spacing: 0.03em; }`,
+  `.rph-plugin-card { border-radius: 8px; border: 1px solid rgba(128,134,139,0.2); padding: 8px; display: flex; flex-direction: column; gap: 8px; }`,
+  `.rph-plugin-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }`,
+  `.rph-plugin-name { font-size: 13px; font-weight: 700; }`,
+  `.rph-chip { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: rgba(128,134,139,0.18); }`,
+  `.rph-chip[data-tone="ok"] { background: rgba(52,168,83,0.22); color: #34a853; }`,
+  `.rph-chip[data-tone="warn"] { background: rgba(251,188,4,0.22); color: #f29900; }`,
+  `.rph-chip[data-tone="error"] { background: rgba(234,67,53,0.22); color: #ea4335; }`,
+  `.rph-metrics { display: flex; flex-wrap: wrap; gap: 8px; }`,
+  `.rph-metric { display: inline-flex; align-items: baseline; gap: 5px; font-size: 12px; padding: 4px 8px; border-radius: 8px; background: rgba(128,134,139,0.12); }`,
+  `.rph-metric-val { font-weight: 700; }`,
+  `.rph-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }`,
+  `.rph-list-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 8px; background: rgba(128,134,139,0.1); font-size: 12px; }`,
+  `.rph-kv { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }`,
+  `.rph-kv-row { display: flex; justify-content: space-between; gap: 8px; word-break: break-word; }`,
+  `.rph-actions { display: flex; flex-wrap: wrap; gap: 6px; }`,
+  `.rph-notice { font-size: 12px; padding: 8px; border-radius: 8px; background: rgba(128,134,139,0.14); word-break: break-word; }`,
+  `.rph-notice[data-tone="error"] { background: rgba(234,67,53,0.18); }`,
+  `.rph-notice[data-tone="warn"] { background: rgba(251,188,4,0.18); }`,
+  `.rph-confirm { border-radius: 10px; border: 1px solid #f29900; background: rgba(251,188,4,0.12); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
+  `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }`,
+  `@media (prefers-color-scheme: light) { .rph-titlebar, .rph-statusbar, .rph-composerbar, .rph-pill, .rph-drawer { background: var(--card, #ffffff); color: var(--foreground, #1f2328); } }`
+].join(" ");
+function clearChildren(el) {
+  while (el.firstChild) {
+    el.removeChild(el.firstChild);
+  }
+}
+function createDeclarativeSlotRenderer({
+  win,
+  doc,
+  surface,
+  registry,
+  initialLocale = "ko"
+}) {
+  validateHostSurfacePort(surface);
+  if (!doc || typeof doc.createElement !== "function") {
+    throw new TypeError("DeclarativeSlotRenderer requires a DOM document.");
+  }
+  if (!registry || typeof registry.list !== "function") {
+    throw new TypeError("DeclarativeSlotRenderer requires a RemotePluginRegistry.");
+  }
+  let locale = initialLocale === "en" ? "en" : "ko";
+  let isOpen = false;
+  let disposed = false;
+  let renderSeq = 0;
+  let pendingChallenge = null;
+  const feedbackByPlugin = /* @__PURE__ */ Object.create(null);
+  surface.injectStyle(HOST_STYLE_ID, HOST_CSS);
+  const slotRoot = surface.mountSlot(HOST_SLOT_ID);
+  slotRoot.setAttribute("class", "rph-root");
+  const titleBarEl = createSafeElement(doc, "div", {
+    attrs: { class: "rph-titlebar", "data-remote-slot": "title-bar", hidden: "hidden" }
+  });
+  const statusBarEl = createSafeElement(doc, "div", {
+    attrs: { class: "rph-statusbar", "data-remote-slot": "status-bar", hidden: "hidden" }
+  });
+  const composerBarEl = createSafeElement(doc, "div", {
+    attrs: { class: "rph-composerbar", "data-remote-slot": "composer-toolbar", hidden: "hidden" }
+  });
+  const dockEl = createSafeElement(doc, "div", { attrs: { class: "rph-dock" } });
+  const drawerEl = createSafeElement(doc, "section", {
+    attrs: {
+      class: "rph-drawer",
+      role: "dialog",
+      "aria-label": STRINGS[locale].title,
+      hidden: "hidden"
+    }
+  });
+  const headerEl = createSafeElement(doc, "div", { attrs: { class: "rph-header" } });
+  const titleEl = createSafeElement(doc, "h2", {
+    attrs: { class: "rph-title" },
+    text: STRINGS[locale].title
+  });
+  const headerActions = createSafeElement(doc, "div", { attrs: { class: "rph-header-actions" } });
+  const langBtn = createSafeElement(doc, "button", {
+    attrs: {
+      type: "button",
+      class: "rph-btn",
+      "data-rph-control": "lang-toggle",
+      "aria-label": STRINGS[locale].langAria
+    },
+    text: STRINGS[locale].langToggle
+  });
+  const closeBtn = createSafeElement(doc, "button", {
+    attrs: {
+      type: "button",
+      class: "rph-btn",
+      "data-rph-control": "close",
+      "aria-label": STRINGS[locale].close
+    },
+    text: "\xD7"
+  });
+  headerActions.appendChild(langBtn);
+  headerActions.appendChild(closeBtn);
+  headerEl.appendChild(titleEl);
+  headerEl.appendChild(headerActions);
+  const confirmBoxEl = createSafeElement(doc, "div", {
+    attrs: { class: "rph-confirm", "data-rph-control": "confirm-box", role: "alertdialog", hidden: "hidden" }
+  });
+  const drawerBodyEl = createSafeElement(doc, "div", {
+    attrs: { "data-rph-control": "drawer-body" }
+  });
+  drawerEl.appendChild(headerEl);
+  drawerEl.appendChild(confirmBoxEl);
+  drawerEl.appendChild(drawerBodyEl);
+  const pillBtn = createSafeElement(doc, "button", {
+    attrs: {
+      type: "button",
+      class: "rph-pill",
+      "data-rph-control": "dock-pill",
+      "aria-expanded": "false",
+      "aria-label": STRINGS[locale].pillLabel
+    }
+  });
+  const pillLabelSpan = createSafeElement(doc, "span", { text: STRINGS[locale].pillText });
+  const pillCountSpan = createSafeElement(doc, "span", {
+    attrs: { class: "rph-badge-count", "data-rph-control": "plugin-count" },
+    text: "0"
+  });
+  pillBtn.appendChild(pillLabelSpan);
+  pillBtn.appendChild(pillCountSpan);
+  dockEl.appendChild(drawerEl);
+  dockEl.appendChild(pillBtn);
+  slotRoot.appendChild(titleBarEl);
+  slotRoot.appendChild(composerBarEl);
+  slotRoot.appendChild(statusBarEl);
+  slotRoot.appendChild(dockEl);
+  function setOpen(nextOpen) {
+    isOpen = Boolean(nextOpen);
+    drawerEl.hidden = !isOpen;
+    pillBtn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    if (!isOpen && typeof pillBtn.focus === "function") {
+      pillBtn.focus();
+    }
+  }
+  function updateChromeLocale() {
+    const s = STRINGS[locale];
+    titleEl.textContent = s.title;
+    drawerEl.setAttribute("aria-label", s.title);
+    langBtn.textContent = s.langToggle;
+    langBtn.setAttribute("aria-label", s.langAria);
+    closeBtn.setAttribute("aria-label", s.close);
+    pillBtn.setAttribute("aria-label", s.pillLabel);
+    pillLabelSpan.textContent = s.pillText;
+  }
+  function renderConfirmBox() {
+    clearChildren(confirmBoxEl);
+    if (!pendingChallenge) {
+      confirmBoxEl.hidden = true;
+      return;
+    }
+    const s = STRINGS[locale];
+    confirmBoxEl.hidden = false;
+    confirmBoxEl.appendChild(
+      createSafeElement(doc, "div", { attrs: { class: "rph-plugin-name" }, text: s.confirmTitle })
+    );
+    confirmBoxEl.appendChild(
+      createSafeElement(doc, "div", {
+        attrs: { class: "rph-notice", "data-tone": "warn" },
+        text: resolveLocalizedText(pendingChallenge.message, locale)
+      })
+    );
+    const btnRow = createSafeElement(doc, "div", { attrs: { class: "rph-actions" } });
+    const confirmBtn = createSafeElement(doc, "button", {
+      attrs: {
+        type: "button",
+        class: "rph-btn",
+        "data-style": "danger",
+        "data-rph-control": "confirm-accept"
+      },
+      text: pendingChallenge.confirmLabel ? resolveLocalizedText(pendingChallenge.confirmLabel, locale) : s.confirmButton
+    });
+    const cancelBtn = createSafeElement(doc, "button", {
+      attrs: {
+        type: "button",
+        class: "rph-btn",
+        "data-rph-control": "confirm-cancel"
+      },
+      text: s.cancelButton
+    });
+    confirmBtn.addEventListener("click", () => {
+      const active = pendingChallenge;
+      pendingChallenge = null;
+      renderConfirmBox();
+      if (active) {
+        void executePluginAction(active.pluginId, active.actionId, {
+          expectedRevision: active.expectedRevision,
+          challengeResponse: { challengeId: active.challengeId, confirmed: true }
+        });
+      }
+    });
+    cancelBtn.addEventListener("click", () => {
+      pendingChallenge = null;
+      renderConfirmBox();
+    });
+    btnRow.appendChild(confirmBtn);
+    btnRow.appendChild(cancelBtn);
+    confirmBoxEl.appendChild(btnRow);
+  }
+  async function executePluginAction(pluginId, actionId, invocation = {}) {
+    const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
+    if (disposed) {
+      return result;
+    }
+    if (result.status === "confirmation_required") {
+      pendingChallenge = {
+        pluginId,
+        actionId,
+        expectedRevision: invocation.expectedRevision,
+        challengeId: result.challengeId,
+        message: result.message,
+        confirmLabel: result.confirmLabel
+      };
+      setOpen(true);
+      renderConfirmBox();
+      return result;
+    }
+    if (result.status === "conflict") {
+      feedbackByPlugin[pluginId] = {
+        tone: "warn",
+        text: resolveLocalizedText(result.message, locale),
+        needsRefresh: true
+      };
+    } else if (result.status === "error") {
+      feedbackByPlugin[pluginId] = {
+        tone: "error",
+        text: resolveLocalizedText(result.message, locale),
+        needsRefresh: false
+      };
+    } else {
+      feedbackByPlugin[pluginId] = {
+        tone: "ok",
+        text: result.message ? resolveLocalizedText(result.message, locale) : STRINGS[locale].actionOk,
+        needsRefresh: false
+      };
+    }
+    await render();
+    return result;
+  }
+  function renderSection(pluginId, snapshotRevision, section) {
+    if (section.kind === "notice") {
+      return createSafeElement(doc, "div", {
+        attrs: { class: "rph-notice", "data-tone": section.tone },
+        text: resolveLocalizedText(section.text, locale)
+      });
+    }
+    if (section.kind === "metrics") {
+      const wrap = createSafeElement(doc, "div", { attrs: { class: "rph-metrics" } });
+      for (const item of section.items) {
+        const box = createSafeElement(doc, "span", {
+          attrs: { class: "rph-metric", "data-tone": item.tone }
+        });
+        box.appendChild(createSafeElement(doc, "span", { text: resolveLocalizedText(item.label, locale) }));
+        box.appendChild(createSafeElement(doc, "span", { attrs: { class: "rph-metric-val" }, text: item.value }));
+        wrap.appendChild(box);
+      }
+      return wrap;
+    }
+    if (section.kind === "list") {
+      const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
+      if (section.title) {
+        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+      }
+      const ul = createSafeElement(doc, "ul", { attrs: { class: "rph-list" } });
+      for (const item of section.items) {
+        const li = createSafeElement(doc, "li", { attrs: { class: "rph-list-item" } });
+        const left = createSafeElement(doc, "div");
+        left.appendChild(createSafeElement(doc, "div", { text: resolveLocalizedText(item.primary, locale) }));
+        if (item.secondary) {
+          left.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(item.secondary, locale) }));
+        }
+        li.appendChild(left);
+        if (item.badge) {
+          li.appendChild(createSafeElement(doc, "span", { attrs: { class: "rph-chip" }, text: resolveLocalizedText(item.badge, locale) }));
+        }
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+      return box;
+    }
+    if (section.kind === "key-value") {
+      const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
+      if (section.title) {
+        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+      }
+      for (const entry of section.entries) {
+        const row = createSafeElement(doc, "div", { attrs: { class: "rph-kv-row" } });
+        row.appendChild(createSafeElement(doc, "span", { text: resolveLocalizedText(entry.key, locale) }));
+        row.appendChild(createSafeElement(doc, "strong", { text: entry.value }));
+        box.appendChild(row);
+      }
+      return box;
+    }
+    if (section.kind === "actions") {
+      const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
+      if (section.title) {
+        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+      }
+      const row = createSafeElement(doc, "div", { attrs: { class: "rph-actions" } });
+      for (const item of section.items) {
+        const attrs = {
+          type: "button",
+          class: "rph-btn",
+          "data-style": item.style,
+          "data-plugin-id": pluginId,
+          "data-action-id": item.id
+        };
+        if (item.disabled) {
+          attrs.disabled = "disabled";
+        }
+        const btn = createSafeElement(doc, "button", {
+          attrs,
+          text: resolveLocalizedText(item.label, locale)
+        });
+        btn.addEventListener("click", () => {
+          void executePluginAction(
+            pluginId,
+            item.id,
+            snapshotRevision ? { expectedRevision: snapshotRevision } : {}
+          );
+        });
+        row.appendChild(btn);
+      }
+      box.appendChild(row);
+      return box;
+    }
+    return createSafeElement(doc, "div");
+  }
+  function renderInlineBarPlugin(container, plugin, snapResult) {
+    const itemWrap = createSafeElement(doc, "div", {
+      attrs: {
+        class: "rph-status-inline",
+        "data-plugin-id": plugin.id,
+        "data-slot-id": plugin.uiSlot.slotId
+      }
+    });
+    itemWrap.appendChild(
+      createSafeElement(doc, "span", {
+        attrs: { class: "rph-plugin-name" },
+        text: resolveLocalizedText(plugin.displayName, locale)
+      })
+    );
+    if (!snapResult.ok) {
+      itemWrap.appendChild(
+        createSafeElement(doc, "span", {
+          attrs: { class: "rph-chip", "data-tone": "error" },
+          text: STRINGS[locale].snapshotError
+        })
+      );
+      container.appendChild(itemWrap);
+      return;
+    }
+    const { snapshot } = snapResult;
+    if (snapshot.badge) {
+      itemWrap.appendChild(
+        createSafeElement(doc, "span", {
+          attrs: { class: "rph-chip", "data-tone": snapshot.badge.tone },
+          text: resolveLocalizedText(snapshot.badge.text, locale)
+        })
+      );
+    }
+    for (const sec of snapshot.sections) {
+      if (sec.kind === "metrics") {
+        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      } else if (sec.kind === "actions") {
+        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      }
+    }
+    container.appendChild(itemWrap);
+  }
+  function renderPluginCard(plugin, snapResult) {
+    const card = createSafeElement(doc, "article", {
+      attrs: {
+        class: "rph-plugin-card",
+        "data-plugin-id": plugin.id,
+        "data-slot-id": plugin.uiSlot.slotId
+      }
+    });
+    const head = createSafeElement(doc, "div", { attrs: { class: "rph-plugin-head" } });
+    head.appendChild(
+      createSafeElement(doc, "span", {
+        attrs: { class: "rph-plugin-name" },
+        text: resolveLocalizedText(plugin.displayName, locale)
+      })
+    );
+    if (snapResult.ok && snapResult.snapshot.badge) {
+      head.appendChild(
+        createSafeElement(doc, "span", {
+          attrs: { class: "rph-chip", "data-tone": snapResult.snapshot.badge.tone },
+          text: resolveLocalizedText(snapResult.snapshot.badge.text, locale)
+        })
+      );
+    }
+    card.appendChild(head);
+    if (!snapResult.ok) {
+      card.appendChild(
+        createSafeElement(doc, "div", {
+          attrs: { class: "rph-notice", "data-tone": "error" },
+          text: `${STRINGS[locale].snapshotError}: ${snapResult.error}`
+        })
+      );
+      return card;
+    }
+    const { snapshot } = snapResult;
+    if (snapshot.notice) {
+      card.appendChild(
+        createSafeElement(doc, "div", {
+          attrs: { class: "rph-notice", "data-tone": snapshot.notice.tone },
+          text: resolveLocalizedText(snapshot.notice.text, locale)
+        })
+      );
+    }
+    for (const sec of snapshot.sections) {
+      card.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+    }
+    const fb = feedbackByPlugin[plugin.id];
+    if (fb) {
+      const fbEl = createSafeElement(doc, "div", {
+        attrs: { class: "rph-notice", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
+        text: fb.text
+      });
+      card.appendChild(fbEl);
+      if (fb.needsRefresh) {
+        const reloadBtn = createSafeElement(doc, "button", {
+          attrs: { type: "button", class: "rph-btn", "data-rph-control": "conflict-reload" },
+          text: STRINGS[locale].conflictRefresh
+        });
+        reloadBtn.addEventListener("click", () => {
+          delete feedbackByPlugin[plugin.id];
+          void render();
+        });
+        card.appendChild(reloadBtn);
+      }
+    }
+    return card;
+  }
+  async function render() {
+    if (disposed) {
+      return;
+    }
+    const seq = ++renderSeq;
+    const plugins = registry.list();
+    const snapshots = await Promise.all(
+      plugins.map(async (plugin) => ({
+        plugin,
+        snapResult: await registry.readSnapshot(plugin.id, { locale })
+      }))
+    );
+    if (disposed || seq !== renderSeq) {
+      return;
+    }
+    updateChromeLocale();
+    renderConfirmBox();
+    pillCountSpan.textContent = String(plugins.length);
+    clearChildren(titleBarEl);
+    clearChildren(statusBarEl);
+    clearChildren(composerBarEl);
+    clearChildren(drawerBodyEl);
+    const drawerGroups = /* @__PURE__ */ Object.create(null);
+    let titleBarCount = 0;
+    let statusBarCount = 0;
+    let composerBarCount = 0;
+    for (const entry of snapshots) {
+      const slot = entry.plugin.uiSlot.slot;
+      if (slot === "title-bar") {
+        renderInlineBarPlugin(titleBarEl, entry.plugin, entry.snapResult);
+        titleBarCount += 1;
+      } else if (slot === "status-bar") {
+        renderInlineBarPlugin(statusBarEl, entry.plugin, entry.snapResult);
+        statusBarCount += 1;
+      } else if (slot === "composer-toolbar") {
+        renderInlineBarPlugin(composerBarEl, entry.plugin, entry.snapResult);
+        composerBarCount += 1;
+      }
+      if (!drawerGroups[slot]) {
+        drawerGroups[slot] = [];
+      }
+      drawerGroups[slot].push(entry);
+    }
+    titleBarEl.hidden = titleBarCount === 0;
+    statusBarEl.hidden = statusBarCount === 0;
+    composerBarEl.hidden = composerBarCount === 0;
+    const slotKeys = Object.keys(drawerGroups);
+    if (slotKeys.length === 0) {
+      drawerBodyEl.appendChild(
+        createSafeElement(doc, "div", {
+          attrs: { class: "rph-notice", "data-tone": "info" },
+          text: STRINGS[locale].empty
+        })
+      );
+      return;
+    }
+    for (const slot of slotKeys) {
+      const groupEl = createSafeElement(doc, "div", {
+        attrs: { class: "rph-slot-group", "data-remote-slot-group": slot }
+      });
+      const labelObj = SLOT_LABELS[slot] || { ko: slot, en: slot };
+      groupEl.appendChild(
+        createSafeElement(doc, "div", {
+          attrs: { class: "rph-slot-heading" },
+          text: `${resolveLocalizedText(labelObj, locale)} (${slot})`
+        })
+      );
+      for (const entry of drawerGroups[slot]) {
+        groupEl.appendChild(renderPluginCard(entry.plugin, entry.snapResult));
+      }
+      drawerBodyEl.appendChild(groupEl);
+    }
+  }
+  const onPillClick = () => setOpen(!isOpen);
+  const onCloseClick = () => setOpen(false);
+  const onLangClick = () => {
+    locale = locale === "ko" ? "en" : "ko";
+    void render();
+  };
+  const onKeyDown = (e) => {
+    if (e.isComposing || e.keyCode === 229) {
+      return;
+    }
+    if (e.key === "Escape" && isOpen) {
+      setOpen(false);
+    }
+  };
+  pillBtn.addEventListener("click", onPillClick);
+  closeBtn.addEventListener("click", onCloseClick);
+  langBtn.addEventListener("click", onLangClick);
+  if (win && typeof win.addEventListener === "function") {
+    win.addEventListener("keydown", onKeyDown);
+  }
+  const unsubRegistry = registry.onChange(() => {
+    void render();
+  });
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    unsubRegistry();
+    pillBtn.removeEventListener("click", onPillClick);
+    closeBtn.removeEventListener("click", onCloseClick);
+    langBtn.removeEventListener("click", onLangClick);
+    if (win && typeof win.removeEventListener === "function") {
+      win.removeEventListener("keydown", onKeyDown);
+    }
+    surface.removeStyle(HOST_STYLE_ID);
+    surface.unmountSlot(HOST_SLOT_ID);
+  };
+  surface.onDispose(dispose);
+  void render();
+  return Object.freeze({
+    render,
+    setOpen,
+    toggleOpen() {
+      setOpen(!isOpen);
+    },
+    setLocale(nextLocale) {
+      locale = nextLocale === "en" ? "en" : "ko";
+      return render();
+    },
+    getLocale() {
+      return locale;
+    },
+    isOpen() {
+      return isOpen;
+    },
+    getSlotRoot() {
+      return slotRoot;
+    },
+    dispose
+  });
+}
+
+// src/core/desktop-companion-view.js
+var PANEL_STYLE_ID = "desktop-remote-companion-css";
+var PANEL_CSS = [
+  `.drc-panel { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; border-radius: 12px; border: 1px solid rgba(128,134,139,0.3); padding: 14px; display: flex; flex-direction: column; gap: 10px; max-width: 680px; }`,
+  `.drc-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }`,
+  `.drc-title { margin: 0; font-size: 15px; font-weight: 700; }`,
+  `.drc-subtitle { margin: 0; font-size: 12px; opacity: 0.78; }`,
+  `.drc-card { border-radius: 8px; border: 1px solid rgba(128,134,139,0.22); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
+  `.drc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; }`,
+  `.drc-slots { display: flex; flex-wrap: wrap; gap: 6px; }`,
+  `.drc-chip { padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: rgba(128,134,139,0.16); }`,
+  `.drc-btn { min-height: 36px; padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(128,134,139,0.35); background: rgba(128,134,139,0.14); color: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }`,
+  `.drc-btn:focus-visible { outline: 2px solid #4d90fe; outline-offset: 2px; }`,
+  `.drc-status { font-size: 12px; opacity: 0.85; min-height: 18px; }`
+].join(" ");
+var COPY = Object.freeze({
+  ko: Object.freeze({
+    title: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uCEF4\uD328\uB2C8\uC5B8",
+    subtitle: "AddonManifest.v1 \uD638\uC2A4\uD2B8 \uACA9\uB9AC \uC2AC\uB86F\uC5D0\uC11C \uB3D9\uC791\uD558\uB294 \uC6D0\uACA9 \uC5F0\uB3D9 \uC548\uB0B4 \uD328\uB110\uC785\uB2C8\uB2E4.",
+    langToggle: "EN",
+    contractLabel: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uD45C\uC900 \uACC4\uC57D",
+    hostLabel: "\uB124\uC774\uD2F0\uBE0C \uD638\uC2A4\uD2B8 \uD504\uB85C\uD544",
+    setupTitle: "\uC678\uBD80 \xB7 \uBAA8\uBC14\uC77C \uBE0C\uB77C\uC6B0\uC800 \uC6D0\uACA9 \uC5F0\uB3D9",
+    copyBookmarklet: "\uBD81\uB9C8\uD074\uB9BF \uBCF5\uC0AC",
+    copyUserscript: "\uC720\uC800\uC2A4\uD06C\uB9BD\uD2B8 \uACBD\uB85C \uBCF5\uC0AC",
+    copiedBookmarklet: "\uBD81\uB9C8\uD074\uB9BF \uC2A4\uB2C8\uD3AB\uC744 \uD074\uB9BD\uBCF4\uB4DC\uC5D0 \uBCF5\uC0AC\uD588\uC2B5\uB2C8\uB2E4.",
+    copiedUserscript: "\uC720\uC800\uC2A4\uD06C\uB9BD\uD2B8 \uACBD\uB85C\uB97C \uD074\uB9BD\uBCF4\uB4DC\uC5D0 \uBCF5\uC0AC\uD588\uC2B5\uB2C8\uB2E4.",
+    copyFailed: "\uD074\uB9BD\uBCF4\uB4DC \uBCF5\uC0AC\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4. \uBC30\uD3EC \uD30C\uC77C\uC744 \uC9C1\uC811 \uC5F4\uC5B4 \uBCF5\uC0AC\uD558\uC138\uC694.",
+    slotsTitle: "\uC9C0\uC6D0\uB418\uB294 \uC6D0\uACA9 UI \uC2AC\uB86F \uBC30\uCE58"
+  }),
+  en: Object.freeze({
+    title: "Remote Plugin Companion",
+    subtitle: "Remote integration settings panel running inside an isolated AddonManifest.v1 slot.",
+    langToggle: "KO",
+    contractLabel: "Remote Plugin Standard",
+    hostLabel: "Native Host Profile",
+    setupTitle: "External & Mobile Browser Setup",
+    copyBookmarklet: "Copy Bookmarklet",
+    copyUserscript: "Copy Userscript Path",
+    copiedBookmarklet: "Bookmarklet snippet copied to clipboard.",
+    copiedUserscript: "Userscript path copied to clipboard.",
+    copyFailed: "Clipboard copy failed. Copy directly from the built dist artifact.",
+    slotsTitle: "Supported Remote UI Slot Placements"
+  })
+});
+function mountDesktopCompanionView({
+  doc,
+  surface,
+  slotId,
+  hostInfo = {},
+  remoteArtifacts = {},
+  clipboard = null,
+  initialLocale = "ko"
+}) {
+  validateHostSurfacePort(surface);
+  if (!doc || typeof doc.createElement !== "function") {
+    throw new TypeError("DesktopCompanionView requires a DOM document.");
+  }
+  if (typeof slotId !== "string" || !slotId.trim()) {
+    throw new TypeError("DesktopCompanionView requires a declared slotId.");
+  }
+  let locale = initialLocale === "en" ? "en" : "ko";
+  let statusMessage = "";
+  let disposed = false;
+  surface.injectStyle(PANEL_STYLE_ID, PANEL_CSS);
+  const container = surface.mountSlot(slotId);
+  const bookmarkletText = typeof remoteArtifacts.bookmarklet === "string" && remoteArtifacts.bookmarklet.trim() ? remoteArtifacts.bookmarklet.trim() : "dist/bookmarklet.txt";
+  const userscriptPath = typeof remoteArtifacts.userscriptPath === "string" && remoteArtifacts.userscriptPath.trim() ? remoteArtifacts.userscriptPath.trim() : "dist/remote-companion.user.js";
+  async function copyText(text, successKey) {
+    if (!clipboard || typeof clipboard.writeText !== "function") {
+      statusMessage = COPY[locale].copyFailed;
+      render();
+      return false;
+    }
+    try {
+      await clipboard.writeText(text);
+      statusMessage = COPY[locale][successKey];
+      render();
+      return true;
+    } catch (_err) {
+      statusMessage = COPY[locale].copyFailed;
+      render();
+      return false;
+    }
+  }
+  function render() {
+    if (disposed) {
+      return;
+    }
+    while (container.firstChild) {
+      container.removeChild(container.firstChild);
+    }
+    const s = COPY[locale];
+    const panel = createSafeElement(doc, "section", {
+      attrs: { class: "drc-panel", "data-drc-locale": locale }
+    });
+    const header = createSafeElement(doc, "div", { attrs: { class: "drc-header" } });
+    const headingWrap = createSafeElement(doc, "div");
+    headingWrap.appendChild(createSafeElement(doc, "h3", { attrs: { class: "drc-title" }, text: s.title }));
+    headingWrap.appendChild(createSafeElement(doc, "p", { attrs: { class: "drc-subtitle" }, text: s.subtitle }));
+    const langBtn = createSafeElement(doc, "button", {
+      attrs: { type: "button", class: "drc-btn", "data-drc-action": "toggle-locale" },
+      text: s.langToggle
+    });
+    langBtn.addEventListener("click", () => {
+      locale = locale === "ko" ? "en" : "ko";
+      statusMessage = "";
+      render();
+    });
+    header.appendChild(headingWrap);
+    header.appendChild(langBtn);
+    panel.appendChild(header);
+    const metaCard = createSafeElement(doc, "div", { attrs: { class: "drc-card" } });
+    const row1 = createSafeElement(doc, "div", { attrs: { class: "drc-row" } });
+    row1.appendChild(createSafeElement(doc, "span", { text: s.contractLabel }));
+    row1.appendChild(createSafeElement(doc, "strong", { text: REMOTE_PLUGIN_CONTRACT_VERSION }));
+    const row2 = createSafeElement(doc, "div", { attrs: { class: "drc-row" } });
+    row2.appendChild(createSafeElement(doc, "span", { text: s.hostLabel }));
+    row2.appendChild(
+      createSafeElement(doc, "strong", {
+        text: `${hostInfo.hostProfileId || "default"} (${hostInfo.hostVersion || "1.0.1"})`
+      })
+    );
+    metaCard.appendChild(row1);
+    metaCard.appendChild(row2);
+    panel.appendChild(metaCard);
+    const setupCard = createSafeElement(doc, "div", { attrs: { class: "drc-card" } });
+    setupCard.appendChild(createSafeElement(doc, "strong", { text: s.setupTitle }));
+    const btnRow = createSafeElement(doc, "div", { attrs: { class: "drc-slots" } });
+    const copyBmBtn = createSafeElement(doc, "button", {
+      attrs: { type: "button", class: "drc-btn", "data-drc-action": "copy-bookmarklet" },
+      text: s.copyBookmarklet
+    });
+    copyBmBtn.addEventListener("click", () => {
+      void copyText(bookmarkletText, "copiedBookmarklet");
+    });
+    const copyUsBtn = createSafeElement(doc, "button", {
+      attrs: { type: "button", class: "drc-btn", "data-drc-action": "copy-userscript" },
+      text: s.copyUserscript
+    });
+    copyUsBtn.addEventListener("click", () => {
+      void copyText(userscriptPath, "copiedUserscript");
+    });
+    btnRow.appendChild(copyBmBtn);
+    btnRow.appendChild(copyUsBtn);
+    setupCard.appendChild(btnRow);
+    setupCard.appendChild(
+      createSafeElement(doc, "div", {
+        attrs: { class: "drc-status", role: "status", "aria-live": "polite", "data-drc-status": "true" },
+        text: statusMessage
+      })
+    );
+    panel.appendChild(setupCard);
+    const slotCard = createSafeElement(doc, "div", { attrs: { class: "drc-card" } });
+    slotCard.appendChild(createSafeElement(doc, "strong", { text: s.slotsTitle }));
+    const chips = createSafeElement(doc, "div", { attrs: { class: "drc-slots" } });
+    for (const slot of ALLOWED_UI_SLOTS) {
+      chips.appendChild(createSafeElement(doc, "span", { attrs: { class: "drc-chip" }, text: slot }));
+    }
+    slotCard.appendChild(chips);
+    panel.appendChild(slotCard);
+    container.appendChild(panel);
+  }
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    surface.removeStyle(PANEL_STYLE_ID);
+    surface.unmountSlot(slotId);
+  };
+  surface.onDispose(dispose);
+  render();
+  return Object.freeze({
+    render,
+    setLocale(nextLocale) {
+      locale = nextLocale === "en" ? "en" : "ko";
+      render();
+    },
+    getLocale() {
+      return locale;
+    },
+    dispose
+  });
+}
 
 // src/bridges/dom-overlay-bridge.js
 function stripSensitiveSettings(rawSettings) {
@@ -1617,319 +3367,224 @@ function createMcpExtensionSlot({
   };
 }
 
-// src/bridges/remote-translator-engine.js
-var EXCLUDED_TAGS = /* @__PURE__ */ new Set([
-  "SCRIPT",
-  "STYLE",
-  "NOSCRIPT",
-  "PRE",
-  "CODE",
-  "KBD",
-  "SAMP",
-  "TEXTAREA",
-  "INPUT",
-  "SELECT",
-  "OPTION",
-  "SVG",
-  "CANVAS",
-  "IFRAME"
+// src/adapters/addon-host/addon-host-surface-adapter.js
+var REQUIRED_ADDON_HOST_METHODS = Object.freeze([
+  "mountSlot",
+  "unmountSlot",
+  "injectStyle",
+  "removeStyle",
+  "onDispose",
+  "dispose"
 ]);
-var PROTECTED_SPAN_PATTERN = /(`[^`\n]+`|https?:\/\/[^\s)]+|(?:[a-zA-Z]:\\|\/(?:[a-zA-Z0-9._-]+\/)+)[a-zA-Z0-9._-]+)/g;
-var LATIN_LETTER_PATTERN = /[A-Za-z]{2,}/;
-var MAX_CACHE_ENTRIES = 500;
-var MAX_CONCURRENCY = 4;
-function protectTechnicalTokens(text) {
-  const tokens = [];
-  const masked = String(text).replace(PROTECTED_SPAN_PATTERN, (match) => {
-    const idx = tokens.length;
-    tokens.push(match);
-    return `__TOK${idx}__`;
+function createAddonHostSurfaceAdapter(addonHost) {
+  if (!addonHost || typeof addonHost !== "object") {
+    throw new SecurityPolicyError(
+      "ERR_MISSING_ADDON_HOST",
+      "AddonHostSurfaceAdapter requires a scoped addonHost capability handle."
+    );
+  }
+  assertPort(addonHost, "addonHost", REQUIRED_ADDON_HOST_METHODS);
+  let disposed = false;
+  const ownedSlots = /* @__PURE__ */ new Set();
+  const ownedStyles = /* @__PURE__ */ new Set();
+  return Object.freeze({
+    pluginId: typeof addonHost.pluginId === "string" ? addonHost.pluginId : "antigravity-remote-plugin",
+    hostVersion: typeof addonHost.hostVersion === "string" ? addonHost.hostVersion : "1.0.1",
+    hostProfileId: typeof addonHost.hostProfileId === "string" ? addonHost.hostProfileId : "antigravity-desktop",
+    storageNamespace: typeof addonHost.storageNamespace === "string" ? addonHost.storageNamespace : "antigravity-remote-plugin",
+    mountSlot(slotId, parentEl) {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_SURFACE_DISPOSED", "HostSurfacePort is already disposed.");
+      }
+      const el = addonHost.mountSlot(slotId, parentEl);
+      ownedSlots.add(slotId);
+      return el;
+    },
+    unmountSlot(slotId) {
+      if (disposed) {
+        return false;
+      }
+      ownedSlots.delete(slotId);
+      return Boolean(addonHost.unmountSlot(slotId));
+    },
+    injectStyle(styleId, cssText) {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_SURFACE_DISPOSED", "HostSurfacePort is already disposed.");
+      }
+      const el = addonHost.injectStyle(styleId, String(cssText || ""));
+      ownedStyles.add(styleId);
+      return el;
+    },
+    removeStyle(styleId) {
+      if (disposed) {
+        return false;
+      }
+      ownedStyles.delete(styleId);
+      return Boolean(addonHost.removeStyle(styleId));
+    },
+    listOwnedSlots() {
+      return [...ownedSlots];
+    },
+    onDispose(fn) {
+      if (disposed || typeof fn !== "function") {
+        return;
+      }
+      addonHost.onDispose(fn);
+    },
+    dispose() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      ownedSlots.clear();
+      ownedStyles.clear();
+      addonHost.dispose();
+    }
   });
-  return { masked, tokens };
 }
-function restoreTechnicalTokens(translatedText, tokens) {
-  let out = String(translatedText);
-  for (let i = 0; i < tokens.length; i += 1) {
-    out = out.split(`__TOK${i}__`).join(tokens[i]);
-  }
-  return out;
-}
-function isExcludedElement(el) {
-  let cur = el;
-  while (cur && cur.nodeType === 1) {
-    const tag = typeof cur.tagName === "string" ? cur.tagName.toUpperCase() : "";
-    if (EXCLUDED_TAGS.has(tag)) {
-      return true;
-    }
-    if (typeof cur.getAttribute === "function") {
-      if (cur.getAttribute("data-remote-dock-ignore") === "true") {
-        return true;
-      }
-      const ce = cur.getAttribute("contenteditable");
-      if (ce === "" || ce === "true") {
-        return true;
-      }
-      if (cur.getAttribute("role") === "textbox") {
-        return true;
-      }
-    }
-    const cls = typeof cur.className === "string" ? cur.className : "";
-    if (/\b(?:xterm|monaco-editor|cm-editor|diff-line|code-block)\b/.test(cls)) {
-      return true;
-    }
-    cur = cur.parentElement || cur.parentNode;
-  }
-  return false;
-}
-function collectTranslatableTextNodes(root) {
-  const result = [];
-  if (!root) {
-    return result;
-  }
-  const walk = (node) => {
-    if (!node) {
-      return;
-    }
-    if (node.nodeType === 3) {
-      const val = typeof node.nodeValue === "string" ? node.nodeValue : "";
-      if (val.trim().length >= 2 && LATIN_LETTER_PATTERN.test(val)) {
-        if (!isExcludedElement(node.parentElement || node.parentNode)) {
-          result.push(node);
-        }
-      }
-      return;
-    }
-    if (node.nodeType === 1) {
-      if (isExcludedElement(node)) {
-        return;
-      }
-      const children = node.childNodes || [];
-      for (let i = 0; i < children.length; i += 1) {
-        walk(children[i]);
-      }
-    }
-  };
-  walk(root);
-  return result;
-}
-function createRemoteTranslatorEngine({
-  win,
+
+// src/adapters/remote-web/shadow-surface-adapter.js
+var hasOwn2 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+function createShadowSurfaceAdapter({
   doc,
-  settings = {},
-  translateText,
-  onStatus = null
+  ownerId = "antigravity-remote-plugin",
+  mountTarget = null,
+  diagnostics = null
 } = {}) {
-  if (!win || !doc) {
-    throw new SecurityPolicyError("INCOMPLETE_FRAME", "Remote translator requires win and doc.");
+  if (!doc || typeof doc.createElement !== "function") {
+    throw new SecurityPolicyError("ERR_INVALID_DOCUMENT", "ShadowSurfaceAdapter requires a DOM document.");
   }
-  if (typeof translateText !== "function") {
-    throw new TypeError("Remote translator requires a translateText(text, opts) function.");
-  }
-  let currentSettings = {
-    enabled: settings.enabled !== false,
-    targetLang: typeof settings.targetLang === "string" && settings.targetLang.trim() ? settings.targetLang.trim() : "ko"
-  };
-  const originals = /* @__PURE__ */ new Map();
-  const cache = /* @__PURE__ */ new Map();
-  const pendingNodes = /* @__PURE__ */ new Set();
-  let observer = null;
-  let abortController = null;
-  let active = false;
-  let translatedCount = 0;
-  let errorCount = 0;
-  let inFlight = 0;
-  const queue = [];
-  function emitStatus(phase, lastError = null) {
-    if (typeof onStatus === "function") {
-      onStatus({
-        enabled: currentSettings.enabled,
-        active,
-        phase,
-        translatedCount,
-        errorCount,
-        lastError
-      });
+  const hostEl = createSafeElement(doc, "div", {
+    attrs: {
+      translate: "no",
+      "data-addon-host-owner": ownerId,
+      "data-remote-host-surface": "closed-shadow"
     }
+  });
+  const shadowRoot = typeof hostEl.attachShadow === "function" ? hostEl.attachShadow({ mode: "closed" }) : hostEl;
+  const parent = mountTarget || doc.body || doc.documentElement;
+  if (parent && typeof parent.appendChild === "function") {
+    parent.appendChild(hostEl);
   }
-  function cacheSet(key, val) {
-    if (cache.size >= MAX_CACHE_ENTRIES) {
-      const oldestKey = cache.keys().next().value;
-      if (oldestKey !== void 0) {
-        cache.delete(oldestKey);
+  const slots = /* @__PURE__ */ Object.create(null);
+  const styles = /* @__PURE__ */ Object.create(null);
+  const disposers = [];
+  let disposed = false;
+  return Object.freeze({
+    ownerId,
+    hostElement: hostEl,
+    mountSlot(slotId) {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_SURFACE_DISPOSED", "HostSurfacePort is already disposed.");
       }
-    }
-    cache.set(key, val);
-  }
-  function restoreAllOriginals() {
-    for (const [node, originalText] of originals.entries()) {
-      if (node && typeof node.nodeValue === "string") {
-        node.nodeValue = originalText;
+      if (typeof slotId !== "string" || !slotId.trim()) {
+        throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "slotId must be a non-empty string.");
       }
-    }
-    originals.clear();
-    pendingNodes.clear();
-    translatedCount = 0;
-  }
-  function pumpQueue() {
-    while (active && currentSettings.enabled && inFlight < MAX_CONCURRENCY && queue.length > 0) {
-      const node = queue.shift();
-      if (!node || !pendingNodes.has(node)) {
-        continue;
+      if (hasOwn2(slots, slotId)) {
+        return slots[slotId];
       }
-      inFlight += 1;
-      void processNode(node).finally(() => {
-        inFlight -= 1;
-        pumpQueue();
-      });
-    }
-  }
-  async function processNode(node) {
-    const signal = abortController?.signal;
-    if (!active || !currentSettings.enabled || signal?.aborted) {
-      pendingNodes.delete(node);
-      return;
-    }
-    const raw = typeof node.nodeValue === "string" ? node.nodeValue : "";
-    const trimmed = raw.trim();
-    if (trimmed.length < 2 || !LATIN_LETTER_PATTERN.test(trimmed)) {
-      pendingNodes.delete(node);
-      return;
-    }
-    const leadingWs = raw.match(/^\s*/)?.[0] || "";
-    const trailingWs = raw.match(/\s*$/)?.[0] || "";
-    const cacheKey = `${currentSettings.targetLang}:${trimmed}`;
-    try {
-      let translated = cache.get(cacheKey);
-      if (translated === void 0) {
-        const { masked, tokens } = protectTechnicalTokens(trimmed);
-        const translatedMasked = await translateText(masked, {
-          targetLang: currentSettings.targetLang,
-          signal
-        });
-        if (!active || !currentSettings.enabled || signal?.aborted) {
-          pendingNodes.delete(node);
-          return;
+      const el = createSafeElement(doc, "div", {
+        attrs: {
+          translate: "no",
+          "data-addon-host-owner": ownerId,
+          "data-addon-host-slot": slotId
         }
-        translated = restoreTechnicalTokens(translatedMasked, tokens);
-        cacheSet(cacheKey, translated);
+      });
+      slots[slotId] = el;
+      shadowRoot.appendChild(el);
+      return el;
+    },
+    unmountSlot(slotId) {
+      if (!hasOwn2(slots, slotId)) {
+        return false;
       }
-      if (!originals.has(node)) {
-        originals.set(node, raw);
+      const el = slots[slotId];
+      delete slots[slotId];
+      if (el && el.parentNode && typeof el.parentNode.removeChild === "function") {
+        el.parentNode.removeChild(el);
       }
-      node.nodeValue = `${leadingWs}${translated}${trailingWs}`;
-      translatedCount = originals.size;
-      emitStatus("translated");
-    } catch (err) {
-      if (err?.name !== "AbortError") {
-        errorCount += 1;
-        emitStatus("error", String(err?.message || "Translation failed"));
+      return true;
+    },
+    injectStyle(styleId, cssText) {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_SURFACE_DISPOSED", "HostSurfacePort is already disposed.");
       }
-    } finally {
-      pendingNodes.delete(node);
-    }
-  }
-  function enqueueRoot(root) {
-    if (!active || !currentSettings.enabled || !root) {
-      return;
-    }
-    const nodes = collectTranslatableTextNodes(root);
-    for (const node of nodes) {
-      if (originals.has(node) || pendingNodes.has(node)) {
-        continue;
+      if (typeof styleId !== "string" || !styleId.trim()) {
+        throw new SecurityPolicyError("ERR_INVALID_STYLE_ID", "styleId must be a non-empty string.");
       }
-      pendingNodes.add(node);
-      queue.push(node);
-    }
-    pumpQueue();
-  }
-  function startObserver() {
-    const ObserverCtor = win.MutationObserver || globalThis.MutationObserver;
-    if (typeof ObserverCtor !== "function" || !doc.body) {
-      return;
-    }
-    observer = new ObserverCtor((mutations) => {
-      if (!active || !currentSettings.enabled) {
+      let styleEl = hasOwn2(styles, styleId) ? styles[styleId] : null;
+      if (!styleEl) {
+        styleEl = createSafeElement(doc, "style", {
+          attrs: {
+            "data-addon-host-owner": ownerId,
+            "data-addon-host-style": `${ownerId}:${styleId}`
+          }
+        });
+        styles[styleId] = styleEl;
+        shadowRoot.appendChild(styleEl);
+      }
+      styleEl.textContent = String(cssText || "");
+      return styleEl;
+    },
+    removeStyle(styleId) {
+      if (!hasOwn2(styles, styleId)) {
+        return false;
+      }
+      const el = styles[styleId];
+      delete styles[styleId];
+      if (el && el.parentNode && typeof el.parentNode.removeChild === "function") {
+        el.parentNode.removeChild(el);
+      }
+      return true;
+    },
+    listOwnedSlots() {
+      return Object.keys(slots);
+    },
+    onDispose(fn) {
+      if (disposed || typeof fn !== "function") {
         return;
       }
-      for (const mutation of mutations) {
-        if (mutation.type === "childList") {
-          for (const added of mutation.addedNodes || []) {
-            enqueueRoot(added);
+      disposers.push(fn);
+    },
+    dispose() {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      for (const fn of disposers.splice(0, disposers.length).reverse()) {
+        try {
+          fn();
+        } catch (err) {
+          if (diagnostics && typeof diagnostics.emit === "function") {
+            diagnostics.emit({
+              level: "error",
+              code: "SURFACE_DISPOSER_FAILED",
+              source: "adapter.shadow-surface",
+              message: "Surface disposer threw during teardown",
+              detail: err
+            });
           }
         }
       }
-    });
-    observer.observe(doc.body, { childList: true, subtree: true });
-  }
-  function stopObserver() {
-    if (observer) {
-      observer.disconnect();
-      observer = null;
-    }
-  }
-  return {
-    start() {
-      if (active) {
-        return;
-      }
-      active = true;
-      abortController = new AbortController();
-      if (currentSettings.enabled) {
-        startObserver();
-        enqueueRoot(doc.body || doc.documentElement);
-        emitStatus("running");
-      } else {
-        emitStatus("paused");
-      }
-    },
-    updateSettings(nextSettings = {}) {
-      const nextEnabled = nextSettings.enabled !== void 0 ? Boolean(nextSettings.enabled) : currentSettings.enabled;
-      const nextLang = typeof nextSettings.targetLang === "string" && nextSettings.targetLang.trim() ? nextSettings.targetLang.trim() : currentSettings.targetLang;
-      const langChanged = nextLang !== currentSettings.targetLang;
-      currentSettings = { enabled: nextEnabled, targetLang: nextLang };
-      if (!active) {
-        return;
-      }
-      if (!currentSettings.enabled) {
-        stopObserver();
-        queue.length = 0;
-        if (abortController) {
-          abortController.abort();
-          abortController = new AbortController();
+      for (const key of Object.keys(slots)) {
+        const el = slots[key];
+        delete slots[key];
+        if (el && el.parentNode && typeof el.parentNode.removeChild === "function") {
+          el.parentNode.removeChild(el);
         }
-        restoreAllOriginals();
-        emitStatus("paused");
-        return;
       }
-      if (langChanged) {
-        restoreAllOriginals();
+      for (const key of Object.keys(styles)) {
+        const el = styles[key];
+        delete styles[key];
+        if (el && el.parentNode && typeof el.parentNode.removeChild === "function") {
+          el.parentNode.removeChild(el);
+        }
       }
-      if (!observer) {
-        startObserver();
+      if (hostEl.parentNode && typeof hostEl.parentNode.removeChild === "function") {
+        hostEl.parentNode.removeChild(hostEl);
       }
-      enqueueRoot(doc.body || doc.documentElement);
-      emitStatus("running");
-    },
-    getStats() {
-      return {
-        enabled: currentSettings.enabled,
-        active,
-        translatedCount,
-        errorCount
-      };
-    },
-    dispose() {
-      active = false;
-      stopObserver();
-      queue.length = 0;
-      if (abortController) {
-        abortController.abort();
-        abortController = null;
-      }
-      restoreAllOriginals();
-      emitStatus("disposed");
     }
-  };
+  });
 }
 
 // src/adapters/antigravity/discovery-adapter.js
@@ -2344,225 +3999,6 @@ function createAntigravityThemeWorkspaceAdapter({
   };
 }
 
-// src/adapters/antigravity/remote-dock-ui.js
-var DOCK_STYLE_ID = "arp-remote-dock-style-v2";
-var DOCK_ROOT_ID = "arp-remote-dock-root-v2";
-var DOCK_CSS = [
-  `#${DOCK_ROOT_ID} { position: fixed; right: max(12px, env(safe-area-inset-right)); bottom: max(14px, env(safe-area-inset-bottom)); z-index: 2147483000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color-scheme: light dark; }`,
-  `#${DOCK_ROOT_ID} * { box-sizing: border-box; }`,
-  `#${DOCK_ROOT_ID} .arp-pill { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 999px; border: 1px solid rgba(128, 134, 139, 0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28); touch-action: manipulation; }`,
-  `#${DOCK_ROOT_ID} .arp-dot { width: 8px; height: 8px; border-radius: 50%; background: #34a853; flex-shrink: 0; }`,
-  `#${DOCK_ROOT_ID} .arp-dot[data-off="true"] { background: #9aa0a6; }`,
-  `#${DOCK_ROOT_ID} .arp-popover { position: absolute; right: 0; bottom: 54px; width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 96px); overflow-y: auto; border-radius: 14px; border: 1px solid rgba(128, 134, 139, 0.35); background: var(--card, #181a1f); color: var(--foreground, #f1f3f4); padding: 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36); display: flex; flex-direction: column; gap: 10px; }`,
-  `#${DOCK_ROOT_ID} .arp-popover[hidden] { display: none; }`,
-  `#${DOCK_ROOT_ID} .arp-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }`,
-  `#${DOCK_ROOT_ID} .arp-title { margin: 0; font-size: 14px; font-weight: 700; }`,
-  `#${DOCK_ROOT_ID} .arp-close { min-width: 44px; min-height: 44px; border-radius: 10px; border: 1px solid rgba(128, 134, 139, 0.3); background: transparent; color: inherit; font-size: 16px; cursor: pointer; touch-action: manipulation; }`,
-  `#${DOCK_ROOT_ID} .arp-section { border-radius: 10px; border: 1px solid rgba(128, 134, 139, 0.24); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
-  `#${DOCK_ROOT_ID} .arp-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }`,
-  `#${DOCK_ROOT_ID} .arp-label { font-size: 13px; font-weight: 600; }`,
-  `#${DOCK_ROOT_ID} .arp-meta { font-size: 12px; opacity: 0.78; }`,
-  `#${DOCK_ROOT_ID} .arp-btn { min-height: 44px; padding: 8px 12px; border-radius: 10px; border: 1px solid rgba(128, 134, 139, 0.35); background: rgba(128, 134, 139, 0.14); color: inherit; font-size: 13px; font-weight: 600; cursor: pointer; touch-action: manipulation; }`,
-  `#${DOCK_ROOT_ID} .arp-btn[data-active="true"] { background: #1a73e8; border-color: #1a73e8; color: #ffffff; }`,
-  `#${DOCK_ROOT_ID} .arp-pill:focus-visible, #${DOCK_ROOT_ID} .arp-close:focus-visible, #${DOCK_ROOT_ID} .arp-btn:focus-visible { outline: 2px solid #4d90fe; outline-offset: 2px; }`,
-  `@media (prefers-color-scheme: light) { #${DOCK_ROOT_ID} .arp-pill, #${DOCK_ROOT_ID} .arp-popover { background: var(--card, #ffffff); color: var(--foreground, #1f2328); } }`
-].join(" ");
-function createRemoteDockUi({
-  win,
-  doc,
-  initialTranslateEnabled = true,
-  onToggleTranslation,
-  onOpenSidecar
-} = {}) {
-  const existing = doc.getElementById(DOCK_ROOT_ID);
-  if (existing && typeof existing.remove === "function") {
-    existing.remove();
-  }
-  let styleEl = doc.getElementById(DOCK_STYLE_ID);
-  if (!styleEl) {
-    styleEl = doc.createElement("style");
-    styleEl.id = DOCK_STYLE_ID;
-    styleEl.textContent = DOCK_CSS;
-    (doc.head || doc.documentElement).appendChild(styleEl);
-  }
-  let isOpen = false;
-  let translateEnabled = Boolean(initialTranslateEnabled);
-  const root = createSafeElement(doc, "div", {
-    attrs: { id: DOCK_ROOT_ID, "data-remote-dock-ignore": "true" }
-  });
-  const popover = createSafeElement(doc, "section", {
-    attrs: {
-      class: "arp-popover",
-      role: "dialog",
-      "aria-label": "Antigravity Remote Companion",
-      hidden: "hidden"
-    }
-  });
-  const header = createSafeElement(doc, "div", { attrs: { class: "arp-header" } });
-  const title = createSafeElement(doc, "h2", {
-    attrs: { class: "arp-title" },
-    text: "Antigravity Remote"
-  });
-  const closeBtn = createSafeElement(doc, "button", {
-    attrs: { type: "button", class: "arp-close", "aria-label": "\uB2EB\uAE30" },
-    text: "\xD7"
-  });
-  header.appendChild(title);
-  header.appendChild(closeBtn);
-  popover.appendChild(header);
-  const trSection = createSafeElement(doc, "div", { attrs: { class: "arp-section" } });
-  const trRow = createSafeElement(doc, "div", { attrs: { class: "arp-row" } });
-  const trLabel = createSafeElement(doc, "span", {
-    attrs: { class: "arp-label" },
-    text: "\uD55C\uAE00 \uBC88\uC5ED (ko-translator)"
-  });
-  const trToggleBtn = createSafeElement(doc, "button", {
-    attrs: {
-      type: "button",
-      class: "arp-btn",
-      id: "arp-toggle-translate",
-      "data-active": translateEnabled ? "true" : "false",
-      "aria-pressed": translateEnabled ? "true" : "false"
-    },
-    text: translateEnabled ? "\uCF1C\uC9D0" : "\uAEBC\uC9D0"
-  });
-  trRow.appendChild(trLabel);
-  trRow.appendChild(trToggleBtn);
-  const trStatus = createSafeElement(doc, "div", {
-    attrs: { class: "arp-meta", id: "arp-translate-status", role: "status", "aria-live": "polite" },
-    text: translateEnabled ? "\uC6D0\uACA9 \uD398\uC774\uC9C0 \uC2E4\uC2DC\uAC04 \uBC88\uC5ED \uD65C\uC131" : "\uC6D0\uBB38 \uD45C\uC2DC \uC911"
-  });
-  trSection.appendChild(trRow);
-  trSection.appendChild(trStatus);
-  popover.appendChild(trSection);
-  const sidecarSection = createSafeElement(doc, "div", { attrs: { class: "arp-section" } });
-  const sidecarLabel = createSafeElement(doc, "span", {
-    attrs: { class: "arp-label" },
-    text: "\uB3D9\uBC18 \uC0AC\uC774\uB4DC\uCE74 \uD328\uB110"
-  });
-  const sidecarRow = createSafeElement(doc, "div", { attrs: { class: "arp-row" } });
-  const statusbarBtn = createSafeElement(doc, "button", {
-    attrs: { type: "button", class: "arp-btn", id: "arp-open-statusbar" },
-    text: "Statusbar \uC5F4\uAE30"
-  });
-  const mcpBtn = createSafeElement(doc, "button", {
-    attrs: { type: "button", class: "arp-btn", id: "arp-open-mcp" },
-    text: "MCP Manager \uC5F4\uAE30"
-  });
-  sidecarRow.appendChild(statusbarBtn);
-  sidecarRow.appendChild(mcpBtn);
-  const sidecarFeedback = createSafeElement(doc, "div", {
-    attrs: { class: "arp-meta", id: "arp-sidecar-feedback", role: "status", "aria-live": "polite" },
-    text: "Antigravity \uACF5\uC2DD AUX_PANE \uAC8C\uC774\uD2B8\uC6E8\uC774\uB85C \uC5F0\uACB0\uB429\uB2C8\uB2E4."
-  });
-  sidecarSection.appendChild(sidecarLabel);
-  sidecarSection.appendChild(sidecarRow);
-  sidecarSection.appendChild(sidecarFeedback);
-  popover.appendChild(sidecarSection);
-  const pillBtn = createSafeElement(doc, "button", {
-    attrs: {
-      type: "button",
-      class: "arp-pill",
-      id: "arp-dock-pill",
-      "aria-expanded": "false",
-      "aria-label": "Antigravity Remote \uBA54\uB274 \uC5F4\uAE30"
-    }
-  });
-  const dot = createSafeElement(doc, "span", {
-    attrs: { class: "arp-dot", "data-off": translateEnabled ? "false" : "true" }
-  });
-  const pillText = createSafeElement(doc, "span", { text: "Remote" });
-  pillBtn.appendChild(dot);
-  pillBtn.appendChild(pillText);
-  root.appendChild(popover);
-  root.appendChild(pillBtn);
-  (doc.body || doc.documentElement).appendChild(root);
-  function setOpen(nextOpen) {
-    isOpen = Boolean(nextOpen);
-    popover.hidden = !isOpen;
-    pillBtn.setAttribute("aria-expanded", isOpen ? "true" : "false");
-    if (!isOpen && typeof pillBtn.focus === "function") {
-      pillBtn.focus();
-    }
-  }
-  function updateTranslateUi(enabled, statusText) {
-    translateEnabled = Boolean(enabled);
-    trToggleBtn.setAttribute("data-active", translateEnabled ? "true" : "false");
-    trToggleBtn.setAttribute("aria-pressed", translateEnabled ? "true" : "false");
-    trToggleBtn.textContent = translateEnabled ? "\uCF1C\uC9D0" : "\uAEBC\uC9D0";
-    dot.setAttribute("data-off", translateEnabled ? "false" : "true");
-    if (typeof statusText === "string") {
-      trStatus.textContent = statusText;
-    }
-  }
-  const onPillClick = () => setOpen(!isOpen);
-  const onCloseClick = () => setOpen(false);
-  const onTranslateClick = () => {
-    const next = !translateEnabled;
-    updateTranslateUi(next, next ? "\uBC88\uC5ED \uC801\uC6A9 \uC911..." : "\uC6D0\uBB38\uC73C\uB85C \uBCF5\uC6D0\uB428");
-    if (typeof onToggleTranslation === "function") {
-      onToggleTranslation(next);
-    }
-  };
-  const onStatusbarClick = () => {
-    if (typeof onOpenSidecar === "function") {
-      onOpenSidecar("antigravity-statusbar/statusbar");
-    }
-    sidecarFeedback.textContent = "Statusbar \uBCF4\uC870 \uD328\uB110 \uD1A0\uAE00 \uC694\uCCAD\uC744 \uBCF4\uB0C8\uC2B5\uB2C8\uB2E4.";
-  };
-  const onMcpClick = () => {
-    if (typeof onOpenSidecar === "function") {
-      onOpenSidecar("antigravity-mcp-manager/mcp_manager");
-    }
-    sidecarFeedback.textContent = "MCP Manager \uBCF4\uC870 \uD328\uB110 \uD1A0\uAE00 \uC694\uCCAD\uC744 \uBCF4\uB0C8\uC2B5\uB2C8\uB2E4.";
-  };
-  const onKeyDown = (e) => {
-    if (e.isComposing || e.keyCode === 229) {
-      return;
-    }
-    if (e.key === "Escape" && isOpen) {
-      setOpen(false);
-    }
-  };
-  pillBtn.addEventListener("click", onPillClick);
-  closeBtn.addEventListener("click", onCloseClick);
-  trToggleBtn.addEventListener("click", onTranslateClick);
-  statusbarBtn.addEventListener("click", onStatusbarClick);
-  mcpBtn.addEventListener("click", onMcpClick);
-  win.addEventListener("keydown", onKeyDown);
-  return {
-    setOpen,
-    toggleOpen() {
-      setOpen(!isOpen);
-    },
-    setTranslationStatus(stats) {
-      if (!stats) {
-        return;
-      }
-      if (!stats.enabled) {
-        updateTranslateUi(false, "\uC6D0\uBB38 \uD45C\uC2DC \uC911");
-        return;
-      }
-      if (stats.lastError) {
-        updateTranslateUi(true, `\uBC88\uC5ED \uC624\uB958: ${stats.lastError}`);
-        return;
-      }
-      updateTranslateUi(true, `\uBC88\uC5ED \uD65C\uC131 \xB7 ${stats.translatedCount || 0}\uAC1C \uAD6C\uAC04 \uBC88\uC5ED\uB428`);
-    },
-    dispose() {
-      pillBtn.removeEventListener("click", onPillClick);
-      closeBtn.removeEventListener("click", onCloseClick);
-      trToggleBtn.removeEventListener("click", onTranslateClick);
-      statusbarBtn.removeEventListener("click", onStatusbarClick);
-      mcpBtn.removeEventListener("click", onMcpClick);
-      win.removeEventListener("keydown", onKeyDown);
-      if (typeof root.remove === "function") {
-        root.remove();
-      }
-    }
-  };
-}
-
 // src/runtime/bootstrap.js
 var ANTIGRAVITY_STATUSBAR_API_PATHS = Object.freeze([
   "/api/telemetry",
@@ -2670,156 +4106,155 @@ function bootstrapAntigravityRemoteBridge({
   };
 }
 
-// src/runtime/remote-web-entry.js
-var DEFAULT_TRANSLATE_API_BASE = "https://translate.googleapis.com/translate_a/single";
-function validateTranslateEndpoint(rawUrl) {
-  let parsed;
-  try {
-    parsed = new URL(rawUrl);
-  } catch (_err) {
-    throw new SecurityPolicyError("INVALID_TRANSLATE_ENDPOINT", "Invalid translation endpoint URL.");
-  }
-  const isHttps = parsed.protocol === "https:";
-  const isLoopbackHttp = parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname);
-  if (!isHttps && !isLoopbackHttp) {
-    throw new SecurityPolicyError(
-      "UNSAFE_TRANSLATE_ENDPOINT",
-      "Remote translation endpoint must use HTTPS (or loopback HTTP for local testing)."
-    );
-  }
-  if (parsed.username || parsed.password) {
-    throw new SecurityPolicyError("UNSAFE_TRANSLATE_ENDPOINT", "Embedded credentials in endpoint URL are forbidden.");
-  }
-  return parsed.toString();
-}
-function parseGoogleTranslateResponse(data) {
-  if (data && typeof data === "object" && typeof data.translatedText === "string") {
-    return data.translatedText;
-  }
-  if (Array.isArray(data) && Array.isArray(data[0])) {
-    return data[0].map((seg) => Array.isArray(seg) && typeof seg[0] === "string" ? seg[0] : "").join("");
-  }
-  throw new Error("Unexpected translation response format.");
-}
-function createRemoteHttpTranslator({ win, endpointBase = DEFAULT_TRANSLATE_API_BASE }) {
-  const safeBase = validateTranslateEndpoint(endpointBase);
-  const gmXhr = typeof win?.GM_xmlhttpRequest === "function" ? win.GM_xmlhttpRequest : typeof globalThis.GM_xmlhttpRequest === "function" ? globalThis.GM_xmlhttpRequest : null;
-  return async function translateText(text, { targetLang = "ko", signal } = {}) {
-    const url = new URL(safeBase);
-    url.searchParams.set("client", "gtx");
-    url.searchParams.set("sl", "auto");
-    url.searchParams.set("tl", targetLang);
-    url.searchParams.set("dt", "t");
-    url.searchParams.set("q", text);
-    if (gmXhr) {
-      return new Promise((resolve, reject) => {
-        gmXhr({
-          method: "GET",
-          url: url.toString(),
-          onload(resp2) {
-            if (resp2.status < 200 || resp2.status >= 300) {
-              reject(new Error(`Translation HTTP ${resp2.status}`));
-              return;
-            }
-            try {
-              resolve(parseGoogleTranslateResponse(JSON.parse(resp2.responseText)));
-            } catch (parseErr) {
-              reject(parseErr);
-            }
-          },
-          onerror() {
-            reject(new Error("Translation network error"));
-          }
-        });
-      });
-    }
-    const fetchFn = typeof win?.fetch === "function" ? win.fetch.bind(win) : globalThis.fetch.bind(globalThis);
-    const resp = await fetchFn(url.toString(), { method: "GET", signal });
-    if (!resp.ok) {
-      throw new Error(`Translation HTTP ${resp.status}`);
-    }
-    const json = await resp.json();
-    return parseGoogleTranslateResponse(json);
-  };
-}
-function mountAntigravityRemoteCompanion(win = globalThis.window, doc = globalThis.document) {
+// src/runtime/remote-host-runtime.js
+var REMOTE_HOST_VERSION = "2.0.0";
+var DESKTOP_SETTINGS_SLOT_ID = "antigravity-remote-plugin.settings";
+function mountRemotePluginHost({
+  win = globalThis.window,
+  doc = globalThis.document,
+  allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
+  initialLocale = "ko",
+  ownerId = "antigravity-remote-plugin"
+} = {}) {
   if (!win || !doc) {
     return null;
   }
-  if (win.__antigravityRemoteCompanion && typeof win.__antigravityRemoteCompanion.toggleDock === "function") {
-    win.__antigravityRemoteCompanion.toggleDock();
-    return win.__antigravityRemoteCompanion;
+  if (win.antigravityRemoteHost && typeof win.antigravityRemoteHost.toggleDock === "function") {
+    win.antigravityRemoteHost.toggleDock();
+    return win.antigravityRemoteHost;
   }
-  const allowedOrigins = Array.isArray(win.__ARP_ALLOWED_ORIGINS__) && win.__ARP_ALLOWED_ORIGINS__.length > 0 ? win.__ARP_ALLOWED_ORIGINS__ : DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS;
   const currentOrigin = win.location?.origin || "";
   if (!isOriginAllowed(currentOrigin, allowedOrigins)) {
     return null;
   }
-  const endpointBase = typeof win.__ARP_TRANSLATE_ENDPOINT__ === "string" && win.__ARP_TRANSLATE_ENDPOINT__.trim() ? win.__ARP_TRANSLATE_ENDPOINT__.trim() : DEFAULT_TRANSLATE_API_BASE;
-  let dock = null;
-  const translateText = createRemoteHttpTranslator({ win, endpointBase });
-  const translator = typeof win.__agyCreateKoTranslator === "function" ? win.__agyCreateKoTranslator({
+  const diagnostics = new DiagnosticsBus();
+  const registry = new RemotePluginRegistry({ diagnostics });
+  const surface = createShadowSurfaceAdapter({ doc, ownerId, diagnostics });
+  const renderer = createDeclarativeSlotRenderer({
     win,
     doc,
-    settings: { enabled: true, provider: "google-translate" },
-    onStatus: (stats) => dock?.setTranslationStatus(stats)
-  }) : createRemoteTranslatorEngine({
-    win,
-    doc,
-    settings: { enabled: true, targetLang: "ko" },
-    translateText,
-    onStatus: (stats) => dock?.setTranslationStatus(stats)
+    surface,
+    registry,
+    initialLocale
   });
-  dock = createRemoteDockUi({
+  const handshake = createPluginHandshakeHost({
     win,
-    doc,
-    initialTranslateEnabled: true,
-    onToggleTranslation(nextEnabled) {
-      translator.updateSettings({ enabled: nextEnabled });
-    },
-    onOpenSidecar(sidecarId) {
-      const targetWin = win.parent && win.parent !== win ? win.parent : win;
-      targetWin.postMessage(
-        {
-          type: "toggle-aux-pane",
-          payload: { sidecarId, viewPath: "/" }
-        },
-        currentOrigin
-      );
+    allowedOrigins,
+    onPortConnected({ port, origin, pluginId }) {
+      diagnostics.emit({
+        level: "info",
+        code: "REMOTE_PLUGIN_HANDSHAKE_CONNECTED",
+        source: "runtime.remote-host",
+        message: "Closed MessageChannel handshake established",
+        detail: { origin, pluginId }
+      });
+      port.onmessage = (msgEvent) => {
+        const msg = msgEvent?.data;
+        if (!msg || typeof msg !== "object") {
+          return;
+        }
+        if (msg.type === "remote-plugin-v1:list") {
+          port.postMessage({
+            type: "remote-plugin-v1:list-result",
+            plugins: registry.list().map((p) => ({
+              id: p.id,
+              version: p.version,
+              uiSlot: p.uiSlot,
+              capabilities: p.capabilities
+            }))
+          });
+        }
+      };
     }
   });
-  translator.start();
-  const handle = {
-    version: "2.0.0",
-    translator,
-    dock,
+  let disposed = false;
+  const handle = Object.freeze({
+    contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
+    version: REMOTE_HOST_VERSION,
+    registry,
+    renderer,
+    diagnostics,
+    register(plugin) {
+      return registry.register(plugin, { locale: renderer.getLocale() });
+    },
+    unregister(pluginId) {
+      return registry.unregister(pluginId);
+    },
+    listPlugins() {
+      return registry.list();
+    },
+    listSlots() {
+      return [...ALLOWED_UI_SLOTS];
+    },
     toggleDock() {
-      dock.toggleOpen();
+      renderer.toggleOpen();
+    },
+    setOpen(open) {
+      renderer.setOpen(open);
+    },
+    setLocale(locale) {
+      return renderer.setLocale(locale);
+    },
+    getLocale() {
+      return renderer.getLocale();
+    },
+    issueHandshakeNonce() {
+      return handshake.issueNonce();
     },
     dispose() {
-      translator.dispose();
-      dock.dispose();
-      if (win.__antigravityRemoteCompanion === handle) {
-        delete win.__antigravityRemoteCompanion;
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      handshake.dispose();
+      registry.dispose();
+      surface.dispose();
+      if (win.antigravityRemoteHost === handle) {
+        delete win.antigravityRemoteHost;
       }
     }
-  };
-  win.__antigravityRemoteCompanion = handle;
+  });
+  win.antigravityRemoteHost = handle;
   return handle;
 }
-if (typeof window !== "undefined" && typeof document !== "undefined" && window.__ARP_AUTO_MOUNT__ !== false) {
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => {
-      mountAntigravityRemoteCompanion(window, document);
-    }, { once: true });
-  } else {
-    mountAntigravityRemoteCompanion(window, document);
-  }
+function mountDesktopAddon(addonHost, {
+  doc = globalThis.document,
+  clipboard = globalThis.navigator?.clipboard ?? null,
+  remoteArtifacts = {
+    bookmarklet: "dist/bookmarklet.txt",
+    userscriptPath: "dist/antigravity-remote.user.js"
+  },
+  initialLocale = "ko"
+} = {}) {
+  const surface = createAddonHostSurfaceAdapter(addonHost);
+  const view = mountDesktopCompanionView({
+    doc,
+    surface,
+    slotId: DESKTOP_SETTINGS_SLOT_ID,
+    hostInfo: {
+      hostProfileId: surface.hostProfileId,
+      hostVersion: surface.hostVersion
+    },
+    remoteArtifacts,
+    clipboard,
+    initialLocale
+  });
+  return Object.freeze({
+    pluginId: surface.pluginId,
+    slotId: DESKTOP_SETTINGS_SLOT_ID,
+    surface,
+    view,
+    dispose() {
+      surface.dispose();
+    }
+  });
 }
 
 // virtual-remote-bridge-entry.js
 var BUILD_VERSION = "2.0.0";
 export {
+  ALLOWED_CAPABILITIES,
+  ALLOWED_UI_SLOTS,
   ANTIGRAVITY_PROTECTED_MCP_PATHS,
   ANTIGRAVITY_SIDECAR_INBOUND_EVENTS,
   ANTIGRAVITY_STATUSBAR_API_PATHS,
@@ -2827,13 +4262,19 @@ export {
   BUILD_VERSION,
   DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
   DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
+  DESKTOP_SETTINGS_SLOT_ID,
   DiagnosticsBus,
   DisposableStore,
   EventChain,
+  HANDSHAKE_ACK_TYPE,
+  HANDSHAKE_PROTOCOL_TYPE,
   PORT_CONTRACTS,
   REDACTED,
+  REMOTE_HOST_VERSION,
+  REMOTE_PLUGIN_CONTRACT_VERSION,
   RESERVED_TRUSTED_TYPES_POLICIES,
   RemoteOrchestrator,
+  RemotePluginRegistry,
   SecurityPolicyError,
   SingleFlight,
   assertAllowedPolicyName,
@@ -2841,27 +4282,33 @@ export {
   assertPort,
   assertRemoteMcpMutationAllowed,
   assertSafeAttribute,
+  assertSafeLocalizedText,
   assertSafeTagName,
+  assertSafeText,
   assertTrustedScriptUrl,
   assertWritableConfigPath,
   bootstrapAntigravityRemoteBridge,
   canonicalizeConfigPath,
+  createAddonHostSurfaceAdapter,
   createAntigravityDiscoveryAdapter,
   createAntigravityFrameAdapter,
   createAntigravitySettingsAdapter,
   createAntigravitySidecarAdapter,
   createAntigravityThemeWorkspaceAdapter,
+  createDeclarativeSlotRenderer,
   createDomOverlayBridge,
   createGuardedWorkerBlobUrl,
   createMcpExtensionSlot,
-  createRemoteDockUi,
-  createRemoteTranslatorEngine,
+  createPluginHandshakeHost,
   createSafeElement,
   createScopedTrustedTypesPolicy,
+  createShadowSurfaceAdapter,
   createSidecarUiBridge,
   deepFreeze,
   deriveSidecarOrigin,
   formatHostForUrl,
+  generateHandshakeNonce,
+  initiatePluginHandshake,
   isLoopbackHostname,
   isOriginAllowed,
   isSensitiveKey,
@@ -2869,18 +4316,24 @@ export {
   isTrustedScriptUrl,
   isTrustedWorkerOrScriptUrl,
   matchesDomainBoundary,
-  mountAntigravityRemoteCompanion,
+  mountDesktopAddon,
+  mountDesktopCompanionView,
+  mountRemotePluginHost,
   normalizeOrigin,
-  protectTechnicalTokens,
   redactSecrets,
   redactUrl,
-  restoreTechnicalTokens,
+  resolveLocalizedText,
   sanitizeTranslatorSettings,
   stripSensitiveDeep,
   stripSensitiveSettings,
+  validateActionInvocation,
+  validateActionResult,
   validateBridgeDescriptor,
   validateDiscoveryPort,
   validateFramePromotionPort,
+  validateHostSurfacePort,
+  validatePluginSnapshot,
+  validateRemotePlugin,
   validateSettingsReadPort,
   validateSidecarRelayPort,
   validateThemeWorkspaceSyncPort
