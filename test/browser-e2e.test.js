@@ -151,14 +151,37 @@ async function createCdpSession(pageWsUrl) {
   return { send, waitForEvent, close: () => ws.close() };
 }
 
-test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, iframe load postMessage, and cross-origin DOMException', async () => {
+test('ARP-TC-023: Real Chromium E2E verifies default window.fetch orchestrator.start/relayApi/DomOverlay, TrustedTypes CSP, Worker Blob, iframe load postMessage, and cross-origin DOMException', async () => {
   const browserBin = findBrowserExecutable();
   assert.ok(browserBin, 'A Chromium/Chrome/Edge executable is required for ARP-TC-023 browser E2E');
 
   const bundleSource = readFileSync(join(ROOT, 'dist/remote_bridge.js'), 'utf8');
+  const REAL_CSRF = 'real-browser-csrf-token-1234';
+  const REAL_SIDECAR_TOKEN = 'sc-browser-tok-9999';
 
-  // 1) Sidecar server (different loopback port) serving a real iframe HTML page.
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, x-codeium-csrf-token, X-Sidecar-Token',
+  };
+
+  // 1) Sidecar server (different loopback port) serving both real iframe HTML and JSON APIs.
   const sidecarSrv = await startHttpServer((req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, corsHeaders);
+      res.end();
+      return;
+    }
+    if (req.url === '/api/telemetry') {
+      if (req.headers['x-sidecar-token'] !== REAL_SIDECAR_TOKEN) {
+        res.writeHead(401, { ...corsHeaders, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ usedTokens: 54321, maxTokenLimit: 384000 }));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(`<!doctype html><html><body><script>
       window.__received = [];
@@ -174,13 +197,55 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
     </script></body></html>`);
   });
 
-  // 2) Cross-origin server (accessed via http://localhost:<port>, different origin from 127.0.0.1).
+  // 2) Real LanguageServer Connect RPC server for Chromium default window.fetch discovery.
+  const lsSrv = await startHttpServer((req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, corsHeaders);
+      res.end();
+      return;
+    }
+    if (req.headers['x-codeium-csrf-token'] !== REAL_CSRF) {
+      res.writeHead(403, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'forbidden' }));
+      return;
+    }
+    if (req.url === '/exa.language_server_pb.LanguageServerService/GetAllPlugins') {
+      res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        plugins: [
+          { name: 'antigravity-statusbar', path: '/p/antigravity-statusbar', disabled: false },
+          { name: 'antigravity-ko-translator', path: '/p/ko-thought-translator', disabled: false },
+        ],
+      }));
+      return;
+    }
+    if (req.url === '/exa.language_server_pb.LanguageServerService/GetSidecars') {
+      res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        sidecars: [
+          {
+            sidecarId: 'antigravity-statusbar/statusbar',
+            pluginName: 'antigravity-statusbar',
+            host: '127.0.0.1',
+            port: sidecarSrv.port,
+            token: REAL_SIDECAR_TOKEN,
+            running: true,
+          },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(404, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  // 3) Cross-origin server (accessed via http://localhost:<port>, different origin from 127.0.0.1).
   const crossOriginSrv = await startHttpServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end('<!doctype html><html><body>cross-origin-frame</body></html>');
   });
 
-  // 3) Host server enforcing strict TrustedTypes CSP & serving dist/remote_bridge.js.
+  // 4) Host server enforcing strict TrustedTypes CSP & serving dist/remote_bridge.js.
   const hostSrv = await startHttpServer((req, res) => {
     if (req.url === '/remote_bridge.js') {
       res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
@@ -208,7 +273,6 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
     const launched = await launchHeadlessChromium(browserBin, userDataDir);
     child = launched.child;
 
-    // Fetch the page target WebSocket URL from Chromium's /json endpoint.
     const debugPort = new URL(launched.wsUrl).port;
     const targetsRes = await fetch(`http://127.0.0.1:${debugPort}/json`);
     const targets = await targetsRes.json();
@@ -226,23 +290,33 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
     const evalExpr = `(async () => {
       const mod = await import('/remote_bridge.js');
       const hostOrigin = window.location.origin;
+      const lsPort = ${lsSrv.port};
       const sidecarPort = ${sidecarSrv.port};
       const crossPort = ${crossOriginSrv.port};
 
       const inbound = [];
+      const overlayLog = [];
+
+      // IMPORTANT (C2): Do NOT pass fetchImpl -> exercises real Chromium window.fetch!
       const app1 = mod.bootstrapAntigravityRemoteBridge({
-        lsAddress: '127.0.0.1:5387',
-        csrfToken: 'real-browser-csrf-token-1234',
+        lsAddress: '127.0.0.1:' + lsPort,
+        csrfToken: '${REAL_CSRF}',
         allowedOrigins: [hostOrigin, 'https://antigravity.google.com'],
+        readSettingsFile: async () => ({ provider: 'local-llm', translateThinking: true }),
         initialThemeVariables: { '--background': '#101418' },
         initialWorkspaceUris: ['file:///workspace/e2e'],
+        initialFrame: { win: window, doc: document, origin: hostOrigin, conversationId: 'conv-browser-1' },
+        createKoTranslator: ({ win, doc, settings }) => ({
+          start() { overlayLog.push({ event: 'start', provider: settings.provider, hasDom: Boolean(win && doc) }); },
+          dispose() { overlayLog.push({ event: 'dispose' }); },
+        }),
         onSidecarEvent: (evt) => inbound.push(evt),
       });
 
       // Re-initialization with the same fixed policy name must reuse cached policy (no duplicate TypeError).
       const app2 = mod.bootstrapAntigravityRemoteBridge({
-        lsAddress: '127.0.0.1:5387',
-        csrfToken: 'real-browser-csrf-token-1234',
+        lsAddress: '127.0.0.1:' + lsPort,
+        csrfToken: '${REAL_CSRF}',
         allowedOrigins: [hostOrigin],
       });
 
@@ -259,6 +333,25 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
         const w = new Worker(trustedBlobUrl);
         w.onmessage = (e) => { w.terminate(); resolve(e.data); };
         w.onerror = (e) => { w.terminate(); reject(new Error(e.message || 'worker error')); };
+      });
+
+      // Real orchestrator.start() using Chromium's default window.fetch (must NOT throw Illegal invocation).
+      const startResult = await app1.orchestrator.start();
+
+      // Real relayApi() using Chromium's default window.fetch + X-Sidecar-Token.
+      const telemetry = await app1.bridges.statusbar.relayApi('/api/telemetry', { conversationId: 'conv-browser-1' });
+
+      // Wait for real sidecar iframe load -> theme-change + workspace-change -> inbound toggle-aux-pane.
+      const deadline = Date.now() + 5000;
+      while (inbound.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      // Spoofed message with wrong source on the sidecar origin must be rejected.
+      const spoofedResult = app1.bridges.statusbar.handleInboundMessage({
+        origin: 'http://127.0.0.1:' + sidecarPort,
+        source: window,
+        data: { type: 'toggle-aux-pane', payload: { spoof: true } },
       });
 
       // Cross-origin iframe must throw SecurityPolicyError(CROSS_ORIGIN_IFRAME_DENIED), NOT raw DOMException.
@@ -284,27 +377,6 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
       }
       const promotedSame = app1.framePort.promoteRemoteIframe(sameIframe, { targetOrigin: hostOrigin });
 
-      // SidecarUiBridge real iframe load + postMessage round-trip.
-      await app1.bridges.statusbar.mount({
-        frame: { win: window, doc: document, conversationId: 'conv-browser-1' },
-        sidecar: { sidecarId: 'antigravity-statusbar/statusbar', host: '127.0.0.1', port: sidecarPort, token: 'sc-browser-tok' },
-        diagnostics: app1.diagnostics,
-      });
-
-      // Wait for real sidecar iframe load -> theme-change + workspace-change -> inbound toggle-aux-pane.
-      const deadline = Date.now() + 5000;
-      while (inbound.length === 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
-
-      // Spoofed message with wrong source on the sidecar origin must be rejected.
-      const spoofedResult = app1.bridges.statusbar.handleInboundMessage({
-        origin: 'http://127.0.0.1:' + sidecarPort,
-        source: window,
-        data: { type: 'toggle-aux-pane', payload: { spoof: true } },
-      });
-
-      app1.bridges.statusbar.dispose();
       app1.orchestrator.dispose();
       app2.orchestrator.dispose();
 
@@ -312,6 +384,9 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
         isNativeTT,
         isTrustedScriptUrl,
         workerReply,
+        mountedIds: startResult.mountedIds,
+        telemetryUsedTokens: telemetry.usedTokens,
+        overlayLog,
         crossErrCode,
         mismatchErrCode,
         promotedOrigin: promotedSame.origin,
@@ -332,6 +407,12 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
     assert.equal(result.isNativeTT, true);
     assert.equal(result.isTrustedScriptUrl, true);
     assert.equal(result.workerReply, 'worker-pong');
+    assert.deepEqual(result.mountedIds.sort(), ['ko-translator-overlay', 'statusbar-sidecar']);
+    assert.equal(result.telemetryUsedTokens, 54321);
+    assert.equal(result.overlayLog[0].event, 'start');
+    assert.equal(result.overlayLog[0].provider, 'google-translate');
+    assert.equal(result.overlayLog[0].hasDom, true);
+    assert.equal(result.overlayLog[result.overlayLog.length - 1].event, 'dispose');
     assert.equal(result.crossErrCode, 'CROSS_ORIGIN_IFRAME_DENIED');
     assert.equal(result.mismatchErrCode, 'ORIGIN_MISMATCH');
     assert.equal(result.promotedOrigin, `http://127.0.0.1:${hostSrv.port}`);
@@ -350,6 +431,7 @@ test('ARP-TC-023: Real Chromium E2E verifies TrustedTypes CSP, Worker Blob, ifra
     }
     rmSync(userDataDir, { recursive: true, force: true });
     await new Promise((r) => hostSrv.server.close(r));
+    await new Promise((r) => lsSrv.server.close(r));
     await new Promise((r) => sidecarSrv.server.close(r));
     await new Promise((r) => crossOriginSrv.server.close(r));
   }

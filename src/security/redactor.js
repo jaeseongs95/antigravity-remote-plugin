@@ -22,6 +22,8 @@ const SENSITIVE_QUERY_PARAMS = new Set([
 const INLINE_PARAM_PATTERN =
   /([?&#](?:token|access_token|refresh_token|csrf|csrf_token|api_key|apikey|secret|key|password|passwd|x-sidecar-token)=)([^&#]*)/gi;
 
+const INLINE_USERINFO_PATTERN = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)([^/\s@]+)(@)/g;
+
 export const REDACTED = '[REDACTED]';
 
 function redactFragment(hash) {
@@ -39,7 +41,9 @@ export function redactUrl(rawUrl) {
   try {
     parsed = new URL(rawUrl);
   } catch (_err) {
-    return rawUrl.replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
+    return rawUrl
+      .replace(INLINE_USERINFO_PATTERN, `$1${REDACTED}$3`)
+      .replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
   }
   let mutated = false;
   for (const paramKey of [...parsed.searchParams.keys()]) {

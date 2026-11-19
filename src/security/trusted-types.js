@@ -69,11 +69,12 @@ export function createScopedTrustedTypesPolicy({
     POLICY_CACHE.set(trustedTypesApi, apiCache);
   }
 
-  let nativePolicy = apiCache.get(trimmedName);
-  if (!nativePolicy) {
-    nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
+  let entry = apiCache.get(trimmedName);
+  if (!entry) {
+    const holder = { validator: validateScriptUrl };
+    const nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
       createScriptURL(url) {
-        if (!validateScriptUrl(url)) {
+        if (!holder.validator(url)) {
           throw new SecurityPolicyError(
             'UNTRUSTED_SCRIPT_URL',
             'Script URL failed allowlist validation.',
@@ -82,7 +83,10 @@ export function createScopedTrustedTypesPolicy({
         return url;
       },
     });
-    apiCache.set(trimmedName, nativePolicy);
+    entry = { holder, nativePolicy };
+    apiCache.set(trimmedName, entry);
+  } else {
+    entry.holder.validator = validateScriptUrl;
   }
 
   return {
@@ -95,7 +99,8 @@ export function createScopedTrustedTypesPolicy({
           'Script URL failed allowlist validation.',
         );
       }
-      return nativePolicy.createScriptURL(url);
+      entry.holder.validator = validateScriptUrl;
+      return entry.nativePolicy.createScriptURL(url);
     },
   };
 }

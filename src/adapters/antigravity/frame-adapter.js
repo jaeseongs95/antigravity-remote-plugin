@@ -107,10 +107,17 @@ export function createAntigravityFrameAdapter({
         );
       }
 
+      if (!actualOrigin || actualOrigin === 'null') {
+        throw new SecurityPolicyError(
+          'UNAVAILABLE_IFRAME_ORIGIN',
+          'Remote iframe does not expose a verifiable origin.',
+        );
+      }
+
       const resolvedOrigin = targetOrigin || actualOrigin;
       assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
 
-      if (targetOrigin && actualOrigin) {
+      if (targetOrigin) {
         const expectedNorm = normalizeOrigin(targetOrigin);
         const actualNorm = normalizeOrigin(actualOrigin);
         if (!expectedNorm || !actualNorm || expectedNorm.origin !== actualNorm.origin) {

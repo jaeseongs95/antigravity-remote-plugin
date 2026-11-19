@@ -85,6 +85,12 @@ export function createGuardedWorkerBlobUrl({
     );
   }
   const rawBlobUrl = createBlobUrl(scriptUrl);
+  if (!isTrustedBlobUrl(rawBlobUrl, allowlist)) {
+    throw new SecurityPolicyError(
+      'UNTRUSTED_SCRIPT_URL',
+      'Generated Worker Blob URL failed trusted origin allowlist validation.',
+    );
+  }
   if (trustedTypesPolicy) {
     return trustedTypesPolicy.createScriptURL(rawBlobUrl);
   }

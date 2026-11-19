@@ -188,4 +188,42 @@ test('ARP-TC-020: RemoteOrchestrator serializes start(), handles frame-change ra
   orchestrator.dispose();
   assert.equal(disposeCount, 3);
   assert.equal(frameListener, null);
+
+  // 4) Mid-mount dispose() prevents zombie mounts AND restart after dispose() works cleanly.
+  let releaseSlowMount = null;
+  let slowDisposed = 0;
+  const slowOrch = new RemoteOrchestrator({
+    discoveryPort: {
+      async listPlugins() { return [{ name: 'slow-p', disabled: false }]; },
+      async listSidecars() { return []; },
+    },
+    framePort: {
+      async acquireActiveFrame() { return { win: {}, doc: {} }; },
+      onFrameChange() { return () => {}; },
+    },
+  });
+  slowOrch.registerBridge({
+    id: 'slow-b',
+    pluginName: 'slow-p',
+    async mount() {
+      if (releaseSlowMount) {
+        await new Promise((r) => { releaseSlowMount = r; });
+      }
+    },
+    dispose() { slowDisposed += 1; },
+  });
+
+  releaseSlowMount = () => {};
+  const inFlightStart = slowOrch.start();
+  await new Promise((r) => setTimeout(r, 10));
+  slowOrch.dispose();
+  releaseSlowMount();
+  await inFlightStart;
+  assert.deepEqual(slowOrch.getMountedBridgeIds(), []);
+  assert.ok(slowDisposed >= 1);
+
+  releaseSlowMount = null;
+  const restarted = await slowOrch.start();
+  assert.deepEqual(restarted.mountedIds, ['slow-b']);
+  slowOrch.dispose();
 });

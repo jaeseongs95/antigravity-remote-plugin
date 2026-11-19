@@ -2,13 +2,13 @@
   "name": "antigravity-remote-plugin",
   "version": "0.1.0",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "f31c526f974e9b6c210aa1c3a23dde98c0a26fe7753e40a1f9b253a6a56cc227",
+  "entrySha256": "f235dda00531cd3e068be61769869cc824319f07cd1c4f6de2aa9726365551f3",
   "moduleCount": 18,
   "modules": [
     {
       "path": "src/security/redactor.js",
-      "sha256": "9efdbf2d7dc59825c413f3a6f687ce2572ec71250a65435fee42a52e1d0aa400",
-      "bytes": 3187
+      "sha256": "d8409a4f834863452c37ba1e8fadae28c901d33914d7a6bb9bd67423877742d6",
+      "bytes": 3346
     },
     {
       "path": "src/security/origin-policy.js",
@@ -17,13 +17,13 @@
     },
     {
       "path": "src/security/trusted-types.js",
-      "sha256": "99f025b764f1371d5b92bf42bce93ddb116f2848be1d89d64df2110e299934e7",
-      "bytes": 2899
+      "sha256": "9b538a8437411c01c86887e792ff00e76c410b794c96525e3e825dd488ca2948",
+      "bytes": 3089
     },
     {
       "path": "src/security/script-guard.js",
-      "sha256": "dabf3a06e4ea44f9829b139816ae5439e9b7b5d88379ff32a87d388934a2fcd5",
-      "bytes": 2624
+      "sha256": "5e00572b11b7bcb42855df76a59b83361cf7e3834fe9e7bcc245899238e77233",
+      "bytes": 2829
     },
     {
       "path": "src/security/dom-guard.js",
@@ -52,38 +52,38 @@
     },
     {
       "path": "src/bridges/dom-overlay-bridge.js",
-      "sha256": "a7811f656b0e1e78336d723909eeafa946d322d82548f5924d0e460657415fa4",
-      "bytes": 4611
+      "sha256": "c33c2d47df2380cda0506be431e349bb0c46b543734e93776ee2a0e0d6696352",
+      "bytes": 5240
     },
     {
       "path": "src/bridges/sidecar-ui-bridge.js",
-      "sha256": "2ad41231b917d5952143973954d2c6565605a930a9a0278ba36ba05ae676b4b0",
-      "bytes": 11920
+      "sha256": "d3641d571c20ffc0b4092de4e3e8020975d4b1e97d003884ca70f47145d277f3",
+      "bytes": 11918
     },
     {
       "path": "src/bridges/mcp-extension-slot.js",
-      "sha256": "90d7022f75e8a732e3fc78238dff86dd075f48f50c33deb6d39067bb344ac747",
-      "bytes": 5000
+      "sha256": "d1f86b969a6777f24dbc510af098d44b9a4ac7518024df536569aa932833bb9d",
+      "bytes": 5195
     },
     {
       "path": "src/adapters/antigravity/discovery-adapter.js",
-      "sha256": "3acf1e6b38852d1639367f7a9aa1134faabc62120414f82409de857eadb80fd3",
-      "bytes": 4540
+      "sha256": "09f7756752f6d9a8868e6bda35e14e74006339725d79aa4afb376eb2520deb82",
+      "bytes": 4610
     },
     {
       "path": "src/adapters/antigravity/frame-adapter.js",
-      "sha256": "e5c5fb6d31c1d480d20064dcc262ce586ab388f1a54fd3e157386bf00cb8508a",
-      "bytes": 4505
+      "sha256": "f09294fd1f9e0f24727cb6103a0732f56d7f4bfe4279b9b1147b2c3f3762bf28",
+      "bytes": 4705
     },
     {
       "path": "src/adapters/antigravity/sidecar-adapter.js",
-      "sha256": "9b45574209f1964d93f29c82fc9447c0473825d515f3edf9f4573986a0ccec28",
-      "bytes": 2409
+      "sha256": "d027bfd2ac0c90456ffa7afd3cd37cf8fa0c9a5c36364bb54a48cbd0ce0bc673",
+      "bytes": 2482
     },
     {
       "path": "src/adapters/antigravity/settings-adapter.js",
-      "sha256": "61a1e37a1d0c996bb0fbeedb61257a771dbe9f4afbbe6417bd1e30187e835d23",
-      "bytes": 2594
+      "sha256": "992a8c7200bbe6717f2ee699e2d2b1b12f367d4091dd2a4c04a94213a1946dce",
+      "bytes": 3265
     },
     {
       "path": "src/adapters/antigravity/theme-workspace-adapter.js",
@@ -92,8 +92,8 @@
     },
     {
       "path": "src/runtime/bootstrap.js",
-      "sha256": "35176e89497d51d68dcd135d8d787206701a9257d7844ecc91a7c86d5d9d3541",
-      "bytes": 4342
+      "sha256": "46bdec2dfcd2f629976c56b11563a60f4dd0574d13c91df523941389f7879837",
+      "bytes": 4412
     }
   ]
 }

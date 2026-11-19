@@ -27,6 +27,8 @@ const SENSITIVE_QUERY_PARAMS = new Set([
 const INLINE_PARAM_PATTERN =
   /([?&#](?:token|access_token|refresh_token|csrf|csrf_token|api_key|apikey|secret|key|password|passwd|x-sidecar-token)=)([^&#]*)/gi;
 
+const INLINE_USERINFO_PATTERN = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:)([^/\s@]+)(@)/g;
+
 export const REDACTED = '[REDACTED]';
 
 function redactFragment(hash) {
@@ -44,7 +46,9 @@ export function redactUrl(rawUrl) {
   try {
     parsed = new URL(rawUrl);
   } catch (_err) {
-    return rawUrl.replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
+    return rawUrl
+      .replace(INLINE_USERINFO_PATTERN, `$1${REDACTED}$3`)
+      .replace(INLINE_PARAM_PATTERN, `$1${REDACTED}`);
   }
   let mutated = false;
   for (const paramKey of [...parsed.searchParams.keys()]) {
@@ -346,11 +350,12 @@ export function createScopedTrustedTypesPolicy({
     POLICY_CACHE.set(trustedTypesApi, apiCache);
   }
 
-  let nativePolicy = apiCache.get(trimmedName);
-  if (!nativePolicy) {
-    nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
+  let entry = apiCache.get(trimmedName);
+  if (!entry) {
+    const holder = { validator: validateScriptUrl };
+    const nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
       createScriptURL(url) {
-        if (!validateScriptUrl(url)) {
+        if (!holder.validator(url)) {
           throw new SecurityPolicyError(
             'UNTRUSTED_SCRIPT_URL',
             'Script URL failed allowlist validation.',
@@ -359,7 +364,10 @@ export function createScopedTrustedTypesPolicy({
         return url;
       },
     });
-    apiCache.set(trimmedName, nativePolicy);
+    entry = { holder, nativePolicy };
+    apiCache.set(trimmedName, entry);
+  } else {
+    entry.holder.validator = validateScriptUrl;
   }
 
   return {
@@ -372,7 +380,8 @@ export function createScopedTrustedTypesPolicy({
           'Script URL failed allowlist validation.',
         );
       }
-      return nativePolicy.createScriptURL(url);
+      entry.holder.validator = validateScriptUrl;
+      return entry.nativePolicy.createScriptURL(url);
     },
   };
 }
@@ -463,6 +472,12 @@ export function createGuardedWorkerBlobUrl({
     );
   }
   const rawBlobUrl = createBlobUrl(scriptUrl);
+  if (!isTrustedBlobUrl(rawBlobUrl, allowlist)) {
+    throw new SecurityPolicyError(
+      'UNTRUSTED_SCRIPT_URL',
+      'Generated Worker Blob URL failed trusted origin allowlist validation.',
+    );
+  }
   if (trustedTypesPolicy) {
     return trustedTypesPolicy.createScriptURL(rawBlobUrl);
   }
@@ -1154,14 +1169,33 @@ export class RemoteOrchestrator {
 }
 
 // --- module: src/bridges/dom-overlay-bridge.js ---
-export function stripSensitiveSettings(rawSettings) {
-  const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+export function stripSensitiveSettings(rawSettings, depth = 0, seen = new WeakSet()) {
+  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+    return Object.freeze({});
+  }
+  const input = typeof rawSettings === 'object' ? rawSettings : {};
+  if (seen.has(input)) {
+    return Object.freeze({});
+  }
+  seen.add(input);
   const clean = {};
   for (const [key, value] of Object.entries(input)) {
     if (isSensitiveKey(key) || typeof value === 'function') {
       continue;
     }
-    clean[key] = value;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      clean[key] = stripSensitiveSettings(value, depth + 1, seen);
+    } else if (Array.isArray(value)) {
+      clean[key] = Object.freeze(
+        value.map((item) =>
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? stripSensitiveSettings(item, depth + 1, seen)
+            : item,
+        ),
+      );
+    } else {
+      clean[key] = value;
+    }
   }
   return Object.freeze(clean);
 }
@@ -1446,85 +1480,90 @@ export function createSidecarUiBridge({
       iframeLoaded = false;
       store = new DisposableStore({ diagnostics });
 
-      // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
-      if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
-        const conversationId = typeof conversationIdProvider === 'function'
-          ? conversationIdProvider()
-          : (frame.conversationId || '');
-        const uiUrl = relayPort.buildUiUrl({ sidecar, conversationId });
-        const iframe = createSafeElement(frame.doc, 'iframe', {
-          attrs: {
-            src: uiUrl,
-            'data-remote-sidecar-id': sidecarId,
-            sandbox: 'allow-scripts allow-same-origin allow-forms',
-          },
-        });
-        mountedIframe = iframe;
+      try {
+        // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
+        if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
+          const conversationId = typeof conversationIdProvider === 'function'
+            ? conversationIdProvider()
+            : (frame.conversationId || '');
+          const uiUrl = relayPort.buildUiUrl({ sidecar, conversationId });
+          const iframe = createSafeElement(frame.doc, 'iframe', {
+            attrs: {
+              src: uiUrl,
+              'data-remote-sidecar-id': sidecarId,
+              sandbox: 'allow-scripts allow-same-origin allow-forms',
+            },
+          });
+          mountedIframe = iframe;
 
-        const hasLoadEvents = typeof iframe.addEventListener === 'function';
-        if (hasLoadEvents) {
-          const onLoad = () => {
+          const hasLoadEvents = typeof iframe.addEventListener === 'function';
+          if (hasLoadEvents) {
+            const onLoad = () => {
+              iframeLoaded = true;
+              if (mountedIframe === iframe && iframe.contentWindow) {
+                pushThemeAndWorkspace(iframe.contentWindow);
+              }
+            };
+            iframe.addEventListener('load', onLoad);
+            store.add(() => {
+              if (typeof iframe.removeEventListener === 'function') {
+                iframe.removeEventListener('load', onLoad);
+              }
+            });
+          }
+
+          const mountContainer = frame.panelContainer || frame.doc.body || null;
+          if (mountContainer && typeof mountContainer.appendChild === 'function') {
+            mountContainer.appendChild(iframe);
+            store.add(() => {
+              if (typeof iframe.remove === 'function') {
+                iframe.remove();
+              } else if (mountContainer && typeof mountContainer.removeChild === 'function') {
+                mountContainer.removeChild(iframe);
+              }
+            });
+          }
+
+          // Only push synchronously if the host element does not emit DOM load events.
+          if (!hasLoadEvents && iframe.contentWindow) {
             iframeLoaded = true;
-            if (mountedIframe === iframe && iframe.contentWindow) {
-              pushThemeAndWorkspace(iframe.contentWindow);
+            pushThemeAndWorkspace(iframe.contentWindow);
+          }
+        }
+
+        // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
+        if (themeWorkspacePort) {
+          const unsubSync = themeWorkspacePort.subscribe((change) => {
+            const targetWin = mountedIframe?.contentWindow || null;
+            if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
+              return;
             }
+            if (change?.type === 'theme-change') {
+              this.postThemeChange(targetWin, activeSidecarOrigin, change.cssVariables);
+            } else if (change?.type === 'workspace-change') {
+              this.postWorkspaceChange(targetWin, activeSidecarOrigin, change.workspaceUris);
+            }
+          });
+          if (typeof unsubSync === 'function') {
+            store.add(unsubSync);
+          }
+        }
+
+        // Wire host window message listener for inbound sidecar preload events.
+        if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
+          const onMessage = (event) => {
+            this.handleInboundMessage(event);
           };
-          iframe.addEventListener('load', onLoad);
+          frame.win.addEventListener('message', onMessage);
           store.add(() => {
-            if (typeof iframe.removeEventListener === 'function') {
-              iframe.removeEventListener('load', onLoad);
+            if (typeof frame.win.removeEventListener === 'function') {
+              frame.win.removeEventListener('message', onMessage);
             }
           });
         }
-
-        const mountContainer = frame.panelContainer || frame.doc.body || null;
-        if (mountContainer && typeof mountContainer.appendChild === 'function') {
-          mountContainer.appendChild(iframe);
-          store.add(() => {
-            if (typeof iframe.remove === 'function') {
-              iframe.remove();
-            } else if (mountContainer && typeof mountContainer.removeChild === 'function') {
-              mountContainer.removeChild(iframe);
-            }
-          });
-        }
-
-        // Only push synchronously if the host element does not emit DOM load events.
-        if (!hasLoadEvents && iframe.contentWindow) {
-          iframeLoaded = true;
-          pushThemeAndWorkspace(iframe.contentWindow);
-        }
-      }
-
-      // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
-      if (themeWorkspacePort) {
-        const unsubSync = themeWorkspacePort.subscribe((change) => {
-          const targetWin = mountedIframe?.contentWindow || null;
-          if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
-            return;
-          }
-          if (change?.type === 'theme-change') {
-            this.postThemeChange(targetWin, activeSidecarOrigin, change.cssVariables);
-          } else if (change?.type === 'workspace-change') {
-            this.postWorkspaceChange(targetWin, activeSidecarOrigin, change.workspaceUris);
-          }
-        });
-        if (typeof unsubSync === 'function') {
-          store.add(unsubSync);
-        }
-      }
-
-      // Wire host window message listener for inbound sidecar preload events.
-      if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
-        const onMessage = (event) => {
-          this.handleInboundMessage(event);
-        };
-        frame.win.addEventListener('message', onMessage);
-        store.add(() => {
-          if (typeof frame.win.removeEventListener === 'function') {
-            frame.win.removeEventListener('message', onMessage);
-          }
-        });
+      } catch (mountErr) {
+        this.dispose();
+        throw mountErr;
       }
 
       return { sidecarId: sidecar.sidecarId, origin: sidecarOrigin };
@@ -1607,26 +1646,21 @@ export function createSidecarUiBridge({
         return { accepted: false, reason: 'UNTRUSTED_ORIGIN' };
       }
 
-      // Fail-closed source check: when an iframe is mounted, its contentWindow must be
-      // present and strictly equal to event.source.
-      if (mountedIframe !== null) {
-        const requiredSource = expectedSource ?? mountedIframe.contentWindow;
-        if (!requiredSource) {
-          return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
+      // Fail-closed source check: require an explicit expectedSource or mounted iframe contentWindow.
+      const requiredSource = expectedSource ?? mountedIframe?.contentWindow ?? null;
+      if (!requiredSource) {
+        return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
+      }
+      if (event.source !== requiredSource) {
+        if (activeDiagnostics) {
+          activeDiagnostics.emit({
+            level: 'warn',
+            code: 'POSTMESSAGE_SOURCE_MISMATCH',
+            source: `bridge.${id}`,
+            message: 'Dropped inbound postMessage from unexpected window source',
+            detail: { origin: event.origin },
+          });
         }
-        if (event.source !== requiredSource) {
-          if (activeDiagnostics) {
-            activeDiagnostics.emit({
-              level: 'warn',
-              code: 'POSTMESSAGE_SOURCE_MISMATCH',
-              source: `bridge.${id}`,
-              message: 'Dropped inbound postMessage from unexpected window source',
-              detail: { origin: event.origin },
-            });
-          }
-          return { accepted: false, reason: 'SOURCE_MISMATCH' };
-        }
-      } else if (expectedSource !== null && event.source !== expectedSource) {
         return { accepted: false, reason: 'SOURCE_MISMATCH' };
       }
 
@@ -1682,6 +1716,12 @@ export function canonicalizeConfigPath(rawPath) {
   }
 
   let normalized = rawPath.trim().replace(/\\/g, '/');
+  if (/^[a-zA-Z]:[^/]/.test(normalized)) {
+    throw new SecurityPolicyError(
+      'INVALID_CONFIG_PATH',
+      'Ambiguous drive-relative Windows configuration paths are forbidden.',
+    );
+  }
   if (normalized === '~' || normalized.startsWith('~/')) {
     normalized = `/__home__${normalized.slice(1)}`;
   }
@@ -1879,7 +1919,7 @@ function extractInstallDir(rawPath, fallbackName) {
 export function createAntigravityDiscoveryAdapter({
   lsAddress,
   csrfToken,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
 }) {
   const origin = validateLoopbackAddress(lsAddress);
   const validToken = validateCsrfToken(csrfToken);
@@ -2040,10 +2080,17 @@ export function createAntigravityFrameAdapter({
         );
       }
 
+      if (!actualOrigin || actualOrigin === 'null') {
+        throw new SecurityPolicyError(
+          'UNAVAILABLE_IFRAME_ORIGIN',
+          'Remote iframe does not expose a verifiable origin.',
+        );
+      }
+
       const resolvedOrigin = targetOrigin || actualOrigin;
       assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
 
-      if (targetOrigin && actualOrigin) {
+      if (targetOrigin) {
         const expectedNorm = normalizeOrigin(targetOrigin);
         const actualNorm = normalizeOrigin(actualOrigin);
         if (!expectedNorm || !actualNorm || expectedNorm.origin !== actualNorm.origin) {
@@ -2097,7 +2144,9 @@ function assertLoopbackSidecar(sidecar) {
   return { host, port };
 }
 
-export function createAntigravitySidecarAdapter({ fetchImpl = globalThis.fetch } = {}) {
+export function createAntigravitySidecarAdapter({
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
+} = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new TypeError('AntigravitySidecarAdapter requires a fetch implementation.');
   }
@@ -2175,7 +2224,7 @@ export function sanitizeTranslatorSettings(
   if (typeof input.customEndpoint === 'string' && input.customEndpoint.trim()) {
     try {
       const parsed = new URL(input.customEndpoint.trim());
-      if (parsed.protocol === 'https:') {
+      if (parsed.protocol === 'https:' && !parsed.username && !parsed.password) {
         sanitized.customEndpoint = parsed.toString();
       }
     } catch (_err) {
@@ -2194,14 +2243,33 @@ export function sanitizeTranslatorSettings(
   return Object.freeze(locked);
 }
 
-function sanitizeGenericSettings(rawSettings) {
-  const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+function sanitizeGenericSettings(rawSettings, depth = 0, seen = new WeakSet()) {
+  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+    return Object.freeze({});
+  }
+  const input = typeof rawSettings === 'object' ? rawSettings : {};
+  if (seen.has(input)) {
+    return Object.freeze({});
+  }
+  seen.add(input);
   const clean = {};
   for (const [key, value] of Object.entries(input)) {
     if (isSensitiveKey(key) || typeof value === 'function') {
       continue;
     }
-    clean[key] = value;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      clean[key] = sanitizeGenericSettings(value, depth + 1, seen);
+    } else if (Array.isArray(value)) {
+      clean[key] = Object.freeze(
+        value.map((item) =>
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? sanitizeGenericSettings(item, depth + 1, seen)
+            : item,
+        ),
+      );
+    } else {
+      clean[key] = value;
+    }
   }
   return Object.freeze(clean);
 }
@@ -2300,7 +2368,7 @@ const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
 export function bootstrapAntigravityRemoteBridge({
   lsAddress,
   csrfToken,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
   trustedTypesApi = globalThis.trustedTypes ?? null,
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
   readSettingsFile = async () => ({}),

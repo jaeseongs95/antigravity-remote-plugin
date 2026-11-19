@@ -39,7 +39,7 @@ const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
 export function bootstrapAntigravityRemoteBridge({
   lsAddress,
   csrfToken,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
   trustedTypesApi = globalThis.trustedTypes ?? null,
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
   readSettingsFile = async () => ({}),

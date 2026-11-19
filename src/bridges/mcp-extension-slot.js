@@ -27,6 +27,12 @@ export function canonicalizeConfigPath(rawPath) {
   }
 
   let normalized = rawPath.trim().replace(/\\/g, '/');
+  if (/^[a-zA-Z]:[^/]/.test(normalized)) {
+    throw new SecurityPolicyError(
+      'INVALID_CONFIG_PATH',
+      'Ambiguous drive-relative Windows configuration paths are forbidden.',
+    );
+  }
   if (normalized === '~' || normalized.startsWith('~/')) {
     normalized = `/__home__${normalized.slice(1)}`;
   }

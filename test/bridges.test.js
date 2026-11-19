@@ -63,6 +63,8 @@ test('ARP-TC-013: DomOverlayBridge validates SettingsReadPort, enforces least pr
   assert.deepEqual(Object.keys(receivedArgs).sort(), ['doc', 'onStatus', 'settings', 'win']);
   assert.equal(receivedArgs.settings.provider, 'google-translate');
   assert.equal(receivedArgs.settings.customEndpoint, null);
+  assert.equal('csrfToken' in receivedArgs.settings, false);
+  assert.equal('lsClient' in receivedArgs.settings, false);
 
   bridge.updateSettings({ provider: 'local-llm', customEndpoint: 'https://api.example.com/tr' });
   assert.equal(updated.provider, 'custom-https');
@@ -181,6 +183,28 @@ test('ARP-TC-014: SidecarUiBridge defers postMessage until iframe load, normaliz
   themeWorkspacePort.updateTheme({ '--background': '#222' });
   assert.equal(postedToIframe.length, 3);
 
+  // API relay works for allowlisted endpoints and blocks forbidden endpoints (API_PATH_NOT_ALLOWED).
+  const telemetry = await bridge.relayApi('/api/telemetry', { conversationId: 'conv-1' });
+  assert.equal(telemetry.ok, true);
+  await bridge.relayApi('/api/context-limit', { conversationId: 'conv-1', contextWindow: 384000 });
+  await bridge.relayApi('/api/compact', { conversationId: 'conv-1' });
+  assert.equal(relayCalls.length, 3);
+
+  await assert.rejects(
+    () => bridge.relayApi('/api/forbidden-endpoint', {}),
+    (err) => err instanceof SecurityPolicyError && err.code === 'API_PATH_NOT_ALLOWED',
+  );
+
+  // Port spoofing (different loopback port 9999) must be rejected.
+  const onMsg = winListeners.get('message');
+  assert.equal(typeof onMsg, 'function');
+  onMsg({
+    origin: 'http://127.0.0.1:9999',
+    source: iframeWindow,
+    data: { type: 'toggle-aux-pane', payload: {} },
+  });
+  assert.equal(inboundSeen.length, 0);
+
   // Detached iframe (contentWindow === null) must fail closed on inbound messages.
   currentIframeObj.contentWindow = null;
   const detachedRes = bridge.handleInboundMessage({
@@ -193,7 +217,6 @@ test('ARP-TC-014: SidecarUiBridge defers postMessage until iframe load, normaliz
   currentIframeObj.contentWindow = iframeWindow;
 
   // Exact origin + exact source accepted.
-  const onMsg = winListeners.get('message');
   onMsg({
     origin: 'http://127.0.0.1:41234',
     source: iframeWindow,
@@ -224,7 +247,7 @@ test('ARP-TC-015: McpExtensionSlot rejects NUL/control chars, traversal, null pa
     (err) => err instanceof SecurityPolicyError && err.code === 'UNCONFIRMED_REMOTE_STDIO',
   );
 
-  for (const invalidPath of [null, '', '/home/user/.gemini/config/config.json\u0000', '/home/user/mcp.json\n']) {
+  for (const invalidPath of [null, '', 'C:.gemini/config/config.json', '/home/user/.gemini/config/config.json\u0000', '/home/user/mcp.json\n']) {
     await assert.rejects(
       () => slot.requestServerMutation({
         targetConfigPath: invalidPath,

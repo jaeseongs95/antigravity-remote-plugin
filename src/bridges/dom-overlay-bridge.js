@@ -3,14 +3,33 @@ import { validateSettingsReadPort } from '../core/ports.js';
 import { SecurityPolicyError } from '../security/origin-policy.js';
 import { isSensitiveKey } from '../security/redactor.js';
 
-export function stripSensitiveSettings(rawSettings) {
-  const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+export function stripSensitiveSettings(rawSettings, depth = 0, seen = new WeakSet()) {
+  if (depth > 8 || rawSettings === null || rawSettings === undefined) {
+    return Object.freeze({});
+  }
+  const input = typeof rawSettings === 'object' ? rawSettings : {};
+  if (seen.has(input)) {
+    return Object.freeze({});
+  }
+  seen.add(input);
   const clean = {};
   for (const [key, value] of Object.entries(input)) {
     if (isSensitiveKey(key) || typeof value === 'function') {
       continue;
     }
-    clean[key] = value;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      clean[key] = stripSensitiveSettings(value, depth + 1, seen);
+    } else if (Array.isArray(value)) {
+      clean[key] = Object.freeze(
+        value.map((item) =>
+          item && typeof item === 'object' && !Array.isArray(item)
+            ? stripSensitiveSettings(item, depth + 1, seen)
+            : item,
+        ),
+      );
+    } else {
+      clean[key] = value;
+    }
   }
   return Object.freeze(clean);
 }

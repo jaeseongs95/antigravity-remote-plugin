@@ -66,7 +66,7 @@ function extractInstallDir(rawPath, fallbackName) {
 export function createAntigravityDiscoveryAdapter({
   lsAddress,
   csrfToken,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
 }) {
   const origin = validateLoopbackAddress(lsAddress);
   const validToken = validateCsrfToken(csrfToken);

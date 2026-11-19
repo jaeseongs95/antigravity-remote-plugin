@@ -86,9 +86,9 @@ test('ARP-TC-018: AntigravitySettingsAdapter applies translator fallback and gen
   const adapter = createAntigravitySettingsAdapter({
     async readSettingsFile(pluginName) {
       if (pluginName === 'antigravity-ko-translator') {
-        return { enabled: true, provider: 'local-llm', customEndpoint: 'http://localhost:11434/v1' };
+        return { enabled: true, provider: 'local-llm', customEndpoint: 'https://user:pass@api.example.com/v1' };
       }
-      return { refreshMs: 1000, api_key: 'secret-val' };
+      return { refreshMs: 1000, api_key: 'secret-val', nested: { token: 'nested-secret', ok: true } };
     },
   });
 
@@ -99,6 +99,8 @@ test('ARP-TC-018: AntigravitySettingsAdapter applies translator fallback and gen
   const safeOther = await adapter.readPluginSettings('antigravity-statusbar');
   assert.equal(safeOther.refreshMs, 1000);
   assert.equal('api_key' in safeOther, false);
+  assert.equal('token' in safeOther.nested, false);
+  assert.equal(safeOther.nested.ok, true);
 });
 
 test('ARP-TC-021: AntigravityFrameAdapter translates cross-origin DOMException and validates targetOrigin match', async () => {

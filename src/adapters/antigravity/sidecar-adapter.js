@@ -23,7 +23,9 @@ function assertLoopbackSidecar(sidecar) {
   return { host, port };
 }
 
-export function createAntigravitySidecarAdapter({ fetchImpl = globalThis.fetch } = {}) {
+export function createAntigravitySidecarAdapter({
+  fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined,
+} = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new TypeError('AntigravitySidecarAdapter requires a fetch implementation.');
   }

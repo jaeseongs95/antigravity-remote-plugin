@@ -142,85 +142,90 @@ export function createSidecarUiBridge({
       iframeLoaded = false;
       store = new DisposableStore({ diagnostics });
 
-      // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
-      if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
-        const conversationId = typeof conversationIdProvider === 'function'
-          ? conversationIdProvider()
-          : (frame.conversationId || '');
-        const uiUrl = relayPort.buildUiUrl({ sidecar, conversationId });
-        const iframe = createSafeElement(frame.doc, 'iframe', {
-          attrs: {
-            src: uiUrl,
-            'data-remote-sidecar-id': sidecarId,
-            sandbox: 'allow-scripts allow-same-origin allow-forms',
-          },
-        });
-        mountedIframe = iframe;
+      try {
+        // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
+        if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
+          const conversationId = typeof conversationIdProvider === 'function'
+            ? conversationIdProvider()
+            : (frame.conversationId || '');
+          const uiUrl = relayPort.buildUiUrl({ sidecar, conversationId });
+          const iframe = createSafeElement(frame.doc, 'iframe', {
+            attrs: {
+              src: uiUrl,
+              'data-remote-sidecar-id': sidecarId,
+              sandbox: 'allow-scripts allow-same-origin allow-forms',
+            },
+          });
+          mountedIframe = iframe;
 
-        const hasLoadEvents = typeof iframe.addEventListener === 'function';
-        if (hasLoadEvents) {
-          const onLoad = () => {
+          const hasLoadEvents = typeof iframe.addEventListener === 'function';
+          if (hasLoadEvents) {
+            const onLoad = () => {
+              iframeLoaded = true;
+              if (mountedIframe === iframe && iframe.contentWindow) {
+                pushThemeAndWorkspace(iframe.contentWindow);
+              }
+            };
+            iframe.addEventListener('load', onLoad);
+            store.add(() => {
+              if (typeof iframe.removeEventListener === 'function') {
+                iframe.removeEventListener('load', onLoad);
+              }
+            });
+          }
+
+          const mountContainer = frame.panelContainer || frame.doc.body || null;
+          if (mountContainer && typeof mountContainer.appendChild === 'function') {
+            mountContainer.appendChild(iframe);
+            store.add(() => {
+              if (typeof iframe.remove === 'function') {
+                iframe.remove();
+              } else if (mountContainer && typeof mountContainer.removeChild === 'function') {
+                mountContainer.removeChild(iframe);
+              }
+            });
+          }
+
+          // Only push synchronously if the host element does not emit DOM load events.
+          if (!hasLoadEvents && iframe.contentWindow) {
             iframeLoaded = true;
-            if (mountedIframe === iframe && iframe.contentWindow) {
-              pushThemeAndWorkspace(iframe.contentWindow);
+            pushThemeAndWorkspace(iframe.contentWindow);
+          }
+        }
+
+        // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
+        if (themeWorkspacePort) {
+          const unsubSync = themeWorkspacePort.subscribe((change) => {
+            const targetWin = mountedIframe?.contentWindow || null;
+            if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
+              return;
             }
+            if (change?.type === 'theme-change') {
+              this.postThemeChange(targetWin, activeSidecarOrigin, change.cssVariables);
+            } else if (change?.type === 'workspace-change') {
+              this.postWorkspaceChange(targetWin, activeSidecarOrigin, change.workspaceUris);
+            }
+          });
+          if (typeof unsubSync === 'function') {
+            store.add(unsubSync);
+          }
+        }
+
+        // Wire host window message listener for inbound sidecar preload events.
+        if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
+          const onMessage = (event) => {
+            this.handleInboundMessage(event);
           };
-          iframe.addEventListener('load', onLoad);
+          frame.win.addEventListener('message', onMessage);
           store.add(() => {
-            if (typeof iframe.removeEventListener === 'function') {
-              iframe.removeEventListener('load', onLoad);
+            if (typeof frame.win.removeEventListener === 'function') {
+              frame.win.removeEventListener('message', onMessage);
             }
           });
         }
-
-        const mountContainer = frame.panelContainer || frame.doc.body || null;
-        if (mountContainer && typeof mountContainer.appendChild === 'function') {
-          mountContainer.appendChild(iframe);
-          store.add(() => {
-            if (typeof iframe.remove === 'function') {
-              iframe.remove();
-            } else if (mountContainer && typeof mountContainer.removeChild === 'function') {
-              mountContainer.removeChild(iframe);
-            }
-          });
-        }
-
-        // Only push synchronously if the host element does not emit DOM load events.
-        if (!hasLoadEvents && iframe.contentWindow) {
-          iframeLoaded = true;
-          pushThemeAndWorkspace(iframe.contentWindow);
-        }
-      }
-
-      // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
-      if (themeWorkspacePort) {
-        const unsubSync = themeWorkspacePort.subscribe((change) => {
-          const targetWin = mountedIframe?.contentWindow || null;
-          if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
-            return;
-          }
-          if (change?.type === 'theme-change') {
-            this.postThemeChange(targetWin, activeSidecarOrigin, change.cssVariables);
-          } else if (change?.type === 'workspace-change') {
-            this.postWorkspaceChange(targetWin, activeSidecarOrigin, change.workspaceUris);
-          }
-        });
-        if (typeof unsubSync === 'function') {
-          store.add(unsubSync);
-        }
-      }
-
-      // Wire host window message listener for inbound sidecar preload events.
-      if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
-        const onMessage = (event) => {
-          this.handleInboundMessage(event);
-        };
-        frame.win.addEventListener('message', onMessage);
-        store.add(() => {
-          if (typeof frame.win.removeEventListener === 'function') {
-            frame.win.removeEventListener('message', onMessage);
-          }
-        });
+      } catch (mountErr) {
+        this.dispose();
+        throw mountErr;
       }
 
       return { sidecarId: sidecar.sidecarId, origin: sidecarOrigin };
@@ -303,26 +308,21 @@ export function createSidecarUiBridge({
         return { accepted: false, reason: 'UNTRUSTED_ORIGIN' };
       }
 
-      // Fail-closed source check: when an iframe is mounted, its contentWindow must be
-      // present and strictly equal to event.source.
-      if (mountedIframe !== null) {
-        const requiredSource = expectedSource ?? mountedIframe.contentWindow;
-        if (!requiredSource) {
-          return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
+      // Fail-closed source check: require an explicit expectedSource or mounted iframe contentWindow.
+      const requiredSource = expectedSource ?? mountedIframe?.contentWindow ?? null;
+      if (!requiredSource) {
+        return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
+      }
+      if (event.source !== requiredSource) {
+        if (activeDiagnostics) {
+          activeDiagnostics.emit({
+            level: 'warn',
+            code: 'POSTMESSAGE_SOURCE_MISMATCH',
+            source: `bridge.${id}`,
+            message: 'Dropped inbound postMessage from unexpected window source',
+            detail: { origin: event.origin },
+          });
         }
-        if (event.source !== requiredSource) {
-          if (activeDiagnostics) {
-            activeDiagnostics.emit({
-              level: 'warn',
-              code: 'POSTMESSAGE_SOURCE_MISMATCH',
-              source: `bridge.${id}`,
-              message: 'Dropped inbound postMessage from unexpected window source',
-              detail: { origin: event.origin },
-            });
-          }
-          return { accepted: false, reason: 'SOURCE_MISMATCH' };
-        }
-      } else if (expectedSource !== null && event.source !== expectedSource) {
         return { accepted: false, reason: 'SOURCE_MISMATCH' };
       }
 
