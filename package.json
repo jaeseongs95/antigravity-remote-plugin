@@ -1,6 +1,6 @@
 {
   "name": "antigravity-remote-plugin",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Vendor-independent remote web bridge plugin for Antigravity companion extensions and sidecars",
   "type": "module",
   "main": "src/runtime/bootstrap.js",

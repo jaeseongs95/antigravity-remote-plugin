@@ -1,4 +1,4 @@
-# Test Cases — antigravity-remote-plugin v1.0.0
+# Test Cases — antigravity-remote-plugin v1.0.1
 
 23 automated test cases (`ARP-TC-001` through `ARP-TC-023`) covering vendor independence, security invariants, concurrency safety, real loopback HTTP integration, standalone bundle execution, and real headless Chromium browser E2E.
 

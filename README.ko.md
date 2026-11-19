@@ -2,7 +2,7 @@
 
 [English README](./README.md)
 
-**버전:** `1.0.0`
+**버전:** `1.0.1`
 
 `antigravity-remote-plugin`은 데스크톱 네이티브 전용 동반 플러그인(`antigravity-statusbar`, `antigravity-ko-translator`, `antigravity-mcp-manager`)으로부터 원격 웹 제어 책임을 완전히 분리하기 위해 설계된 벤더 독립적 원격 브리지 플러그인입니다.
 
@@ -38,4 +38,5 @@ npm run verify
 
 ## 릴리스 노트
 
+- [v1.0.1 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v1.0.1.md)
 - [v1.0.0 릴리스 노트 (영문 / 한글)](./docs/RELEASE_NOTES_v1.0.0.md)

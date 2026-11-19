@@ -1,6 +1,6 @@
-// antigravity-remote-plugin v1.0.0 — standalone self-contained ESM bundle
+// antigravity-remote-plugin v1.0.1 — standalone self-contained ESM bundle
 // Generated deterministically from 18 source modules.
-export const BUILD_VERSION = "1.0.0";
+export const BUILD_VERSION = "1.0.1";
 
 // --- module: src/security/redactor.js ---
 const SENSITIVE_KEY_PATTERN =
