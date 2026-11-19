@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { formatHostForUrl, isOriginAllowed, SecurityPolicyError } from '../src/security/origin-policy.js';
 import { createScopedTrustedTypesPolicy } from '../src/security/trusted-types.js';
-import { createGuardedWorkerBlobUrl, isTrustedScriptUrl } from '../src/security/script-guard.js';
+import {
+  createGuardedWorkerBlobUrl,
+  isTrustedScriptUrl,
+  isTrustedWorkerOrScriptUrl,
+} from '../src/security/script-guard.js';
 import { assertSafeAttribute, assertSafeTagName, createSafeElement } from '../src/security/dom-guard.js';
 import { deepFreeze, REDACTED, redactSecrets, redactUrl } from '../src/security/redactor.js';
 
@@ -26,7 +30,7 @@ test('ARP-TC-004: isOriginAllowed enforces exact origin, subdomain & IPv6 loopba
   assert.equal(isOriginAllowed('javascript:alert(1)', allowlist), false);
 });
 
-test('ARP-TC-005: createScopedTrustedTypesPolicy blocks reserved names and validates URLs', () => {
+test('ARP-TC-005: createScopedTrustedTypesPolicy blocks reserved names and reuses cached policy on re-init', () => {
   const validator = (url) => isTrustedScriptUrl(url, ['https://example.com']);
 
   for (const reserved of ['default', 'Default', 'dompurify', 'angular']) {
@@ -36,33 +40,42 @@ test('ARP-TC-005: createScopedTrustedTypesPolicy blocks reserved names and valid
     );
   }
 
-  let createdName = null;
+  let createCalls = 0;
   const fakeApi = {
     createPolicy(name, rules) {
-      createdName = name;
+      createCalls += 1;
+      if (createCalls > 1) {
+        throw new TypeError(`Policy ${name} already exists`);
+      }
       return rules;
     },
   };
-  const policy = createScopedTrustedTypesPolicy({
+  const policy1 = createScopedTrustedTypesPolicy({
+    trustedTypesApi: fakeApi,
+    policyName: 'remote-bridge-script-v1',
+    validateScriptUrl: validator,
+  });
+  const policy2 = createScopedTrustedTypesPolicy({
     trustedTypesApi: fakeApi,
     policyName: 'remote-bridge-script-v1',
     validateScriptUrl: validator,
   });
 
-  assert.equal(createdName, 'remote-bridge-script-v1');
-  assert.equal(policy.createScriptURL('https://example.com/worker.js'), 'https://example.com/worker.js');
+  assert.equal(createCalls, 1);
+  assert.equal(policy1.createScriptURL('https://example.com/worker.js'), 'https://example.com/worker.js');
+  assert.equal(policy2.createScriptURL('https://example.com/worker.js'), 'https://example.com/worker.js');
   assert.throws(
-    () => policy.createScriptURL('https://attacker.test/worker.js'),
+    () => policy1.createScriptURL('https://attacker.test/worker.js'),
     (err) => err instanceof SecurityPolicyError && err.code === 'UNTRUSTED_SCRIPT_URL',
   );
 });
 
-test('ARP-TC-006: createGuardedWorkerBlobUrl fails closed and preserves native TrustedScriptURL object', () => {
+test('ARP-TC-006: createGuardedWorkerBlobUrl validates script URL and wraps resulting blob: URL as TrustedScriptURL', () => {
   const allowlist = ['https://example.com'];
-  let receivedByFactory = null;
-  const createBlobUrl = (trustedUrl) => {
-    receivedByFactory = trustedUrl;
-    return `blob:https://example.com/wrapped`;
+  let blobCreated = false;
+  const createBlobUrl = () => {
+    blobCreated = true;
+    return 'blob:https://example.com/uuid-1234';
   };
 
   for (const bad of ['javascript:alert(1)', 'data:text/javascript,1', 'https://evil-example.com/a.js']) {
@@ -71,31 +84,37 @@ test('ARP-TC-006: createGuardedWorkerBlobUrl fails closed and preserves native T
       (err) => err instanceof SecurityPolicyError && err.code === 'UNTRUSTED_SCRIPT_URL',
     );
   }
-  assert.equal(receivedByFactory, null);
+  assert.equal(blobCreated, false);
 
   class FakeTrustedScriptURL {
     constructor(v) { this.value = v; }
     toString() { return this.value; }
   }
-  const fakePolicy = {
-    createScriptURL(url) {
-      return new FakeTrustedScriptURL(url);
+  const fakePolicy = createScopedTrustedTypesPolicy({
+    trustedTypesApi: {
+      createPolicy(_name, rules) {
+        return {
+          createScriptURL(url) {
+            return new FakeTrustedScriptURL(rules.createScriptURL(url));
+          },
+        };
+      },
     },
-  };
+    policyName: 'worker-blob-test-v1',
+    validateScriptUrl: (url) => isTrustedWorkerOrScriptUrl(url, allowlist),
+  });
 
-  createGuardedWorkerBlobUrl({
+  const wrapped = createGuardedWorkerBlobUrl({
     scriptUrl: 'https://example.com/audio-worklet.js',
     allowlist,
     createBlobUrl,
     trustedTypesPolicy: fakePolicy,
   });
-  assert.ok(
-    receivedByFactory instanceof FakeTrustedScriptURL,
-    'TrustedScriptURL instance must not be destroyed by String() coercion',
-  );
+  assert.ok(wrapped instanceof FakeTrustedScriptURL);
+  assert.equal(String(wrapped), 'blob:https://example.com/uuid-1234');
 });
 
-test('ARP-TC-007: dom-guard blocks <base>, HTML sinks, inline handlers, and control-char URI bypasses', () => {
+test('ARP-TC-007: dom-guard blocks <base>, HTML sinks, control-char bypasses, and non-string toString() bypasses', () => {
   assert.throws(
     () => assertSafeTagName('base'),
     (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_ELEMENT_TAG',
@@ -109,7 +128,14 @@ test('ARP-TC-007: dom-guard blocks <base>, HTML sinks, inline handlers, and cont
     (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_EVENT_ATTRIBUTE',
   );
 
-  for (const bypass of ['java\tscript:alert(1)', 'java\nscript:alert(1)', 'vbscript:msgbox(1)', 'data:text/html,<svg>']) {
+  const bypasses = [
+    'java\tscript:alert(1)',
+    'java\nscript:alert(1)',
+    'vbscript:msgbox(1)',
+    'data:text/html,<svg>',
+    { toString: () => 'javascript:alert(1)' },
+  ];
+  for (const bypass of bypasses) {
     assert.throws(
       () => assertSafeAttribute('href', bypass),
       (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_URI_SCHEME',
@@ -126,6 +152,11 @@ test('ARP-TC-007: dom-guard blocks <base>, HTML sinks, inline handlers, and cont
       };
     },
   };
+  assert.throws(
+    () => createSafeElement(fakeDoc, 'a', { attrs: { href: { toString: () => 'javascript:alert(1)' } } }),
+    (err) => err instanceof SecurityPolicyError && err.code === 'FORBIDDEN_URI_SCHEME',
+  );
+
   const el = createSafeElement(fakeDoc, 'div', { attrs: { 'data-role': 'panel' }, text: 'hello' });
   assert.equal(el.tagName, 'DIV');
   assert.equal(el.textContent, 'hello');

@@ -128,65 +128,64 @@ test('ARP-TC-012: RemoteOrchestrator mounts only active plugins and disposes cle
   assert.deepEqual(disposed, ['b-active']);
 });
 
-test('ARP-TC-020: RemoteOrchestrator prevents concurrent duplicate mounts, zombie mounts after dispose, and supports clean restart', async () => {
-  let mountCount = 0;
+test('ARP-TC-020: RemoteOrchestrator serializes start(), handles frame-change races, and remounts restarted sidecars', async () => {
+  let onFrameChangeRegistrations = 0;
+  let frameListener = null;
+  let sidecarPort = 41001;
+  const mountedPorts = [];
   let disposeCount = 0;
-  let releaseMount;
 
   const discoveryPort = {
     async listPlugins() {
-      return [{ name: 'slow-plugin', disabled: false }];
+      return [{ name: 'sb-plugin', disabled: false }];
     },
     async listSidecars() {
-      return [];
+      return [{ sidecarId: 'sb/main', host: '127.0.0.1', port: sidecarPort, token: `tok-${sidecarPort}`, running: true }];
     },
   };
   const framePort = {
     async acquireActiveFrame() {
+      await new Promise((r) => setTimeout(r, 10));
       return { win: {}, doc: {} };
     },
-    onFrameChange() {
-      return () => {};
+    onFrameChange(fn) {
+      onFrameChangeRegistrations += 1;
+      frameListener = fn;
+      return () => { frameListener = null; };
     },
   };
 
   const orchestrator = new RemoteOrchestrator({ discoveryPort, framePort });
   orchestrator.registerBridge({
-    id: 'slow',
-    pluginName: 'slow-plugin',
-    async mount() {
-      mountCount += 1;
-      if (releaseMount) {
-        await new Promise((r) => { releaseMount = r; });
-      }
+    id: 'sb',
+    pluginName: 'sb-plugin',
+    sidecarId: 'sb/main',
+    requireSidecar: true,
+    async mount({ sidecar }) {
+      mountedPorts.push(sidecar.port);
     },
     dispose() {
       disposeCount += 1;
     },
   });
 
-  // 1) Parallel reconcile calls must serialize and mount only once.
-  const [r1, r2] = await Promise.all([orchestrator.reconcile(), orchestrator.reconcile()]);
-  assert.equal(mountCount, 1);
-  assert.deepEqual(r1.mountedIds, ['slow']);
-  assert.deepEqual(r2.mountedIds, ['slow']);
+  // 1) Parallel start() must register onFrameChange only ONCE and mount only ONCE.
+  await Promise.all([orchestrator.start(), orchestrator.start()]);
+  assert.equal(onFrameChangeRegistrations, 1);
+  assert.deepEqual(mountedPorts, [41001]);
 
-  orchestrator.dispose();
+  // 2) Restarted sidecar (port/token changed) must unmount stale instance and remount on new port.
+  sidecarPort = 42002;
+  await orchestrator.reconcile();
   assert.equal(disposeCount, 1);
+  assert.deepEqual(mountedPorts, [41001, 42002]);
 
-  // 2) Dispose mid-mount must immediately dispose the finishing mount (zero zombie mounts).
-  releaseMount = () => {};
-  const pendingReconcile = orchestrator.start();
-  await new Promise((r) => setTimeout(r, 10));
-  orchestrator.dispose();
-  releaseMount();
-  await pendingReconcile;
-  assert.deepEqual(orchestrator.getMountedBridgeIds(), []);
-  assert.ok(disposeCount >= 2);
+  // 3) Frame change triggers serialized unmount + remount without leaving zombie mounts.
+  await frameListener({ win: { v: 2 }, doc: { v: 2 } });
+  assert.equal(disposeCount, 2);
+  assert.deepEqual(mountedPorts, [41001, 42002, 42002]);
 
-  // 3) Restart after dispose must work cleanly.
-  releaseMount = null;
-  const restarted = await orchestrator.start();
-  assert.deepEqual(restarted.mountedIds, ['slow']);
   orchestrator.dispose();
+  assert.equal(disposeCount, 3);
+  assert.equal(frameListener, null);
 });

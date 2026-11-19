@@ -1,4 +1,11 @@
+import { isSensitiveKey } from '../../security/redactor.js';
+
 export const DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER = 'google-translate';
+
+const TRANSLATOR_PLUGIN_NAMES = new Set([
+  'antigravity-ko-translator',
+  'ko-thought-translator',
+]);
 
 const ALLOWED_TRANSLATOR_SETTING_KEYS = Object.freeze([
   'enabled',
@@ -46,6 +53,18 @@ export function sanitizeTranslatorSettings(
   return Object.freeze(locked);
 }
 
+function sanitizeGenericSettings(rawSettings) {
+  const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+  const clean = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (isSensitiveKey(key) || typeof value === 'function') {
+      continue;
+    }
+    clean[key] = value;
+  }
+  return Object.freeze(clean);
+}
+
 export function createAntigravitySettingsAdapter({
   readSettingsFile,
   remoteFallbackProvider = DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
@@ -57,7 +76,10 @@ export function createAntigravitySettingsAdapter({
   return {
     async readPluginSettings(pluginName) {
       const raw = await readSettingsFile(pluginName);
-      return sanitizeTranslatorSettings(raw, { remoteFallbackProvider });
+      if (TRANSLATOR_PLUGIN_NAMES.has(String(pluginName || '').trim())) {
+        return sanitizeTranslatorSettings(raw, { remoteFallbackProvider });
+      }
+      return sanitizeGenericSettings(raw);
     },
   };
 }

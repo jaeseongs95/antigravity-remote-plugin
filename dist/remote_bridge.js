@@ -283,6 +283,8 @@ export const RESERVED_TRUSTED_TYPES_POLICIES = Object.freeze([
   'angular',
 ]);
 
+const POLICY_CACHE = new WeakMap();
+
 export function assertAllowedPolicyName(policyName) {
   if (typeof policyName !== 'string' || policyName.trim().length === 0) {
     throw new SecurityPolicyError(
@@ -306,7 +308,7 @@ export function assertAllowedPolicyName(policyName) {
 }
 
 export function createScopedTrustedTypesPolicy({
-  trustedTypesApi,
+  trustedTypesApi = null,
   policyName = 'remote-bridge-script-v1',
   validateScriptUrl,
 }) {
@@ -318,9 +320,11 @@ export function createScopedTrustedTypesPolicy({
     );
   }
 
+  const trimmedName = policyName.trim();
+
   if (!trustedTypesApi || typeof trustedTypesApi.createPolicy !== 'function') {
     return {
-      name: policyName,
+      name: trimmedName,
       isNative: false,
       createScriptURL(url) {
         if (!validateScriptUrl(url)) {
@@ -334,7 +338,33 @@ export function createScopedTrustedTypesPolicy({
     };
   }
 
-  const nativePolicy = trustedTypesApi.createPolicy(policyName, {
+  // Reuse an already-registered policy for this TrustedTypes API to avoid
+  // duplicate-policy TypeError on re-initialization in real browsers.
+  let apiCache = POLICY_CACHE.get(trustedTypesApi);
+  if (!apiCache) {
+    apiCache = new Map();
+    POLICY_CACHE.set(trustedTypesApi, apiCache);
+  }
+
+  let nativePolicy = apiCache.get(trimmedName);
+  if (!nativePolicy) {
+    nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
+      createScriptURL(url) {
+        if (!validateScriptUrl(url)) {
+          throw new SecurityPolicyError(
+            'UNTRUSTED_SCRIPT_URL',
+            'Script URL failed allowlist validation.',
+          );
+        }
+        return url;
+      },
+    });
+    apiCache.set(trimmedName, nativePolicy);
+  }
+
+  return {
+    name: trimmedName,
+    isNative: true,
     createScriptURL(url) {
       if (!validateScriptUrl(url)) {
         throw new SecurityPolicyError(
@@ -342,14 +372,6 @@ export function createScopedTrustedTypesPolicy({
           'Script URL failed allowlist validation.',
         );
       }
-      return url;
-    },
-  });
-
-  return {
-    name: policyName,
-    isNative: true,
-    createScriptURL(url) {
       return nativePolicy.createScriptURL(url);
     },
   };
@@ -384,6 +406,32 @@ export function isTrustedScriptUrl(rawUrl, allowlist) {
   return isOriginAllowed(parsed.origin, allowlist);
 }
 
+/**
+ * Validates a `blob:` URL whose embedded origin belongs to the trusted allowlist.
+ * Used for Worker / AudioWorklet Blob URLs after their source script URL has
+ * already passed `isTrustedScriptUrl`.
+ */
+export function isTrustedBlobUrl(rawUrl, allowlist) {
+  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('blob:')) {
+    return false;
+  }
+  const inner = rawUrl.slice('blob:'.length);
+  let parsed;
+  try {
+    parsed = new URL(inner);
+  } catch (_err) {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return false;
+  }
+  return isOriginAllowed(parsed.origin, allowlist);
+}
+
+export function isTrustedWorkerOrScriptUrl(rawUrl, allowlist) {
+  return isTrustedScriptUrl(rawUrl, allowlist) || isTrustedBlobUrl(rawUrl, allowlist);
+}
+
 export function assertTrustedScriptUrl(rawUrl, allowlist) {
   if (!isTrustedScriptUrl(rawUrl, allowlist)) {
     throw new SecurityPolicyError(
@@ -394,9 +442,12 @@ export function assertTrustedScriptUrl(rawUrl, allowlist) {
 }
 
 /**
- * Guards Worker / AudioWorklet bootstrap Blob URL creation by requiring
- * the underlying script URL to pass `isTrustedScriptUrl` first.
- * Preserves native TrustedScriptURL objects intact (never coerces via String()).
+ * Guards Worker / AudioWorklet bootstrap Blob URL creation:
+ * 1) Validates `scriptUrl` against `isTrustedScriptUrl` (fail-closed).
+ * 2) Calls `createBlobUrl(scriptUrl)` to mint the `blob:` URL.
+ * 3) If `trustedTypesPolicy` is provided, wraps the resulting `blob:` URL via
+ *    `trustedTypesPolicy.createScriptURL(blobUrl)` and returns the native
+ *    TrustedScriptURL object intact (never coerced with String()).
  */
 export function createGuardedWorkerBlobUrl({
   scriptUrl,
@@ -411,10 +462,11 @@ export function createGuardedWorkerBlobUrl({
       'A Blob URL factory function is required.',
     );
   }
-  const validatedUrl = trustedTypesPolicy
-    ? trustedTypesPolicy.createScriptURL(scriptUrl)
-    : scriptUrl;
-  return createBlobUrl(validatedUrl);
+  const rawBlobUrl = createBlobUrl(scriptUrl);
+  if (trustedTypesPolicy) {
+    return trustedTypesPolicy.createScriptURL(rawBlobUrl);
+  }
+  return rawBlobUrl;
 }
 
 // --- module: src/security/dom-guard.js ---
@@ -432,7 +484,7 @@ const FORBIDDEN_HTML_PROPS = new Set([
 const FORBIDDEN_URI_SCHEME_PATTERN = /^(?:javascript|vbscript|data):/i;
 
 function normalizeUriForSchemeCheck(rawValue) {
-  // Strip ASCII control characters (including \t, \n, \r) and spaces that browsers ignore in URL schemes.
+  // Strip ASCII control characters (including \t, \n, \r, \0) and spaces that browsers ignore in URL schemes.
   return String(rawValue).replace(/[\u0000-\u0020\u007f]+/g, '');
 }
 
@@ -470,7 +522,8 @@ export function assertSafeAttribute(attrName, attrValue) {
       );
     }
   }
-  if (typeof attrValue === 'string') {
+  if (attrValue !== null && attrValue !== undefined) {
+    // Coerce objects (e.g. { toString: () => 'javascript:...' }) before validation.
     const collapsed = normalizeUriForSchemeCheck(attrValue);
     if (FORBIDDEN_URI_SCHEME_PATTERN.test(collapsed)) {
       throw new SecurityPolicyError(
@@ -488,9 +541,10 @@ export function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}
   }
   const el = doc.createElement(safeTag);
   for (const [key, val] of Object.entries(attrs)) {
-    assertSafeAttribute(key, val);
-    if (val !== null && val !== undefined) {
-      el.setAttribute(key, String(val));
+    const stringVal = val !== null && val !== undefined ? String(val) : val;
+    assertSafeAttribute(key, stringVal);
+    if (stringVal !== null && stringVal !== undefined) {
+      el.setAttribute(key, stringVal);
     }
   }
   if (text !== null && text !== undefined) {
@@ -831,12 +885,20 @@ export function validateBridgeDescriptor(bridge) {
 }
 
 // --- module: src/core/orchestrator.js ---
+function computeSidecarFingerprint(sidecar) {
+  if (!sidecar || typeof sidecar !== 'object') {
+    return null;
+  }
+  return `${sidecar.sidecarId || ''}|${sidecar.host || '127.0.0.1'}|${sidecar.port || ''}|${sidecar.token || ''}`;
+}
+
 export class RemoteOrchestrator {
   #discoveryPort;
   #framePort;
   #diagnostics;
   #bridges = new Map();
   #mounted = new Map();
+  #mountedFingerprints = new Map();
   #singleFlight = new SingleFlight();
   #mutex = new AsyncMutex();
   #store;
@@ -909,115 +971,129 @@ export class RemoteOrchestrator {
   }
 
   async start(context = {}) {
-    if (this.#started && !this.#store.isDisposed) {
-      return this.reconcile(context);
-    }
+    return this.#mutex.runExclusive(async () => {
+      if (this.#started && !this.#store.isDisposed) {
+        return this.#reconcileLocked(this.#epoch, context);
+      }
 
-    if (this.#store.isDisposed) {
-      this.#store = new DisposableStore({ diagnostics: this.#diagnostics });
-    }
+      if (this.#store.isDisposed) {
+        this.#store = new DisposableStore({ diagnostics: this.#diagnostics });
+      }
 
-    const startEpoch = this.#epoch;
-    const frame = await this.#framePort.acquireActiveFrame();
-    if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
-    }
-
-    this.#activeFrame = frame;
-    this.#started = true;
-
-    const unsubFrame = this.#framePort.onFrameChange(async (nextFrame) => {
+      const startEpoch = this.#epoch;
+      const frame = await this.#framePort.acquireActiveFrame();
       if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-        return;
+        return { mountedIds: [], skippedIds: [] };
       }
-      this.#activeFrame = nextFrame;
-      this.#unmountAll();
-      if (nextFrame) {
-        await this.reconcile(context);
-      }
-    });
-    if (typeof unsubFrame === 'function') {
-      this.#store.add(unsubFrame);
-    }
 
-    return this.reconcile(context);
+      this.#activeFrame = frame;
+      this.#started = true;
+
+      const unsubFrame = this.#framePort.onFrameChange((nextFrame) => {
+        // Bump epoch immediately to invalidate any in-flight mount from the old frame.
+        const changeEpoch = ++this.#epoch;
+        return this.#mutex.runExclusive(async () => {
+          if (changeEpoch !== this.#epoch || this.#store.isDisposed) {
+            return;
+          }
+          this.#activeFrame = nextFrame;
+          this.#unmountAll();
+          if (nextFrame) {
+            await this.#reconcileLocked(changeEpoch, context);
+          }
+        });
+      });
+      if (typeof unsubFrame === 'function') {
+        this.#store.add(unsubFrame);
+      }
+
+      return this.#reconcileLocked(startEpoch, context);
+    });
   }
 
   async reconcile(context = {}) {
     const runEpoch = this.#epoch;
-    return this.#mutex.runExclusive(async () => {
+    return this.#mutex.runExclusive(() => this.#reconcileLocked(runEpoch, context));
+  }
+
+  async #reconcileLocked(runEpoch, context) {
+    if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+      return { mountedIds: [], skippedIds: [] };
+    }
+
+    const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
+    if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+      return { mountedIds: [], skippedIds: [] };
+    }
+
+    const mountedIds = [];
+    const skippedIds = [];
+
+    for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
       if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
+        break;
       }
 
-      const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
-      if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
-      }
+      const pluginRecord = this.#matchActivePlugin(bridge, activePlugins);
+      const sidecarRecord = bridge.sidecarId
+        ? activeSidecars.get(bridge.sidecarId) ?? null
+        : null;
 
-      const mountedIds = [];
-      const skippedIds = [];
+      const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
 
-      for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
-        if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-          break;
-        }
-
-        const pluginRecord = this.#matchActivePlugin(bridge, activePlugins);
-        const sidecarRecord = bridge.sidecarId
-          ? activeSidecars.get(bridge.sidecarId) ?? null
-          : null;
-
-        const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
-
-        if (!isEligible) {
-          if (this.#mounted.has(bridgeId)) {
-            this.#unmountBridge(bridgeId);
-          }
-          skippedIds.push(bridgeId);
-          this.#diagnostics.emit({
-            level: 'info',
-            code: 'BRIDGE_SKIPPED_INACTIVE',
-            source: 'core.orchestrator',
-            message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
-            detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
-          });
-          continue;
-        }
-
+      if (!isEligible) {
         if (this.#mounted.has(bridgeId)) {
+          this.#unmountBridge(bridgeId);
+        }
+        skippedIds.push(bridgeId);
+        this.#diagnostics.emit({
+          level: 'info',
+          code: 'BRIDGE_SKIPPED_INACTIVE',
+          source: 'core.orchestrator',
+          message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
+          detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
+        });
+        continue;
+      }
+
+      const nextFingerprint = computeSidecarFingerprint(sidecarRecord);
+      if (this.#mounted.has(bridgeId)) {
+        const prevFingerprint = this.#mountedFingerprints.get(bridgeId) ?? null;
+        if (prevFingerprint === nextFingerprint) {
           mountedIds.push(bridgeId);
           continue;
         }
-
-        try {
-          await bridge.mount({
-            frame: this.#activeFrame,
-            plugin: pluginRecord,
-            sidecar: sidecarRecord,
-            diagnostics: this.#diagnostics,
-          });
-          if (runEpoch !== this.#epoch || this.#store.isDisposed || !this.#bridges.has(bridgeId)) {
-            // Disposed or unregistered mid-mount: clean up immediately, never leave a zombie mount.
-            this.#safeDisposeBridge(bridgeId, bridge);
-            continue;
-          }
-          this.#mounted.set(bridgeId, bridge);
-          mountedIds.push(bridgeId);
-        } catch (err) {
-          this.#safeDisposeBridge(bridgeId, bridge);
-          this.#diagnostics.emit({
-            level: 'error',
-            code: 'BRIDGE_MOUNT_FAILED',
-            source: 'core.orchestrator',
-            message: `Failed to mount bridge "${bridgeId}"`,
-            detail: err,
-          });
-        }
+        // Sidecar host/port/token changed (e.g. sidecar restarted): unmount stale instance and remount.
+        this.#unmountBridge(bridgeId);
       }
 
-      return { mountedIds, skippedIds };
-    });
+      try {
+        await bridge.mount({
+          frame: this.#activeFrame,
+          plugin: pluginRecord,
+          sidecar: sidecarRecord,
+          diagnostics: this.#diagnostics,
+        });
+        if (runEpoch !== this.#epoch || this.#store.isDisposed || !this.#bridges.has(bridgeId)) {
+          this.#safeDisposeBridge(bridgeId, bridge);
+          continue;
+        }
+        this.#mounted.set(bridgeId, bridge);
+        this.#mountedFingerprints.set(bridgeId, nextFingerprint);
+        mountedIds.push(bridgeId);
+      } catch (err) {
+        this.#safeDisposeBridge(bridgeId, bridge);
+        this.#diagnostics.emit({
+          level: 'error',
+          code: 'BRIDGE_MOUNT_FAILED',
+          source: 'core.orchestrator',
+          message: `Failed to mount bridge "${bridgeId}"`,
+          detail: err,
+        });
+      }
+    }
+
+    return { mountedIds, skippedIds };
   }
 
   getMountedBridgeIds() {
@@ -1058,6 +1134,7 @@ export class RemoteOrchestrator {
       return;
     }
     this.#mounted.delete(bridgeId);
+    this.#mountedFingerprints.delete(bridgeId);
     this.#safeDisposeBridge(bridgeId, bridge);
   }
 
@@ -1092,8 +1169,8 @@ export function stripSensitiveSettings(rawSettings) {
 /**
  * Vendor- and domain-independent pure DOM overlay bridge.
  * Enforces least privilege: passes ONLY `{ win, doc, settings, onStatus }` to
- * the overlay factory, serializes mount/dispose against races, and rolls back
- * cleanly if `start()` fails.
+ * the overlay factory, validates SettingsReadPort, serializes mount/dispose
+ * against races, and rolls back cleanly if `start()` fails.
  */
 export function createDomOverlayBridge({
   id,
@@ -1109,6 +1186,9 @@ export function createDomOverlayBridge({
   }
   if (typeof sanitizeSettings !== 'function') {
     throw new TypeError('DomOverlayBridge sanitizeSettings must be a function.');
+  }
+  if (settingsPort !== null) {
+    validateSettingsReadPort(settingsPort);
   }
 
   const mutex = new AsyncMutex();
@@ -1236,33 +1316,37 @@ export function createDomOverlayBridge({
 }
 
 // --- module: src/bridges/sidecar-ui-bridge.js ---
-export const ALLOWED_SIDECAR_INBOUND_EVENTS = Object.freeze([
-  'sidecar-key-event',
-  'toggle-aux-pane',
-  'toggle-conversation',
-  'add-artifact-comment',
-  'request-credential-refresh',
-]);
-
-export const DEFAULT_ALLOWED_API_PATHS = Object.freeze([
-  '/api/telemetry',
-  '/api/context-limit',
-  '/api/compact',
-]);
-
-function deriveSidecarOrigin(sidecar) {
-  const host = formatHostForUrl(sidecar.host || '127.0.0.1');
+export function deriveSidecarOrigin(sidecar) {
+  if (!sidecar || typeof sidecar !== 'object') {
+    throw new SecurityPolicyError('INVALID_SIDECAR', 'Sidecar descriptor is required.');
+  }
+  const rawHost = sidecar.host || '127.0.0.1';
+  if (!isLoopbackHostname(rawHost)) {
+    throw new SecurityPolicyError(
+      'NON_LOOPBACK_SIDECAR',
+      'Sidecar bridge only permits loopback sidecar origins.',
+    );
+  }
   const port = Number(sidecar.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new SecurityPolicyError('INVALID_SIDECAR_PORT', 'Sidecar port must be a valid TCP port.');
   }
-  return `http://${host}:${port}`.toLowerCase();
+  const host = formatHostForUrl(rawHost);
+  let parsed;
+  try {
+    parsed = new URL(`http://${host}:${port}/`);
+  } catch (_err) {
+    throw new SecurityPolicyError('INVALID_SIDECAR_ORIGIN', 'Sidecar origin is not a valid URL.');
+  }
+  // Normalizes default port 80 (http://127.0.0.1:80 -> http://127.0.0.1) to match browser event.origin.
+  return parsed.origin.toLowerCase();
 }
 
 /**
- * Vendor-independent sidecar UI and JSON API relay bridge.
- * Wires ThemeWorkspaceSyncPort + window message listener + exact activeSidecar
- * origin & source validation, with deterministic DisposableStore teardown.
+ * Vendor- and domain-independent sidecar UI and JSON API relay bridge.
+ * Defers initial theme/workspace postMessage until iframe `load` completes,
+ * validates exact normalized loopback sidecar origin, and enforces fail-closed
+ * `event.source` matching whenever an iframe is mounted.
  */
 export function createSidecarUiBridge({
   id,
@@ -1271,7 +1355,8 @@ export function createSidecarUiBridge({
   relayPort,
   themeWorkspacePort = null,
   allowedOrigins = [],
-  allowedApiPaths = DEFAULT_ALLOWED_API_PATHS,
+  allowedApiPaths = [],
+  allowedInboundEvents = [],
   conversationIdProvider = null,
   onInboundEvent = null,
 }) {
@@ -1279,13 +1364,20 @@ export function createSidecarUiBridge({
   if (themeWorkspacePort !== null) {
     validateThemeWorkspaceSyncPort(themeWorkspacePort);
   }
+  if (!Array.isArray(allowedApiPaths)) {
+    throw new TypeError(`SidecarUiBridge "${id}" requires an allowedApiPaths array.`);
+  }
+  if (!Array.isArray(allowedInboundEvents)) {
+    throw new TypeError(`SidecarUiBridge "${id}" requires an allowedInboundEvents array.`);
+  }
 
   const permittedPaths = new Set(allowedApiPaths);
-  const permittedEvents = new Set(ALLOWED_SIDECAR_INBOUND_EVENTS);
+  const permittedEvents = new Set(allowedInboundEvents);
   let activeSidecar = null;
   let activeSidecarOrigin = null;
   let activeDiagnostics = null;
   let mountedIframe = null;
+  let iframeLoaded = false;
   let store = null;
 
   function isOriginTrustedForActiveSidecar(candidateOrigin) {
@@ -1351,9 +1443,10 @@ export function createSidecarUiBridge({
       activeSidecar = sidecar;
       activeSidecarOrigin = sidecarOrigin;
       activeDiagnostics = diagnostics || null;
+      iframeLoaded = false;
       store = new DisposableStore({ diagnostics });
 
-      // If a host frame with DOM is available, mount the sidecar iframe and wire listeners.
+      // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
       if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
         const conversationId = typeof conversationIdProvider === 'function'
           ? conversationIdProvider()
@@ -1366,6 +1459,24 @@ export function createSidecarUiBridge({
             sandbox: 'allow-scripts allow-same-origin allow-forms',
           },
         });
+        mountedIframe = iframe;
+
+        const hasLoadEvents = typeof iframe.addEventListener === 'function';
+        if (hasLoadEvents) {
+          const onLoad = () => {
+            iframeLoaded = true;
+            if (mountedIframe === iframe && iframe.contentWindow) {
+              pushThemeAndWorkspace(iframe.contentWindow);
+            }
+          };
+          iframe.addEventListener('load', onLoad);
+          store.add(() => {
+            if (typeof iframe.removeEventListener === 'function') {
+              iframe.removeEventListener('load', onLoad);
+            }
+          });
+        }
+
         const mountContainer = frame.panelContainer || frame.doc.body || null;
         if (mountContainer && typeof mountContainer.appendChild === 'function') {
           mountContainer.appendChild(iframe);
@@ -1377,19 +1488,19 @@ export function createSidecarUiBridge({
             }
           });
         }
-        mountedIframe = iframe;
 
-        const targetWin = iframe.contentWindow || null;
-        if (targetWin) {
-          pushThemeAndWorkspace(targetWin);
+        // Only push synchronously if the host element does not emit DOM load events.
+        if (!hasLoadEvents && iframe.contentWindow) {
+          iframeLoaded = true;
+          pushThemeAndWorkspace(iframe.contentWindow);
         }
       }
 
-      // Wire ThemeWorkspaceSyncPort live updates.
+      // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
       if (themeWorkspacePort) {
         const unsubSync = themeWorkspacePort.subscribe((change) => {
           const targetWin = mountedIframe?.contentWindow || null;
-          if (!targetWin || !activeSidecarOrigin) {
+          if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
             return;
           }
           if (change?.type === 'theme-change') {
@@ -1406,8 +1517,7 @@ export function createSidecarUiBridge({
       // Wire host window message listener for inbound sidecar preload events.
       if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
         const onMessage = (event) => {
-          const expectedSource = mountedIframe?.contentWindow || null;
-          this.handleInboundMessage(event, expectedSource);
+          this.handleInboundMessage(event);
         };
         frame.win.addEventListener('message', onMessage);
         store.add(() => {
@@ -1496,19 +1606,30 @@ export function createSidecarUiBridge({
         }
         return { accepted: false, reason: 'UNTRUSTED_ORIGIN' };
       }
-      const requiredSource = expectedSource ?? mountedIframe?.contentWindow ?? null;
-      if (requiredSource && event.source !== requiredSource) {
-        if (activeDiagnostics) {
-          activeDiagnostics.emit({
-            level: 'warn',
-            code: 'POSTMESSAGE_SOURCE_MISMATCH',
-            source: `bridge.${id}`,
-            message: 'Dropped inbound postMessage from unexpected window source',
-            detail: { origin: event.origin },
-          });
+
+      // Fail-closed source check: when an iframe is mounted, its contentWindow must be
+      // present and strictly equal to event.source.
+      if (mountedIframe !== null) {
+        const requiredSource = expectedSource ?? mountedIframe.contentWindow;
+        if (!requiredSource) {
+          return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
         }
+        if (event.source !== requiredSource) {
+          if (activeDiagnostics) {
+            activeDiagnostics.emit({
+              level: 'warn',
+              code: 'POSTMESSAGE_SOURCE_MISMATCH',
+              source: `bridge.${id}`,
+              message: 'Dropped inbound postMessage from unexpected window source',
+              detail: { origin: event.origin },
+            });
+          }
+          return { accepted: false, reason: 'SOURCE_MISMATCH' };
+        }
+      } else if (expectedSource !== null && event.source !== expectedSource) {
         return { accepted: false, reason: 'SOURCE_MISMATCH' };
       }
+
       const type = event.data?.type;
       if (typeof type !== 'string' || !permittedEvents.has(type)) {
         return { accepted: false, reason: 'UNSUPPORTED_EVENT_TYPE' };
@@ -1526,6 +1647,7 @@ export function createSidecarUiBridge({
         currentStore.dispose();
       }
       mountedIframe = null;
+      iframeLoaded = false;
       activeSidecar = null;
       activeSidecarOrigin = null;
       activeDiagnostics = null;
@@ -1539,15 +1661,23 @@ const DEFAULT_PROTECTED_CONFIG_PATTERNS = Object.freeze([
   /(?:^|\/)plugins\/[^/]+\/mcp_config\.json$/i,
 ]);
 
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
+
 /**
  * Pure, cross-platform lexical path canonicalizer (resolves \, //, ., .., ~/).
- * Used to prevent path-traversal bypasses against protected config patterns.
+ * Rejects NUL bytes and ASCII control characters to prevent regex anchor bypasses.
  */
 export function canonicalizeConfigPath(rawPath) {
   if (typeof rawPath !== 'string' || !rawPath.trim()) {
     throw new SecurityPolicyError(
       'INVALID_CONFIG_PATH',
       'A non-empty targetConfigPath is required for MCP configuration mutations.',
+    );
+  }
+  if (CONTROL_CHAR_PATTERN.test(rawPath)) {
+    throw new SecurityPolicyError(
+      'INVALID_CONFIG_PATH',
+      'Configuration path contains forbidden NUL or ASCII control characters.',
     );
   }
 
@@ -1603,7 +1733,6 @@ function isStdioMutation({ transport, serverConfig }) {
   if (normalizedTransport === 'stdio') {
     return true;
   }
-  // Fail-closed: if transport is omitted or non-HTTP and a local executable command is supplied, treat as stdio.
   if (serverConfig && typeof serverConfig === 'object') {
     if (typeof serverConfig.command === 'string' && serverConfig.command.trim().length > 0) {
       return true;
@@ -1738,6 +1867,15 @@ function validateCsrfToken(csrfToken) {
   return csrfToken.trim();
 }
 
+function extractInstallDir(rawPath, fallbackName) {
+  if (typeof rawPath !== 'string' || !rawPath.trim()) {
+    return fallbackName;
+  }
+  const stripped = rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const segment = stripped.split('/').pop();
+  return segment || fallbackName;
+}
+
 export function createAntigravityDiscoveryAdapter({
   lsAddress,
   csrfToken,
@@ -1776,9 +1914,7 @@ export function createAntigravityDiscoveryAdapter({
       return data.plugins.map((plugin) => ({
         name: plugin.name,
         path: plugin.path || '',
-        dir: typeof plugin.path === 'string' && plugin.path.length > 0
-          ? plugin.path.replace(/\\/g, '/').split('/').pop()
-          : plugin.name,
+        dir: extractInstallDir(plugin.path, plugin.name),
         disabled: Boolean(plugin.disabled),
         enabled: !plugin.disabled,
         isGlobal: Boolean(plugin.isGlobal),
@@ -1816,7 +1952,6 @@ function assertValidFrame(frame, allowedOrigins, label) {
   if (!frame || typeof frame !== 'object') {
     throw new SecurityPolicyError('INVALID_FRAME', `Invalid ${label}: expected frame object.`);
   }
-  // Fail-closed: origin is mandatory on every non-null frame.
   assertOriginAllowed(frame.origin, allowedOrigins, label);
   if (!frame.win || !frame.doc) {
     throw new SecurityPolicyError(
@@ -1828,7 +1963,7 @@ function assertValidFrame(frame, allowedOrigins, label) {
 
 export function createAntigravityFrameAdapter({
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
-  trustedTypesApi = null,
+  trustedTypesApi = globalThis.trustedTypes ?? null,
   policyName = 'antigravity-remote-bridge-v1',
   hostLoadGuard = null,
   diagnostics = null,
@@ -1837,7 +1972,7 @@ export function createAntigravityFrameAdapter({
   const ttPolicy = createScopedTrustedTypesPolicy({
     trustedTypesApi,
     policyName,
-    validateScriptUrl: (url) => isTrustedScriptUrl(url, allowedOrigins),
+    validateScriptUrl: (url) => isTrustedWorkerOrScriptUrl(url, allowedOrigins),
   });
 
   const frameChain = new EventChain({
@@ -1874,21 +2009,22 @@ export function createAntigravityFrameAdapter({
     },
 
     /**
-     * Promotes a same-origin / accessible remote iframe element into a validated
-     * frame descriptor (`{ win, doc, origin, iframeEl }`) and notifies subscribers.
-     * Never uses `document.write`, `<base>`, or cross-origin bypasses.
+     * Promotes an accessible remote iframe element into a validated frame descriptor
+     * (`{ win, doc, origin, iframeEl }`). Translates cross-origin DOMException into
+     * `CROSS_ORIGIN_IFRAME_DENIED` and cross-checks `targetOrigin` against actual
+     * `iframe.contentWindow.location.origin`.
      */
-    promoteRemoteIframe(iframeEl, { targetOrigin, conversationId = '' } = {}) {
+    promoteRemoteIframe(iframeEl, { targetOrigin = '', conversationId = '' } = {}) {
       if (!iframeEl || typeof iframeEl !== 'object') {
         throw new SecurityPolicyError('INVALID_IFRAME', 'An iframe element is required for promotion.');
       }
-      const resolvedOrigin = targetOrigin || iframeEl.contentWindow?.location?.origin || '';
-      assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
 
       let win;
       let doc;
+      let actualOrigin;
       try {
         win = iframeEl.contentWindow;
+        actualOrigin = win?.location?.origin || '';
         doc = iframeEl.contentDocument || win?.document;
       } catch (_err) {
         throw new SecurityPolicyError(
@@ -1902,6 +2038,20 @@ export function createAntigravityFrameAdapter({
           'UNAVAILABLE_IFRAME_DOCUMENT',
           'Remote iframe does not expose an accessible contentWindow/contentDocument.',
         );
+      }
+
+      const resolvedOrigin = targetOrigin || actualOrigin;
+      assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
+
+      if (targetOrigin && actualOrigin) {
+        const expectedNorm = normalizeOrigin(targetOrigin);
+        const actualNorm = normalizeOrigin(actualOrigin);
+        if (!expectedNorm || !actualNorm || expectedNorm.origin !== actualNorm.origin) {
+          throw new SecurityPolicyError(
+            'ORIGIN_MISMATCH',
+            'Supplied targetOrigin does not match the actual accessible iframe origin.',
+          );
+        }
       }
 
       const promoted = {
@@ -1993,6 +2143,11 @@ export function createAntigravitySidecarAdapter({ fetchImpl = globalThis.fetch }
 // --- module: src/adapters/antigravity/settings-adapter.js ---
 export const DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER = 'google-translate';
 
+const TRANSLATOR_PLUGIN_NAMES = new Set([
+  'antigravity-ko-translator',
+  'ko-thought-translator',
+]);
+
 const ALLOWED_TRANSLATOR_SETTING_KEYS = Object.freeze([
   'enabled',
   'translateThinking',
@@ -2039,6 +2194,18 @@ export function sanitizeTranslatorSettings(
   return Object.freeze(locked);
 }
 
+function sanitizeGenericSettings(rawSettings) {
+  const input = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+  const clean = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (isSensitiveKey(key) || typeof value === 'function') {
+      continue;
+    }
+    clean[key] = value;
+  }
+  return Object.freeze(clean);
+}
+
 export function createAntigravitySettingsAdapter({
   readSettingsFile,
   remoteFallbackProvider = DEFAULT_ANTIGRAVITY_REMOTE_TRANSLATOR_PROVIDER,
@@ -2050,7 +2217,10 @@ export function createAntigravitySettingsAdapter({
   return {
     async readPluginSettings(pluginName) {
       const raw = await readSettingsFile(pluginName);
-      return sanitizeTranslatorSettings(raw, { remoteFallbackProvider });
+      if (TRANSLATOR_PLUGIN_NAMES.has(String(pluginName || '').trim())) {
+        return sanitizeTranslatorSettings(raw, { remoteFallbackProvider });
+      }
+      return sanitizeGenericSettings(raw);
     },
   };
 }
@@ -2107,6 +2277,20 @@ export function createAntigravityThemeWorkspaceAdapter({
 }
 
 // --- module: src/runtime/bootstrap.js ---
+export const ANTIGRAVITY_STATUSBAR_API_PATHS = Object.freeze([
+  '/api/telemetry',
+  '/api/context-limit',
+  '/api/compact',
+]);
+
+export const ANTIGRAVITY_SIDECAR_INBOUND_EVENTS = Object.freeze([
+  'sidecar-key-event',
+  'toggle-aux-pane',
+  'toggle-conversation',
+  'add-artifact-comment',
+  'request-credential-refresh',
+]);
+
 const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
   /(?:^|\/)\.gemini\/config\/config\.json$/i,
   /(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i,
@@ -2117,7 +2301,7 @@ export function bootstrapAntigravityRemoteBridge({
   lsAddress,
   csrfToken,
   fetchImpl = globalThis.fetch,
-  trustedTypesApi = null,
+  trustedTypesApi = globalThis.trustedTypes ?? null,
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
   readSettingsFile = async () => ({}),
   createKoTranslator = null,
@@ -2187,6 +2371,8 @@ export function bootstrapAntigravityRemoteBridge({
     relayPort: sidecarRelayPort,
     themeWorkspacePort,
     allowedOrigins: [],
+    allowedApiPaths: ANTIGRAVITY_STATUSBAR_API_PATHS,
+    allowedInboundEvents: ANTIGRAVITY_SIDECAR_INBOUND_EVENTS,
     onInboundEvent: onSidecarEvent,
   });
   orchestrator.registerBridge(statusbarBridge);

@@ -6,12 +6,20 @@ import {
   validateFramePromotionPort,
 } from './ports.js';
 
+function computeSidecarFingerprint(sidecar) {
+  if (!sidecar || typeof sidecar !== 'object') {
+    return null;
+  }
+  return `${sidecar.sidecarId || ''}|${sidecar.host || '127.0.0.1'}|${sidecar.port || ''}|${sidecar.token || ''}`;
+}
+
 export class RemoteOrchestrator {
   #discoveryPort;
   #framePort;
   #diagnostics;
   #bridges = new Map();
   #mounted = new Map();
+  #mountedFingerprints = new Map();
   #singleFlight = new SingleFlight();
   #mutex = new AsyncMutex();
   #store;
@@ -84,115 +92,129 @@ export class RemoteOrchestrator {
   }
 
   async start(context = {}) {
-    if (this.#started && !this.#store.isDisposed) {
-      return this.reconcile(context);
-    }
+    return this.#mutex.runExclusive(async () => {
+      if (this.#started && !this.#store.isDisposed) {
+        return this.#reconcileLocked(this.#epoch, context);
+      }
 
-    if (this.#store.isDisposed) {
-      this.#store = new DisposableStore({ diagnostics: this.#diagnostics });
-    }
+      if (this.#store.isDisposed) {
+        this.#store = new DisposableStore({ diagnostics: this.#diagnostics });
+      }
 
-    const startEpoch = this.#epoch;
-    const frame = await this.#framePort.acquireActiveFrame();
-    if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-      return { mountedIds: [], skippedIds: [] };
-    }
-
-    this.#activeFrame = frame;
-    this.#started = true;
-
-    const unsubFrame = this.#framePort.onFrameChange(async (nextFrame) => {
+      const startEpoch = this.#epoch;
+      const frame = await this.#framePort.acquireActiveFrame();
       if (startEpoch !== this.#epoch || this.#store.isDisposed) {
-        return;
+        return { mountedIds: [], skippedIds: [] };
       }
-      this.#activeFrame = nextFrame;
-      this.#unmountAll();
-      if (nextFrame) {
-        await this.reconcile(context);
-      }
-    });
-    if (typeof unsubFrame === 'function') {
-      this.#store.add(unsubFrame);
-    }
 
-    return this.reconcile(context);
+      this.#activeFrame = frame;
+      this.#started = true;
+
+      const unsubFrame = this.#framePort.onFrameChange((nextFrame) => {
+        // Bump epoch immediately to invalidate any in-flight mount from the old frame.
+        const changeEpoch = ++this.#epoch;
+        return this.#mutex.runExclusive(async () => {
+          if (changeEpoch !== this.#epoch || this.#store.isDisposed) {
+            return;
+          }
+          this.#activeFrame = nextFrame;
+          this.#unmountAll();
+          if (nextFrame) {
+            await this.#reconcileLocked(changeEpoch, context);
+          }
+        });
+      });
+      if (typeof unsubFrame === 'function') {
+        this.#store.add(unsubFrame);
+      }
+
+      return this.#reconcileLocked(startEpoch, context);
+    });
   }
 
   async reconcile(context = {}) {
     const runEpoch = this.#epoch;
-    return this.#mutex.runExclusive(async () => {
+    return this.#mutex.runExclusive(() => this.#reconcileLocked(runEpoch, context));
+  }
+
+  async #reconcileLocked(runEpoch, context) {
+    if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+      return { mountedIds: [], skippedIds: [] };
+    }
+
+    const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
+    if (runEpoch !== this.#epoch || this.#store.isDisposed) {
+      return { mountedIds: [], skippedIds: [] };
+    }
+
+    const mountedIds = [];
+    const skippedIds = [];
+
+    for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
       if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
+        break;
       }
 
-      const { activePlugins, activeSidecars } = await this.discoverAuthoritativeState(context);
-      if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-        return { mountedIds: [], skippedIds: [] };
-      }
+      const pluginRecord = this.#matchActivePlugin(bridge, activePlugins);
+      const sidecarRecord = bridge.sidecarId
+        ? activeSidecars.get(bridge.sidecarId) ?? null
+        : null;
 
-      const mountedIds = [];
-      const skippedIds = [];
+      const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
 
-      for (const [bridgeId, bridge] of [...this.#bridges.entries()]) {
-        if (runEpoch !== this.#epoch || this.#store.isDisposed) {
-          break;
-        }
-
-        const pluginRecord = this.#matchActivePlugin(bridge, activePlugins);
-        const sidecarRecord = bridge.sidecarId
-          ? activeSidecars.get(bridge.sidecarId) ?? null
-          : null;
-
-        const isEligible = Boolean(pluginRecord) && (!bridge.requireSidecar || Boolean(sidecarRecord));
-
-        if (!isEligible) {
-          if (this.#mounted.has(bridgeId)) {
-            this.#unmountBridge(bridgeId);
-          }
-          skippedIds.push(bridgeId);
-          this.#diagnostics.emit({
-            level: 'info',
-            code: 'BRIDGE_SKIPPED_INACTIVE',
-            source: 'core.orchestrator',
-            message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
-            detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
-          });
-          continue;
-        }
-
+      if (!isEligible) {
         if (this.#mounted.has(bridgeId)) {
+          this.#unmountBridge(bridgeId);
+        }
+        skippedIds.push(bridgeId);
+        this.#diagnostics.emit({
+          level: 'info',
+          code: 'BRIDGE_SKIPPED_INACTIVE',
+          source: 'core.orchestrator',
+          message: `Skipped bridge "${bridgeId}": authoritative plugin/sidecar not active`,
+          detail: { bridgeId, pluginName: bridge.pluginName, sidecarId: bridge.sidecarId ?? null },
+        });
+        continue;
+      }
+
+      const nextFingerprint = computeSidecarFingerprint(sidecarRecord);
+      if (this.#mounted.has(bridgeId)) {
+        const prevFingerprint = this.#mountedFingerprints.get(bridgeId) ?? null;
+        if (prevFingerprint === nextFingerprint) {
           mountedIds.push(bridgeId);
           continue;
         }
-
-        try {
-          await bridge.mount({
-            frame: this.#activeFrame,
-            plugin: pluginRecord,
-            sidecar: sidecarRecord,
-            diagnostics: this.#diagnostics,
-          });
-          if (runEpoch !== this.#epoch || this.#store.isDisposed || !this.#bridges.has(bridgeId)) {
-            // Disposed or unregistered mid-mount: clean up immediately, never leave a zombie mount.
-            this.#safeDisposeBridge(bridgeId, bridge);
-            continue;
-          }
-          this.#mounted.set(bridgeId, bridge);
-          mountedIds.push(bridgeId);
-        } catch (err) {
-          this.#safeDisposeBridge(bridgeId, bridge);
-          this.#diagnostics.emit({
-            level: 'error',
-            code: 'BRIDGE_MOUNT_FAILED',
-            source: 'core.orchestrator',
-            message: `Failed to mount bridge "${bridgeId}"`,
-            detail: err,
-          });
-        }
+        // Sidecar host/port/token changed (e.g. sidecar restarted): unmount stale instance and remount.
+        this.#unmountBridge(bridgeId);
       }
 
-      return { mountedIds, skippedIds };
-    });
+      try {
+        await bridge.mount({
+          frame: this.#activeFrame,
+          plugin: pluginRecord,
+          sidecar: sidecarRecord,
+          diagnostics: this.#diagnostics,
+        });
+        if (runEpoch !== this.#epoch || this.#store.isDisposed || !this.#bridges.has(bridgeId)) {
+          this.#safeDisposeBridge(bridgeId, bridge);
+          continue;
+        }
+        this.#mounted.set(bridgeId, bridge);
+        this.#mountedFingerprints.set(bridgeId, nextFingerprint);
+        mountedIds.push(bridgeId);
+      } catch (err) {
+        this.#safeDisposeBridge(bridgeId, bridge);
+        this.#diagnostics.emit({
+          level: 'error',
+          code: 'BRIDGE_MOUNT_FAILED',
+          source: 'core.orchestrator',
+          message: `Failed to mount bridge "${bridgeId}"`,
+          detail: err,
+        });
+      }
+    }
+
+    return { mountedIds, skippedIds };
   }
 
   getMountedBridgeIds() {
@@ -233,6 +255,7 @@ export class RemoteOrchestrator {
       return;
     }
     this.#mounted.delete(bridgeId);
+    this.#mountedFingerprints.delete(bridgeId);
     this.#safeDisposeBridge(bridgeId, bridge);
   }
 

@@ -1,4 +1,5 @@
 import { AsyncMutex, DisposableStore } from '../core/lifecycle.js';
+import { validateSettingsReadPort } from '../core/ports.js';
 import { SecurityPolicyError } from '../security/origin-policy.js';
 import { isSensitiveKey } from '../security/redactor.js';
 
@@ -17,8 +18,8 @@ export function stripSensitiveSettings(rawSettings) {
 /**
  * Vendor- and domain-independent pure DOM overlay bridge.
  * Enforces least privilege: passes ONLY `{ win, doc, settings, onStatus }` to
- * the overlay factory, serializes mount/dispose against races, and rolls back
- * cleanly if `start()` fails.
+ * the overlay factory, validates SettingsReadPort, serializes mount/dispose
+ * against races, and rolls back cleanly if `start()` fails.
  */
 export function createDomOverlayBridge({
   id,
@@ -34,6 +35,9 @@ export function createDomOverlayBridge({
   }
   if (typeof sanitizeSettings !== 'function') {
     throw new TypeError('DomOverlayBridge sanitizeSettings must be a function.');
+  }
+  if (settingsPort !== null) {
+    validateSettingsReadPort(settingsPort);
   }
 
   const mutex = new AsyncMutex();

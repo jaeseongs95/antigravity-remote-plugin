@@ -14,7 +14,7 @@ const FORBIDDEN_HTML_PROPS = new Set([
 const FORBIDDEN_URI_SCHEME_PATTERN = /^(?:javascript|vbscript|data):/i;
 
 function normalizeUriForSchemeCheck(rawValue) {
-  // Strip ASCII control characters (including \t, \n, \r) and spaces that browsers ignore in URL schemes.
+  // Strip ASCII control characters (including \t, \n, \r, \0) and spaces that browsers ignore in URL schemes.
   return String(rawValue).replace(/[\u0000-\u0020\u007f]+/g, '');
 }
 
@@ -52,7 +52,8 @@ export function assertSafeAttribute(attrName, attrValue) {
       );
     }
   }
-  if (typeof attrValue === 'string') {
+  if (attrValue !== null && attrValue !== undefined) {
+    // Coerce objects (e.g. { toString: () => 'javascript:...' }) before validation.
     const collapsed = normalizeUriForSchemeCheck(attrValue);
     if (FORBIDDEN_URI_SCHEME_PATTERN.test(collapsed)) {
       throw new SecurityPolicyError(
@@ -70,9 +71,10 @@ export function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}
   }
   const el = doc.createElement(safeTag);
   for (const [key, val] of Object.entries(attrs)) {
-    assertSafeAttribute(key, val);
-    if (val !== null && val !== undefined) {
-      el.setAttribute(key, String(val));
+    const stringVal = val !== null && val !== undefined ? String(val) : val;
+    assertSafeAttribute(key, stringVal);
+    if (stringVal !== null && stringVal !== undefined) {
+      el.setAttribute(key, stringVal);
     }
   }
   if (text !== null && text !== undefined) {

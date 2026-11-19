@@ -6,38 +6,43 @@ import {
 import { createSafeElement } from '../security/dom-guard.js';
 import {
   formatHostForUrl,
+  isLoopbackHostname,
   isOriginAllowed,
   normalizeOrigin,
   SecurityPolicyError,
 } from '../security/origin-policy.js';
 
-export const ALLOWED_SIDECAR_INBOUND_EVENTS = Object.freeze([
-  'sidecar-key-event',
-  'toggle-aux-pane',
-  'toggle-conversation',
-  'add-artifact-comment',
-  'request-credential-refresh',
-]);
-
-export const DEFAULT_ALLOWED_API_PATHS = Object.freeze([
-  '/api/telemetry',
-  '/api/context-limit',
-  '/api/compact',
-]);
-
-function deriveSidecarOrigin(sidecar) {
-  const host = formatHostForUrl(sidecar.host || '127.0.0.1');
+export function deriveSidecarOrigin(sidecar) {
+  if (!sidecar || typeof sidecar !== 'object') {
+    throw new SecurityPolicyError('INVALID_SIDECAR', 'Sidecar descriptor is required.');
+  }
+  const rawHost = sidecar.host || '127.0.0.1';
+  if (!isLoopbackHostname(rawHost)) {
+    throw new SecurityPolicyError(
+      'NON_LOOPBACK_SIDECAR',
+      'Sidecar bridge only permits loopback sidecar origins.',
+    );
+  }
   const port = Number(sidecar.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new SecurityPolicyError('INVALID_SIDECAR_PORT', 'Sidecar port must be a valid TCP port.');
   }
-  return `http://${host}:${port}`.toLowerCase();
+  const host = formatHostForUrl(rawHost);
+  let parsed;
+  try {
+    parsed = new URL(`http://${host}:${port}/`);
+  } catch (_err) {
+    throw new SecurityPolicyError('INVALID_SIDECAR_ORIGIN', 'Sidecar origin is not a valid URL.');
+  }
+  // Normalizes default port 80 (http://127.0.0.1:80 -> http://127.0.0.1) to match browser event.origin.
+  return parsed.origin.toLowerCase();
 }
 
 /**
- * Vendor-independent sidecar UI and JSON API relay bridge.
- * Wires ThemeWorkspaceSyncPort + window message listener + exact activeSidecar
- * origin & source validation, with deterministic DisposableStore teardown.
+ * Vendor- and domain-independent sidecar UI and JSON API relay bridge.
+ * Defers initial theme/workspace postMessage until iframe `load` completes,
+ * validates exact normalized loopback sidecar origin, and enforces fail-closed
+ * `event.source` matching whenever an iframe is mounted.
  */
 export function createSidecarUiBridge({
   id,
@@ -46,7 +51,8 @@ export function createSidecarUiBridge({
   relayPort,
   themeWorkspacePort = null,
   allowedOrigins = [],
-  allowedApiPaths = DEFAULT_ALLOWED_API_PATHS,
+  allowedApiPaths = [],
+  allowedInboundEvents = [],
   conversationIdProvider = null,
   onInboundEvent = null,
 }) {
@@ -54,13 +60,20 @@ export function createSidecarUiBridge({
   if (themeWorkspacePort !== null) {
     validateThemeWorkspaceSyncPort(themeWorkspacePort);
   }
+  if (!Array.isArray(allowedApiPaths)) {
+    throw new TypeError(`SidecarUiBridge "${id}" requires an allowedApiPaths array.`);
+  }
+  if (!Array.isArray(allowedInboundEvents)) {
+    throw new TypeError(`SidecarUiBridge "${id}" requires an allowedInboundEvents array.`);
+  }
 
   const permittedPaths = new Set(allowedApiPaths);
-  const permittedEvents = new Set(ALLOWED_SIDECAR_INBOUND_EVENTS);
+  const permittedEvents = new Set(allowedInboundEvents);
   let activeSidecar = null;
   let activeSidecarOrigin = null;
   let activeDiagnostics = null;
   let mountedIframe = null;
+  let iframeLoaded = false;
   let store = null;
 
   function isOriginTrustedForActiveSidecar(candidateOrigin) {
@@ -126,9 +139,10 @@ export function createSidecarUiBridge({
       activeSidecar = sidecar;
       activeSidecarOrigin = sidecarOrigin;
       activeDiagnostics = diagnostics || null;
+      iframeLoaded = false;
       store = new DisposableStore({ diagnostics });
 
-      // If a host frame with DOM is available, mount the sidecar iframe and wire listeners.
+      // If a host frame with DOM is available, mount the sidecar iframe and wait for `load`.
       if (frame && frame.doc && typeof frame.doc.createElement === 'function') {
         const conversationId = typeof conversationIdProvider === 'function'
           ? conversationIdProvider()
@@ -141,6 +155,24 @@ export function createSidecarUiBridge({
             sandbox: 'allow-scripts allow-same-origin allow-forms',
           },
         });
+        mountedIframe = iframe;
+
+        const hasLoadEvents = typeof iframe.addEventListener === 'function';
+        if (hasLoadEvents) {
+          const onLoad = () => {
+            iframeLoaded = true;
+            if (mountedIframe === iframe && iframe.contentWindow) {
+              pushThemeAndWorkspace(iframe.contentWindow);
+            }
+          };
+          iframe.addEventListener('load', onLoad);
+          store.add(() => {
+            if (typeof iframe.removeEventListener === 'function') {
+              iframe.removeEventListener('load', onLoad);
+            }
+          });
+        }
+
         const mountContainer = frame.panelContainer || frame.doc.body || null;
         if (mountContainer && typeof mountContainer.appendChild === 'function') {
           mountContainer.appendChild(iframe);
@@ -152,19 +184,19 @@ export function createSidecarUiBridge({
             }
           });
         }
-        mountedIframe = iframe;
 
-        const targetWin = iframe.contentWindow || null;
-        if (targetWin) {
-          pushThemeAndWorkspace(targetWin);
+        // Only push synchronously if the host element does not emit DOM load events.
+        if (!hasLoadEvents && iframe.contentWindow) {
+          iframeLoaded = true;
+          pushThemeAndWorkspace(iframe.contentWindow);
         }
       }
 
-      // Wire ThemeWorkspaceSyncPort live updates.
+      // Wire ThemeWorkspaceSyncPort live updates (delivered once iframe is loaded).
       if (themeWorkspacePort) {
         const unsubSync = themeWorkspacePort.subscribe((change) => {
           const targetWin = mountedIframe?.contentWindow || null;
-          if (!targetWin || !activeSidecarOrigin) {
+          if (!targetWin || !activeSidecarOrigin || !iframeLoaded) {
             return;
           }
           if (change?.type === 'theme-change') {
@@ -181,8 +213,7 @@ export function createSidecarUiBridge({
       // Wire host window message listener for inbound sidecar preload events.
       if (frame && frame.win && typeof frame.win.addEventListener === 'function') {
         const onMessage = (event) => {
-          const expectedSource = mountedIframe?.contentWindow || null;
-          this.handleInboundMessage(event, expectedSource);
+          this.handleInboundMessage(event);
         };
         frame.win.addEventListener('message', onMessage);
         store.add(() => {
@@ -271,19 +302,30 @@ export function createSidecarUiBridge({
         }
         return { accepted: false, reason: 'UNTRUSTED_ORIGIN' };
       }
-      const requiredSource = expectedSource ?? mountedIframe?.contentWindow ?? null;
-      if (requiredSource && event.source !== requiredSource) {
-        if (activeDiagnostics) {
-          activeDiagnostics.emit({
-            level: 'warn',
-            code: 'POSTMESSAGE_SOURCE_MISMATCH',
-            source: `bridge.${id}`,
-            message: 'Dropped inbound postMessage from unexpected window source',
-            detail: { origin: event.origin },
-          });
+
+      // Fail-closed source check: when an iframe is mounted, its contentWindow must be
+      // present and strictly equal to event.source.
+      if (mountedIframe !== null) {
+        const requiredSource = expectedSource ?? mountedIframe.contentWindow;
+        if (!requiredSource) {
+          return { accepted: false, reason: 'SOURCE_UNAVAILABLE' };
         }
+        if (event.source !== requiredSource) {
+          if (activeDiagnostics) {
+            activeDiagnostics.emit({
+              level: 'warn',
+              code: 'POSTMESSAGE_SOURCE_MISMATCH',
+              source: `bridge.${id}`,
+              message: 'Dropped inbound postMessage from unexpected window source',
+              detail: { origin: event.origin },
+            });
+          }
+          return { accepted: false, reason: 'SOURCE_MISMATCH' };
+        }
+      } else if (expectedSource !== null && event.source !== expectedSource) {
         return { accepted: false, reason: 'SOURCE_MISMATCH' };
       }
+
       const type = event.data?.type;
       if (typeof type !== 'string' || !permittedEvents.has(type)) {
         return { accepted: false, reason: 'UNSUPPORTED_EVENT_TYPE' };
@@ -301,6 +343,7 @@ export function createSidecarUiBridge({
         currentStore.dispose();
       }
       mountedIframe = null;
+      iframeLoaded = false;
       activeSidecar = null;
       activeSidecarOrigin = null;
       activeDiagnostics = null;

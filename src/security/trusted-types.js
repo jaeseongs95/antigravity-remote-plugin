@@ -6,6 +6,8 @@ export const RESERVED_TRUSTED_TYPES_POLICIES = Object.freeze([
   'angular',
 ]);
 
+const POLICY_CACHE = new WeakMap();
+
 export function assertAllowedPolicyName(policyName) {
   if (typeof policyName !== 'string' || policyName.trim().length === 0) {
     throw new SecurityPolicyError(
@@ -29,7 +31,7 @@ export function assertAllowedPolicyName(policyName) {
 }
 
 export function createScopedTrustedTypesPolicy({
-  trustedTypesApi,
+  trustedTypesApi = null,
   policyName = 'remote-bridge-script-v1',
   validateScriptUrl,
 }) {
@@ -41,9 +43,11 @@ export function createScopedTrustedTypesPolicy({
     );
   }
 
+  const trimmedName = policyName.trim();
+
   if (!trustedTypesApi || typeof trustedTypesApi.createPolicy !== 'function') {
     return {
-      name: policyName,
+      name: trimmedName,
       isNative: false,
       createScriptURL(url) {
         if (!validateScriptUrl(url)) {
@@ -57,7 +61,33 @@ export function createScopedTrustedTypesPolicy({
     };
   }
 
-  const nativePolicy = trustedTypesApi.createPolicy(policyName, {
+  // Reuse an already-registered policy for this TrustedTypes API to avoid
+  // duplicate-policy TypeError on re-initialization in real browsers.
+  let apiCache = POLICY_CACHE.get(trustedTypesApi);
+  if (!apiCache) {
+    apiCache = new Map();
+    POLICY_CACHE.set(trustedTypesApi, apiCache);
+  }
+
+  let nativePolicy = apiCache.get(trimmedName);
+  if (!nativePolicy) {
+    nativePolicy = trustedTypesApi.createPolicy(trimmedName, {
+      createScriptURL(url) {
+        if (!validateScriptUrl(url)) {
+          throw new SecurityPolicyError(
+            'UNTRUSTED_SCRIPT_URL',
+            'Script URL failed allowlist validation.',
+          );
+        }
+        return url;
+      },
+    });
+    apiCache.set(trimmedName, nativePolicy);
+  }
+
+  return {
+    name: trimmedName,
+    isNative: true,
     createScriptURL(url) {
       if (!validateScriptUrl(url)) {
         throw new SecurityPolicyError(
@@ -65,14 +95,6 @@ export function createScopedTrustedTypesPolicy({
           'Script URL failed allowlist validation.',
         );
       }
-      return url;
-    },
-  });
-
-  return {
-    name: policyName,
-    isNative: true,
-    createScriptURL(url) {
       return nativePolicy.createScriptURL(url);
     },
   };

@@ -1,6 +1,13 @@
 import { EventChain } from '../../core/lifecycle.js';
-import { assertOriginAllowed, SecurityPolicyError } from '../../security/origin-policy.js';
-import { createGuardedWorkerBlobUrl, isTrustedScriptUrl } from '../../security/script-guard.js';
+import {
+  assertOriginAllowed,
+  normalizeOrigin,
+  SecurityPolicyError,
+} from '../../security/origin-policy.js';
+import {
+  createGuardedWorkerBlobUrl,
+  isTrustedWorkerOrScriptUrl,
+} from '../../security/script-guard.js';
 import { createScopedTrustedTypesPolicy } from '../../security/trusted-types.js';
 
 export const DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS = Object.freeze([
@@ -12,7 +19,6 @@ function assertValidFrame(frame, allowedOrigins, label) {
   if (!frame || typeof frame !== 'object') {
     throw new SecurityPolicyError('INVALID_FRAME', `Invalid ${label}: expected frame object.`);
   }
-  // Fail-closed: origin is mandatory on every non-null frame.
   assertOriginAllowed(frame.origin, allowedOrigins, label);
   if (!frame.win || !frame.doc) {
     throw new SecurityPolicyError(
@@ -24,7 +30,7 @@ function assertValidFrame(frame, allowedOrigins, label) {
 
 export function createAntigravityFrameAdapter({
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
-  trustedTypesApi = null,
+  trustedTypesApi = globalThis.trustedTypes ?? null,
   policyName = 'antigravity-remote-bridge-v1',
   hostLoadGuard = null,
   diagnostics = null,
@@ -33,7 +39,7 @@ export function createAntigravityFrameAdapter({
   const ttPolicy = createScopedTrustedTypesPolicy({
     trustedTypesApi,
     policyName,
-    validateScriptUrl: (url) => isTrustedScriptUrl(url, allowedOrigins),
+    validateScriptUrl: (url) => isTrustedWorkerOrScriptUrl(url, allowedOrigins),
   });
 
   const frameChain = new EventChain({
@@ -70,21 +76,22 @@ export function createAntigravityFrameAdapter({
     },
 
     /**
-     * Promotes a same-origin / accessible remote iframe element into a validated
-     * frame descriptor (`{ win, doc, origin, iframeEl }`) and notifies subscribers.
-     * Never uses `document.write`, `<base>`, or cross-origin bypasses.
+     * Promotes an accessible remote iframe element into a validated frame descriptor
+     * (`{ win, doc, origin, iframeEl }`). Translates cross-origin DOMException into
+     * `CROSS_ORIGIN_IFRAME_DENIED` and cross-checks `targetOrigin` against actual
+     * `iframe.contentWindow.location.origin`.
      */
-    promoteRemoteIframe(iframeEl, { targetOrigin, conversationId = '' } = {}) {
+    promoteRemoteIframe(iframeEl, { targetOrigin = '', conversationId = '' } = {}) {
       if (!iframeEl || typeof iframeEl !== 'object') {
         throw new SecurityPolicyError('INVALID_IFRAME', 'An iframe element is required for promotion.');
       }
-      const resolvedOrigin = targetOrigin || iframeEl.contentWindow?.location?.origin || '';
-      assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
 
       let win;
       let doc;
+      let actualOrigin;
       try {
         win = iframeEl.contentWindow;
+        actualOrigin = win?.location?.origin || '';
         doc = iframeEl.contentDocument || win?.document;
       } catch (_err) {
         throw new SecurityPolicyError(
@@ -98,6 +105,20 @@ export function createAntigravityFrameAdapter({
           'UNAVAILABLE_IFRAME_DOCUMENT',
           'Remote iframe does not expose an accessible contentWindow/contentDocument.',
         );
+      }
+
+      const resolvedOrigin = targetOrigin || actualOrigin;
+      assertOriginAllowed(resolvedOrigin, allowedOrigins, 'remote iframe');
+
+      if (targetOrigin && actualOrigin) {
+        const expectedNorm = normalizeOrigin(targetOrigin);
+        const actualNorm = normalizeOrigin(actualOrigin);
+        if (!expectedNorm || !actualNorm || expectedNorm.origin !== actualNorm.origin) {
+          throw new SecurityPolicyError(
+            'ORIGIN_MISMATCH',
+            'Supplied targetOrigin does not match the actual accessible iframe origin.',
+          );
+        }
       }
 
       const promoted = {

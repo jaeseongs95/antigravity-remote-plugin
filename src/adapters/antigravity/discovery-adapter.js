@@ -54,6 +54,15 @@ function validateCsrfToken(csrfToken) {
   return csrfToken.trim();
 }
 
+function extractInstallDir(rawPath, fallbackName) {
+  if (typeof rawPath !== 'string' || !rawPath.trim()) {
+    return fallbackName;
+  }
+  const stripped = rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const segment = stripped.split('/').pop();
+  return segment || fallbackName;
+}
+
 export function createAntigravityDiscoveryAdapter({
   lsAddress,
   csrfToken,
@@ -92,9 +101,7 @@ export function createAntigravityDiscoveryAdapter({
       return data.plugins.map((plugin) => ({
         name: plugin.name,
         path: plugin.path || '',
-        dir: typeof plugin.path === 'string' && plugin.path.length > 0
-          ? plugin.path.replace(/\\/g, '/').split('/').pop()
-          : plugin.name,
+        dir: extractInstallDir(plugin.path, plugin.name),
         disabled: Boolean(plugin.disabled),
         enabled: !plugin.disabled,
         isGlobal: Boolean(plugin.isGlobal),

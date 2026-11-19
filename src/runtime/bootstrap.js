@@ -16,6 +16,20 @@ import {
 import { createAntigravitySidecarAdapter } from '../adapters/antigravity/sidecar-adapter.js';
 import { createAntigravityThemeWorkspaceAdapter } from '../adapters/antigravity/theme-workspace-adapter.js';
 
+export const ANTIGRAVITY_STATUSBAR_API_PATHS = Object.freeze([
+  '/api/telemetry',
+  '/api/context-limit',
+  '/api/compact',
+]);
+
+export const ANTIGRAVITY_SIDECAR_INBOUND_EVENTS = Object.freeze([
+  'sidecar-key-event',
+  'toggle-aux-pane',
+  'toggle-conversation',
+  'add-artifact-comment',
+  'request-credential-refresh',
+]);
+
 const ANTIGRAVITY_PROTECTED_MCP_PATHS = Object.freeze([
   /(?:^|\/)\.gemini\/config\/config\.json$/i,
   /(?:^|\/)\.gemini\/antigravity\/mcp_config\.json$/i,
@@ -26,7 +40,7 @@ export function bootstrapAntigravityRemoteBridge({
   lsAddress,
   csrfToken,
   fetchImpl = globalThis.fetch,
-  trustedTypesApi = null,
+  trustedTypesApi = globalThis.trustedTypes ?? null,
   allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
   readSettingsFile = async () => ({}),
   createKoTranslator = null,
@@ -96,6 +110,8 @@ export function bootstrapAntigravityRemoteBridge({
     relayPort: sidecarRelayPort,
     themeWorkspacePort,
     allowedOrigins: [],
+    allowedApiPaths: ANTIGRAVITY_STATUSBAR_API_PATHS,
+    allowedInboundEvents: ANTIGRAVITY_SIDECAR_INBOUND_EVENTS,
     onInboundEvent: onSidecarEvent,
   });
   orchestrator.registerBridge(statusbarBridge);

@@ -6,15 +6,23 @@ const DEFAULT_PROTECTED_CONFIG_PATTERNS = Object.freeze([
   /(?:^|\/)plugins\/[^/]+\/mcp_config\.json$/i,
 ]);
 
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f]/;
+
 /**
  * Pure, cross-platform lexical path canonicalizer (resolves \, //, ., .., ~/).
- * Used to prevent path-traversal bypasses against protected config patterns.
+ * Rejects NUL bytes and ASCII control characters to prevent regex anchor bypasses.
  */
 export function canonicalizeConfigPath(rawPath) {
   if (typeof rawPath !== 'string' || !rawPath.trim()) {
     throw new SecurityPolicyError(
       'INVALID_CONFIG_PATH',
       'A non-empty targetConfigPath is required for MCP configuration mutations.',
+    );
+  }
+  if (CONTROL_CHAR_PATTERN.test(rawPath)) {
+    throw new SecurityPolicyError(
+      'INVALID_CONFIG_PATH',
+      'Configuration path contains forbidden NUL or ASCII control characters.',
     );
   }
 
@@ -70,7 +78,6 @@ function isStdioMutation({ transport, serverConfig }) {
   if (normalizedTransport === 'stdio') {
     return true;
   }
-  // Fail-closed: if transport is omitted or non-HTTP and a local executable command is supplied, treat as stdio.
   if (serverConfig && typeof serverConfig === 'object') {
     if (typeof serverConfig.command === 'string' && serverConfig.command.trim().length > 0) {
       return true;
