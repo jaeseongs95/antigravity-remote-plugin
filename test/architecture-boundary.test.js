@@ -63,7 +63,7 @@ test('ARP-TC-001: core, security, and bridges contain zero vendor literals or do
   assert.deepEqual(violations, []);
 });
 
-test('ARP-TC-002: entire src/ contains zero HTML sink calls or assignments', () => {
+test('ARP-TC-002: entire src/ and sidecars/ contain zero HTML sink calls or assignments', () => {
   const sinkPatterns = [
     /\.innerHTML\b/,
     /\.outerHTML\b/,
@@ -72,18 +72,20 @@ test('ARP-TC-002: entire src/ contains zero HTML sink calls or assignments', () 
   ];
   const violations = [];
 
-  for (const file of collectJsFiles(join(ROOT, 'src'))) {
-    const content = readFileSync(file, 'utf8');
-    for (const pattern of sinkPatterns) {
-      if (pattern.test(content)) {
-        violations.push(`${file} matched ${pattern}`);
+  for (const relDir of ['src', 'sidecars']) {
+    for (const file of collectJsFiles(join(ROOT, relDir))) {
+      const content = readFileSync(file, 'utf8');
+      for (const pattern of sinkPatterns) {
+        if (pattern.test(content)) {
+          violations.push(`${file} matched ${pattern}`);
+        }
       }
     }
   }
   assert.deepEqual(violations, []);
 });
 
-test('ARP-TC-003: entire src/ contains zero forbidden legacy patterns or empty catch blocks', () => {
+test('ARP-TC-003: entire src/ and sidecars/ contain zero forbidden legacy patterns or empty catch blocks', () => {
   const forbidden = [
     /app\.asar/i,
     /statusbar_autoinject/i,
@@ -92,11 +94,13 @@ test('ARP-TC-003: entire src/ contains zero forbidden legacy patterns or empty c
     /catch\s*(?:\([^)]*\))?\s*\{\s*\}/,
   ];
   const violations = [];
-  for (const file of collectJsFiles(join(ROOT, 'src'))) {
-    const content = readFileSync(file, 'utf8');
-    for (const pattern of forbidden) {
-      if (pattern.test(content)) {
-        violations.push(`${file} matched ${pattern}`);
+  for (const relDir of ['src', 'sidecars']) {
+    for (const file of collectJsFiles(join(ROOT, relDir))) {
+      const content = readFileSync(file, 'utf8');
+      for (const pattern of forbidden) {
+        if (pattern.test(content)) {
+          violations.push(`${file} matched ${pattern}`);
+        }
       }
     }
   }

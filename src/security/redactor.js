@@ -66,11 +66,22 @@ export function redactUrl(rawUrl) {
   return mutated ? parsed.toString() : rawUrl;
 }
 
-export function isSensitiveKey(key) {
+const NUMERIC_TOKEN_METRIC_PATTERN =
+  /^(?:used|max|total|input|output|cached|prompt|completion|context|remaining)[a-z0-9_]*token(?:s|limit|count)?$/i;
+
+export function isSensitiveKey(key, value = undefined) {
   if (typeof key !== 'string') {
     return false;
   }
   const normalized = key.trim();
+  if (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    Number.isFinite(value) &&
+    NUMERIC_TOKEN_METRIC_PATTERN.test(normalized)
+  ) {
+    return false;
+  }
   return (
     SENSITIVE_KEY_PATTERN.test(normalized) ||
     SENSITIVE_SUBSTRING_PATTERN.test(normalized)
@@ -109,7 +120,7 @@ export function redactSecrets(value, depth = 0, seen = new WeakSet()) {
 
   const out = {};
   for (const [k, v] of Object.entries(value)) {
-    if (isSensitiveKey(k)) {
+    if (isSensitiveKey(k, v)) {
       out[k] = REDACTED;
     } else {
       out[k] = redactSecrets(v, depth + 1, seen);

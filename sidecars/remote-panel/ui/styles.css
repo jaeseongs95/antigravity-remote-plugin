@@ -279,7 +279,8 @@ body {
 .kv-row {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--arp-border);
   font-size: 0.875rem;

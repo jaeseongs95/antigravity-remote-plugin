@@ -13,6 +13,17 @@ function computeSidecarFingerprint(sidecar) {
   return `${sidecar.sidecarId || ''}|${sidecar.host || '127.0.0.1'}|${sidecar.port || ''}|${sidecar.token || ''}`;
 }
 
+function buildDiscoveryFlightKey(context) {
+  if (!context || typeof context !== 'object' || !Array.isArray(context.workspaceUris)) {
+    return 'discovery:';
+  }
+  const normalized = context.workspaceUris
+    .filter((uri) => typeof uri === 'string' && uri.trim().length > 0)
+    .map((uri) => uri.trim())
+    .sort();
+  return `discovery:${normalized.join('\0')}`;
+}
+
 export class RemoteOrchestrator {
   #discoveryPort;
   #framePort;
@@ -51,7 +62,8 @@ export class RemoteOrchestrator {
   }
 
   async discoverAuthoritativeState(context = {}) {
-    return this.#singleFlight.run('discovery', async () => {
+    const flightKey = buildDiscoveryFlightKey(context);
+    return this.#singleFlight.run(flightKey, async () => {
       const [plugins, sidecars] = await Promise.all([
         this.#discoveryPort.listPlugins(context),
         this.#discoveryPort.listSidecars(context),
@@ -216,7 +228,7 @@ export class RemoteOrchestrator {
       }
     }
 
-    return { mountedIds, skippedIds, failedIds };
+    return { mountedIds, skippedIds, failedIds, activePlugins, activeSidecars };
   }
 
   getMountedBridgeIds() {

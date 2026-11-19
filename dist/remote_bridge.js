@@ -57,11 +57,15 @@ function redactUrl(rawUrl) {
   }
   return mutated ? parsed.toString() : rawUrl;
 }
-function isSensitiveKey(key) {
+var NUMERIC_TOKEN_METRIC_PATTERN = /^(?:used|max|total|input|output|cached|prompt|completion|context|remaining)[a-z0-9_]*token(?:s|limit|count)?$/i;
+function isSensitiveKey(key, value = void 0) {
   if (typeof key !== "string") {
     return false;
   }
   const normalized = key.trim();
+  if (typeof value === "number" && Number.isInteger(value) && Number.isFinite(value) && NUMERIC_TOKEN_METRIC_PATTERN.test(normalized)) {
+    return false;
+  }
   return SENSITIVE_KEY_PATTERN.test(normalized) || SENSITIVE_SUBSTRING_PATTERN.test(normalized);
 }
 function redactSecrets(value, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
@@ -93,7 +97,7 @@ function redactSecrets(value, depth = 0, seen = /* @__PURE__ */ new WeakSet()) {
   }
   const out = {};
   for (const [k, v] of Object.entries(value)) {
-    if (isSensitiveKey(k)) {
+    if (isSensitiveKey(k, v)) {
       out[k] = REDACTED;
     } else {
       out[k] = redactSecrets(v, depth + 1, seen);
@@ -808,6 +812,13 @@ function computeSidecarFingerprint(sidecar) {
   }
   return `${sidecar.sidecarId || ""}|${sidecar.host || "127.0.0.1"}|${sidecar.port || ""}|${sidecar.token || ""}`;
 }
+function buildDiscoveryFlightKey(context) {
+  if (!context || typeof context !== "object" || !Array.isArray(context.workspaceUris)) {
+    return "discovery:";
+  }
+  const normalized = context.workspaceUris.filter((uri) => typeof uri === "string" && uri.trim().length > 0).map((uri) => uri.trim()).sort();
+  return `discovery:${normalized.join("\0")}`;
+}
 var RemoteOrchestrator = class {
   #discoveryPort;
   #framePort;
@@ -842,7 +853,8 @@ var RemoteOrchestrator = class {
     };
   }
   async discoverAuthoritativeState(context = {}) {
-    return this.#singleFlight.run("discovery", async () => {
+    const flightKey = buildDiscoveryFlightKey(context);
+    return this.#singleFlight.run(flightKey, async () => {
       const [plugins, sidecars] = await Promise.all([
         this.#discoveryPort.listPlugins(context),
         this.#discoveryPort.listSidecars(context)
@@ -983,7 +995,7 @@ var RemoteOrchestrator = class {
         });
       }
     }
-    return { mountedIds, skippedIds, failedIds };
+    return { mountedIds, skippedIds, failedIds, activePlugins, activeSidecars };
   }
   getMountedBridgeIds() {
     return [...this.#mounted.keys()];

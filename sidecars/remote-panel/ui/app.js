@@ -25,18 +25,20 @@ const tabPanels = {
 let activeWorkspaces = [];
 let activeAbortController = null;
 let isCompacting = false;
+let lastStatusbarAvailable = false;
 
 function sidecarFetch(path, options = {}) {
-  if (window.sidecar && typeof window.sidecar.fetch === 'function') {
-    return window.sidecar.fetch(path, options);
-  }
-  return fetch(path, {
+  const mergedOptions = {
     ...options,
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {}),
     },
-  });
+  };
+  if (window.sidecar && typeof window.sidecar.fetch === 'function') {
+    return window.sidecar.fetch(path, mergedOptions);
+  }
+  return fetch(path, mergedOptions);
 }
 
 async function postJson(path, body, signal) {
@@ -133,7 +135,8 @@ function renderDiagnostics(mcpSummary, state) {
 }
 
 function renderTelemetry(telemetryResp, statusbarAvailable) {
-  if (!statusbarAvailable) {
+  lastStatusbarAvailable = Boolean(statusbarAvailable);
+  if (!lastStatusbarAvailable) {
     telemetrySummaryEl.textContent = '상태바 사이드카 비활성';
     telemetryDetailEl.textContent = 'antigravity-statusbar 플러그인이 활성화되면 토큰 사용량과 컨텍스트 정리를 사용할 수 있습니다.';
     progressFillEl.style.width = '0%';
@@ -218,6 +221,7 @@ async function refreshAll() {
     if (err.name === 'AbortError') {
       return;
     }
+    lastStatusbarAvailable = false;
     showError(err.message || '상태를 불러오지 못했습니다.');
     compactBtn.disabled = true;
   } finally {
@@ -228,7 +232,7 @@ async function refreshAll() {
 }
 
 async function triggerCompact() {
-  if (isCompacting) {
+  if (isCompacting || !lastStatusbarAvailable) {
     return;
   }
   isCompacting = true;
@@ -242,7 +246,7 @@ async function triggerCompact() {
     actionFeedbackEl.textContent = `컨텍스트 정리 실패: ${err.message}`;
   } finally {
     isCompacting = false;
-    compactBtn.disabled = false;
+    compactBtn.disabled = !lastStatusbarAvailable;
   }
 }
 
@@ -272,11 +276,36 @@ compactBtn.addEventListener('click', () => {
   void triggerCompact();
 });
 
-if (window.sidecar && typeof window.sidecar.onWorkspaceChange === 'function') {
-  window.sidecar.onWorkspaceChange((uris) => {
-    activeWorkspaces = Array.isArray(uris) ? uris : [];
-    void refreshAll();
-  });
+async function resolveInitialWorkspaces() {
+  if (!window.sidecar || typeof window.sidecar.getWorkspaceUris !== 'function') {
+    return [];
+  }
+  try {
+    const uris = await Promise.race([
+      window.sidecar.getWorkspaceUris(),
+      new Promise((resolve) => setTimeout(() => resolve([]), 300)),
+    ]);
+    return Array.isArray(uris) ? uris : [];
+  } catch (_err) {
+    return [];
+  }
 }
 
-void refreshAll();
+async function bootstrapPanel() {
+  activeWorkspaces = await resolveInitialWorkspaces();
+  if (window.sidecar && typeof window.sidecar.onWorkspaceChange === 'function') {
+    window.sidecar.onWorkspaceChange((uris) => {
+      const next = Array.isArray(uris) ? uris : [];
+      const changed =
+        next.length !== activeWorkspaces.length ||
+        next.some((uri, idx) => uri !== activeWorkspaces[idx]);
+      if (changed) {
+        activeWorkspaces = next;
+        void refreshAll();
+      }
+    });
+  }
+  await refreshAll();
+}
+
+void bootstrapPanel();

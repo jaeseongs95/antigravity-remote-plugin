@@ -7,8 +7,8 @@
 | ID | Case | Expected Oracle |
 |---|---|---|
 | ARP-TC-001 | Static scan of `src/core/`, `src/security/`, and `src/bridges/` for vendor literals, domain leakage, and reverse adapter->bridge imports | 0 matches across all files |
-| ARP-TC-002 | Static scan of entire `src/` for direct HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
-| ARP-TC-003 | Static scan of entire `src/` for forbidden legacy patterns and empty catch blocks (`catch {}`, `catch (e) {}`) | 0 matches across all files |
+| ARP-TC-002 | Static scan of entire `src/` and `sidecars/` for direct HTML sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`) | 0 matches across all files |
+| ARP-TC-003 | Static scan of entire `src/` and `sidecars/` for forbidden legacy patterns and empty catch blocks (`catch {}`, `catch (e) {}`) | 0 matches across all files |
 
 ## 2. Security Invariants (`test/security.test.js`)
 

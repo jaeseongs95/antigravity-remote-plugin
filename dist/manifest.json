@@ -3,13 +3,13 @@
   "version": "1.1.0",
   "bundler": "esbuild",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "75ca90062ca795d11030b57e67e3ff6897d4e6fba079889eb080aa17393d3e59",
+  "entrySha256": "23e9b9adf51bea6898421fec1fa91c87b9b50961b932af7d1535e30c06e23732",
   "moduleCount": 18,
   "modules": [
     {
       "path": "src/security/redactor.js",
-      "sha256": "f2d7232c399fb31caaf10398068c9bd7da2d3b8de131552a83775d88575bb4d2",
-      "bytes": 4486
+      "sha256": "33bf6d30c38a80b847a86c9b4c044178357fb41b35ffeea5d120e2de492944a1",
+      "bytes": 4841
     },
     {
       "path": "src/security/origin-policy.js",
@@ -48,8 +48,8 @@
     },
     {
       "path": "src/core/orchestrator.js",
-      "sha256": "143ecd3606950095ea3ca6dbd6219ddc345e2c21cb22e63b9864c8d8386073c7",
-      "bytes": 8577
+      "sha256": "fdfac4250297944e2e627bbb300e162708d73c67b42de0b1fc92e4601e12f4e6",
+      "bytes": 9032
     },
     {
       "path": "src/bridges/dom-overlay-bridge.js",
