@@ -6,6 +6,7 @@ const REQUIRED_ADDON_HOST_METHODS = Object.freeze([
   'unmountSlot',
   'injectStyle',
   'removeStyle',
+  'listOwnedSlots',
   'onDispose',
   'dispose',
 ]);
@@ -13,9 +14,13 @@ const REQUIRED_ADDON_HOST_METHODS = Object.freeze([
 /**
  * Desktop AddonManifest.v1 adapter implementing HostSurfacePort strictly
  * through the scoped capability handle (`addonHost`) injected by the host loader.
- * Never touches document.head, host binary archives, or unowned DOM directly.
+ *
+ * Pre-subscribes to `addonHost.onDispose(...)` before any consumer callback so
+ * host-initiated `addonHost.dispose()` marks `disposed = true` first and allows
+ * consumer teardown (`removeStyle`/`unmountSlot`) to return `false` safely without
+ * throwing `ERR_HANDLE_DISPOSED`.
  */
-export function createAddonHostSurfaceAdapter(addonHost) {
+export function createAddonHostSurfaceAdapter(addonHost, { diagnostics = null } = {}) {
   if (!addonHost || typeof addonHost !== 'object') {
     throw new SecurityPolicyError(
       'ERR_MISSING_ADDON_HOST',
@@ -27,6 +32,34 @@ export function createAddonHostSurfaceAdapter(addonHost) {
   let disposed = false;
   const ownedSlots = new Set();
   const ownedStyles = new Set();
+  const localDisposers = [];
+
+  function runLocalTeardown() {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    for (const fn of localDisposers.splice(0, localDisposers.length).reverse()) {
+      try {
+        fn();
+      } catch (err) {
+        if (diagnostics && typeof diagnostics.emit === 'function') {
+          diagnostics.emit({
+            level: 'error',
+            code: 'SURFACE_DISPOSER_FAILED',
+            source: 'adapter.addon-host-surface',
+            message: 'Desktop surface disposer threw during teardown',
+            detail: err,
+          });
+        }
+      }
+    }
+    ownedSlots.clear();
+    ownedStyles.clear();
+  }
+
+  // F4: Pre-subscribe to host disposal so `disposed = true` is set BEFORE consumer disposers run.
+  addonHost.onDispose(runLocalTeardown);
 
   return Object.freeze({
     pluginId: typeof addonHost.pluginId === 'string' ? addonHost.pluginId : 'antigravity-remote-plugin',
@@ -70,6 +103,9 @@ export function createAddonHostSurfaceAdapter(addonHost) {
     },
 
     listOwnedSlots() {
+      if (disposed) {
+        return [];
+      }
       return [...ownedSlots];
     },
 
@@ -77,16 +113,14 @@ export function createAddonHostSurfaceAdapter(addonHost) {
       if (disposed || typeof fn !== 'function') {
         return;
       }
-      addonHost.onDispose(fn);
+      localDisposers.push(fn);
     },
 
     dispose() {
       if (disposed) {
         return;
       }
-      disposed = true;
-      ownedSlots.clear();
-      ownedStyles.clear();
+      runLocalTeardown();
       addonHost.dispose();
     },
   });

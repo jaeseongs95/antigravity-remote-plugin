@@ -187,7 +187,13 @@ export function validateRemotePlugin(plugin) {
   ) {
     throw new SecurityPolicyError('ERR_INVALID_SLOT_ID', 'Invalid uiSlot.slotId.');
   }
-  const exclusive = Boolean(plugin.uiSlot.exclusive);
+  if (plugin.uiSlot.exclusive !== undefined && typeof plugin.uiSlot.exclusive !== 'boolean') {
+    throw new SecurityPolicyError(
+      'ERR_INVALID_EXCLUSIVE_FLAG',
+      'uiSlot.exclusive must be a boolean when provided.',
+    );
+  }
+  const exclusive = plugin.uiSlot.exclusive === true;
 
   if (!Array.isArray(plugin.capabilities) || plugin.capabilities.length === 0) {
     throw new SecurityPolicyError(

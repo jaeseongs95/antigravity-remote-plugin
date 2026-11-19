@@ -80,7 +80,7 @@ export function mountDesktopCompanionView({
   const userscriptPath =
     typeof remoteArtifacts.userscriptPath === 'string' && remoteArtifacts.userscriptPath.trim()
       ? remoteArtifacts.userscriptPath.trim()
-      : 'dist/remote-companion.user.js';
+      : 'dist/remote-plugin.user.js';
 
   async function copyText(text, successKey) {
     if (!clipboard || typeof clipboard.writeText !== 'function') {

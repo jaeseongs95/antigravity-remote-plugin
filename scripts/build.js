@@ -25,6 +25,7 @@ const LIBRARY_SOURCE_FILES = [
   'src/bridges/dom-overlay-bridge.js',
   'src/bridges/sidecar-ui-bridge.js',
   'src/bridges/mcp-extension-slot.js',
+  'src/bridges/remote-plugin-port-bridge.js',
   'src/adapters/addon-host/addon-host-surface-adapter.js',
   'src/adapters/remote-web/shadow-surface-adapter.js',
   'src/adapters/antigravity/discovery-adapter.js',
@@ -33,7 +34,8 @@ const LIBRARY_SOURCE_FILES = [
   'src/adapters/antigravity/settings-adapter.js',
   'src/adapters/antigravity/theme-workspace-adapter.js',
   'src/runtime/bootstrap.js',
-  'src/runtime/remote-host-runtime.js',
+  'src/runtime/desktop-addon-runtime.js',
+  'src/runtime/remote-web-runtime.js',
 ];
 
 const ALL_SOURCE_FILES = [

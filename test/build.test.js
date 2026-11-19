@@ -17,7 +17,7 @@ function readLf(path) {
   return readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
 }
 
-test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matching committed dist/ byte-for-byte with zero prod test hooks and side-effect-free ESM import', async () => {
+test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matching committed dist/ byte-for-byte with zero prod test hooks or getSlotRoot backdoors and side-effect-free ESM import', async () => {
   const outDirA = mkdtempSync(join(tmpdir(), 'arp-build-a-'));
   const outDirB = mkdtempSync(join(tmpdir(), 'arp-build-b-'));
   const isolatedDir = mkdtempSync(join(tmpdir(), 'arp-standalone-'));
@@ -36,8 +36,8 @@ test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matc
     assert.equal(addonManifest.version, pkg.version);
     assert.equal(manifestA.version, pkg.version);
     assert.equal(manifestA.bundler, 'esbuild');
-    assert.equal(manifestA.moduleCount, 28);
-    assert.equal(manifestA.modules.length, 28);
+    assert.equal(manifestA.moduleCount, 30);
+    assert.equal(manifestA.modules.length, 30);
 
     const files = [
       'remote_bridge.js',
@@ -61,7 +61,6 @@ test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matc
     const userscript = readLf(join(outDirA, 'antigravity-remote.user.js'));
     const bookmarklet = readLf(join(outDirA, 'bookmarklet.txt'));
 
-    // Verify all 4 artifact SHA-256 digests + addon-manifest.json digest.
     assert.equal(manifestA.entrySha256, sha256(bundle));
     assert.equal(manifestA.artifacts.esm.sha256, sha256(bundle));
     assert.equal(manifestA.artifacts.addonRenderer.sha256, sha256(addonRenderer));
@@ -69,14 +68,12 @@ test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matc
     assert.equal(manifestA.artifacts.bookmarklet.sha256, sha256(bookmarklet));
     assert.equal(manifestA.addonManifestSha256, sha256(readLf(join(ROOT, 'addon-manifest.json'))));
 
-    // Verify Userscript metadata block & Bookmarklet prefix.
     assert.ok(userscript.startsWith('// ==UserScript==\n'));
     assert.ok(userscript.includes('@match        https://antigravity.google.com/*'));
     assert.ok(userscript.includes('@grant        none'));
     assert.ok(bookmarklet.startsWith('javascript:'));
     assert.ok(!bookmarklet.trim().includes('\n'), 'bookmarklet must be single-line');
 
-    // Verify zero forbidden legacy patterns or production test hooks in all bundles.
     for (const [label, text] of [
       ['remote_bridge.js', bundle],
       ['addon-renderer.js', addonRenderer],
@@ -86,6 +83,7 @@ test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matc
       assert.ok(!/__ARP_ALLOWED_ORIGINS__/.test(text), `${label} leaked __ARP_ALLOWED_ORIGINS__`);
       assert.ok(!/__ARP_TRANSLATE_ENDPOINT__/.test(text), `${label} leaked __ARP_TRANSLATE_ENDPOINT__`);
       assert.ok(!/__agyCreateKoTranslator/.test(text), `${label} leaked __agyCreateKoTranslator`);
+      assert.ok(!/\bgetSlotRoot\b/.test(text), `${label} leaked getSlotRoot backdoor`);
       assert.ok(!/statusbar_autoinject/i.test(text), `${label} leaked statusbar_autoinject`);
       assert.ok(!/app\.asar/i.test(text), `${label} leaked app.asar`);
     }
@@ -107,6 +105,9 @@ test('ARP-TC-019 & ARP-TC-024: esbuild emits deterministic 4-artifact build matc
     assert.equal(typeof loaded.mountDesktopAddon, 'function');
     assert.equal(typeof loaded.RemotePluginRegistry, 'function');
     assert.equal(typeof loaded.createDeclarativeSlotRenderer, 'function');
+    assert.equal(typeof loaded.attachRemotePluginPortBridge, 'function');
+    assert.equal(typeof loaded.serveRemotePluginOverPort, 'function');
+    assert.equal(typeof loaded.connectPluginHandshake, 'function');
   } finally {
     rmSync(outDirA, { recursive: true, force: true });
     rmSync(outDirB, { recursive: true, force: true });

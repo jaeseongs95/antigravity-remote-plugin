@@ -3,31 +3,31 @@
   "version": "2.0.0",
   "bundler": "esbuild",
   "entry": "dist/remote_bridge.js",
-  "entrySha256": "8cea9d0eee1d3c9ce42f2aada3a61084c15ca344f936b2eb755fb15b7088bb31",
+  "entrySha256": "eb9b506827c380b75b1f64d29407601f4a1c3d65a7cdbbdaa76f860046f65b9b",
   "addonManifestSha256": "1a412c40847348aaf2e891a303ba48d59c76a985f8090b6c1114f78fe8be58c7",
   "artifacts": {
     "esm": {
       "path": "dist/remote_bridge.js",
-      "sha256": "8cea9d0eee1d3c9ce42f2aada3a61084c15ca344f936b2eb755fb15b7088bb31",
-      "bytes": 155566
+      "sha256": "eb9b506827c380b75b1f64d29407601f4a1c3d65a7cdbbdaa76f860046f65b9b",
+      "bytes": 176696
     },
     "addonRenderer": {
       "path": "dist/addon-renderer.js",
-      "sha256": "69916f61e5e4768ec8b48e739a294e8149b1e7f0d084064d9f8477f189e52d44",
-      "bytes": 129493
+      "sha256": "b91cfb25079a4635ab137924a96f20c4004fe8b88e6fc6a7698d4d7f48d775f7",
+      "bytes": 126105
     },
     "userscript": {
       "path": "dist/antigravity-remote.user.js",
-      "sha256": "aef0460b0ea02d8de9a370f0c9bb8a72a9c89ed16d1d1766785f81d3857a092b",
-      "bytes": 89776
+      "sha256": "e2aae892e17917bd29ebb07cfb869eb36078e68595250f8d872cdde2d1561555",
+      "bytes": 100289
     },
     "bookmarklet": {
       "path": "dist/bookmarklet.txt",
-      "sha256": "4577632f1442ca1c09cfd657ff5bf4ae98c6b38336755a7e9a327d4e74c35cbe",
-      "bytes": 50263
+      "sha256": "2d414891b192dddf0014d6c85ab00ce1a7f7036d32857c144c36f2de174d3c37",
+      "bytes": 53163
     }
   },
-  "moduleCount": 28,
+  "moduleCount": 30,
   "modules": [
     {
       "path": "src/security/redactor.js",
@@ -56,8 +56,8 @@
     },
     {
       "path": "src/security/plugin-handshake.js",
-      "sha256": "7b49409781fcd8902579e9a965c1f323e9a2338d6c544b096043bba6ee123097",
-      "bytes": 4541
+      "sha256": "15cf1a6da63f9ca099edded3174a11ff0dbfdfa31182f0ab2bae4f0feae2b09f",
+      "bytes": 10092
     },
     {
       "path": "src/core/diagnostics.js",
@@ -71,8 +71,8 @@
     },
     {
       "path": "src/core/ports.js",
-      "sha256": "55f131a33ec2c2ceee1def756714d66094b43ad66609ddcc4648cfd0c0e6f20a",
-      "bytes": 2507
+      "sha256": "e25b0f914948ebeb36a1033c577a3f069ea1911de375b7a2c5c30de516059fcf",
+      "bytes": 2529
     },
     {
       "path": "src/core/orchestrator.js",
@@ -81,8 +81,8 @@
     },
     {
       "path": "src/core/remote-plugin-contract.js",
-      "sha256": "93a422cfbc163a5c8781924fa20b60c52c8e7cf3209fb36bc21714ea73b3c967",
-      "bytes": 21497
+      "sha256": "9c43dd1ad4d4abff9a07f292315a532d5d824f154c744cb83d051138956586f2",
+      "bytes": 21733
     },
     {
       "path": "src/core/remote-plugin-registry.js",
@@ -91,13 +91,13 @@
     },
     {
       "path": "src/core/declarative-slot-renderer.js",
-      "sha256": "25a60991f729cc43b10a4dcd9e5ba757dc0a69cbb6e40f03dad6d21de260e390",
-      "bytes": 27838
+      "sha256": "455c8d0824cd292d38d63203623bbbb60cf5f984513cff6d7573e0f318a1e636",
+      "bytes": 30512
     },
     {
       "path": "src/core/desktop-companion-view.js",
-      "sha256": "7bb6395e6b9c868e65dcb4b65679e5ff275231389aeb351b3ce6fe75deaafe79",
-      "bytes": 8722
+      "sha256": "365ca8852ac22632c6a4175da4d5885dddf92b54631bd28e0b11c2b3f74593cb",
+      "bytes": 8719
     },
     {
       "path": "src/bridges/dom-overlay-bridge.js",
@@ -115,9 +115,14 @@
       "bytes": 5195
     },
     {
+      "path": "src/bridges/remote-plugin-port-bridge.js",
+      "sha256": "ba52af2ba3491ac9bb2b7a2a70520f85991602c2661f4b2fa227c98dd652829d",
+      "bytes": 12377
+    },
+    {
       "path": "src/adapters/addon-host/addon-host-surface-adapter.js",
-      "sha256": "b69f59c78e97e4d6c708aa2f3021836dfa40c74aa7ab33890fee0d94feb40b32",
-      "bytes": 2717
+      "sha256": "16c3b4c26eebec17e9be2779d99d3c951e974b4516a9739c363af96c826adb1c",
+      "bytes": 3771
     },
     {
       "path": "src/adapters/remote-web/shadow-surface-adapter.js",
@@ -155,19 +160,24 @@
       "bytes": 4531
     },
     {
-      "path": "src/runtime/remote-host-runtime.js",
-      "sha256": "73ad699e2f5e160c3d68525d7ec76ebae5f1fe89605d7653684dd8166a9b1ef5",
-      "bytes": 5142
+      "path": "src/runtime/desktop-addon-runtime.js",
+      "sha256": "a09ca7a01a719142944cf75d8f276c77d22c472b20f3639e082927171c50c9c8",
+      "bytes": 1270
+    },
+    {
+      "path": "src/runtime/remote-web-runtime.js",
+      "sha256": "79e9669b6d6af1d3b5641c2f42de34da7db9ec4dcabbe762bc16601fa1fd587b",
+      "bytes": 5738
     },
     {
       "path": "src/runtime/remote-web-entry.js",
-      "sha256": "6adebacd419ffa7224c4d8ec47261fc89ecebb941b22e860945865205561c887",
-      "bytes": 442
+      "sha256": "fdaf0af4d4059c0f2a59587ed60bae0d0d9c312dde56d5378709b4bed6b7cc9f",
+      "bytes": 441
     },
     {
       "path": "src/runtime/addon-renderer-entry.js",
-      "sha256": "e11aab838f39d504e1b449d8dac69be0ca0f51eea546f752afd4661b00dae7b5",
-      "bytes": 669
+      "sha256": "67cd0edbeede19d421bdc40d57aeefc02907a9c9635690b169b55edaf303fde8",
+      "bytes": 671
     }
   ]
 }

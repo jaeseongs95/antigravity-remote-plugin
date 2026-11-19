@@ -1,4 +1,4 @@
-import { mountRemotePluginHost } from './remote-host-runtime.js';
+import { mountRemotePluginHost } from './remote-web-runtime.js';
 
 function bootRemoteWebHost() {
   if (typeof window === 'undefined' || typeof document === 'undefined') {

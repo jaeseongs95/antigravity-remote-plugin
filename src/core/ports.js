@@ -22,6 +22,7 @@ export const PORT_CONTRACTS = Object.freeze({
     'unmountSlot',
     'injectStyle',
     'removeStyle',
+    'listOwnedSlots',
     'onDispose',
     'dispose',
   ]),

@@ -1,4 +1,4 @@
-import { mountDesktopAddon } from './remote-host-runtime.js';
+import { mountDesktopAddon } from './desktop-addon-runtime.js';
 
 /* global addonHost, __ARP_EMBEDDED_BOOKMARKLET__ */
 const EMBEDDED_BOOKMARKLET =

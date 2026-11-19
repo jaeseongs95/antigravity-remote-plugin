@@ -11,11 +11,25 @@ import { validateHostSurfacePort } from '../src/core/ports.js';
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const ADDON_HOST_CLI = resolve(ROOT, '..', 'antigravity-native-addon-host', 'bin', 'addon-host.js');
 
+const ALLOWED_ADDON_SLOTS = new Set([
+  'title-bar',
+  'sidebar',
+  'status-bar',
+  'composer-toolbar',
+  'settings-pane',
+  'aux-pane',
+  'modal',
+  'overlay',
+  'theme',
+  'document-transform',
+  'custom',
+]);
+
 function createMiniDom() {
   const makeEl = (tagName) => {
     const attrs = new Map();
     const listeners = new Map();
-    const el = {
+    return {
       tagName: tagName.toUpperCase(),
       childNodes: [],
       parentNode: null,
@@ -51,13 +65,7 @@ function createMiniDom() {
       removeEventListener(type, fn) {
         listeners.get(type)?.delete(fn);
       },
-      click() {
-        for (const fn of [...(listeners.get('click') || [])]) {
-          fn();
-        }
-      },
     };
-    return el;
   };
   const body = makeEl('body');
   const head = makeEl('head');
@@ -69,18 +77,32 @@ function createMiniDom() {
   };
 }
 
-function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-plugin.settings']) {
+/**
+ * Strict mock mirroring real antigravity-native-addon-host (`host-loader-builder.js:183-334`):
+ * - Every mutating method calls `assertNotDisposed()` throwing `ERR_HANDLE_DISPOSED:<pluginId>`.
+ * - `dispose()` sets `disposed = true` FIRST before invoking `onDispose` callbacks, and captures
+ *   any callback throw in `disposerErrors` so tests detect LSP violations immediately.
+ */
+function createStrictScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-plugin.settings']) {
   const allowed = new Set(declaredSlotIds);
   const slots = new Map();
   const styles = new Map();
   const disposers = [];
-  let disposed = false;
   const calls = [];
+  const disposerErrors = [];
+  let disposed = false;
+
+  function assertNotDisposed() {
+    if (disposed) {
+      throw new Error('ERR_HANDLE_DISPOSED:antigravity-remote-plugin');
+    }
+  }
 
   return {
     calls,
     slots,
     styles,
+    disposerErrors,
     handle: Object.freeze({
       pluginId: 'antigravity-remote-plugin',
       hostVersion: '1.0.1',
@@ -91,7 +113,7 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
         return '[data-addon-host-owner], [translate="no"], [data-agy-no-translate="true"]';
       },
       mountSlot(slotId, parentEl) {
-        if (disposed) throw new Error('ERR_HANDLE_DISPOSED');
+        assertNotDisposed();
         if (!allowed.has(slotId)) throw new Error(`ERR_UNDECLARED_SLOT:${slotId}`);
         calls.push(['mountSlot', slotId]);
         if (!slots.has(slotId)) {
@@ -105,6 +127,7 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
         return slots.get(slotId);
       },
       unmountSlot(slotId) {
+        assertNotDisposed();
         calls.push(['unmountSlot', slotId]);
         const el = slots.get(slotId);
         if (!el) return false;
@@ -113,7 +136,7 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
         return true;
       },
       injectStyle(styleId, cssText) {
-        if (disposed) throw new Error('ERR_HANDLE_DISPOSED');
+        assertNotDisposed();
         calls.push(['injectStyle', styleId]);
         let st = styles.get(styleId);
         if (!st) {
@@ -126,6 +149,7 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
         return st;
       },
       removeStyle(styleId) {
+        assertNotDisposed();
         calls.push(['removeStyle', styleId]);
         return styles.delete(styleId);
       },
@@ -133,14 +157,20 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
         return [...slots.keys()];
       },
       onDispose(fn) {
+        assertNotDisposed();
         if (typeof fn === 'function') disposers.push(fn);
       },
       dispose() {
         if (disposed) return;
+        // Exact host-loader-builder.js ordering: set disposed = true BEFORE invoking disposers.
         disposed = true;
         calls.push(['dispose']);
         for (const fn of disposers.splice(0, disposers.length)) {
-          fn();
+          try {
+            fn();
+          } catch (err) {
+            disposerErrors.push(err);
+          }
         }
         for (const [k, el] of slots.entries()) {
           el.parentNode?.removeChild(el);
@@ -152,17 +182,26 @@ function createScopedMockAddonHost(doc, declaredSlotIds = ['antigravity-remote-p
   };
 }
 
-test('ARP-TC-026: addon-manifest.json conforms to AddonManifest.v1, passes real addon-host --validate, and dist/addon-renderer.js uses strictly addonHost capability API', () => {
+test('ARP-TC-026: addon-manifest.json satisfies AddonManifest.v1 invariants (+ real addon-host --validate when present) and dist/addon-renderer.js survives real host-initiated addonHost.dispose() with zero ERR_HANDLE_DISPOSED throws', () => {
   const manifestPath = join(ROOT, 'addon-manifest.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
+  // Always enforce strict AddonManifest.v1 schema invariants (works in both standalone CI and local dev)
   assert.equal(manifest.schemaVersion, 1);
+  assert.match(manifest.pluginId, /^[a-z0-9][a-z0-9._-]{1,63}$/);
   assert.equal(manifest.pluginId, 'antigravity-remote-plugin');
+  assert.match(manifest.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
   assert.deepEqual(manifest.capabilities, ['renderer']);
   assert.equal(manifest.entry.rendererScript, 'dist/addon-renderer.js');
+  assert.equal(manifest.entry.mainHookScript ?? null, null);
+  assert.ok(!manifest.entry.rendererScript.includes('..'));
+  assert.ok(existsSync(join(ROOT, manifest.entry.rendererScript)));
+  assert.equal(manifest.uiSlots.length, 1);
+  assert.ok(ALLOWED_ADDON_SLOTS.has(manifest.uiSlots[0].slot));
   assert.equal(manifest.uiSlots[0].slot, 'settings-pane');
   assert.equal(manifest.uiSlots[0].slotId, 'antigravity-remote-plugin.settings');
   assert.equal(manifest.uiSlots[0].exclusive, false);
+  assert.equal(manifest.uiSlots[0].scope, 'addon-owned-slot');
   assert.equal(manifest.isolation.noTranslate, true);
   assert.equal(manifest.isolation.i18nSelfManaged, true);
   assert.equal(manifest.isolation.respectsNoTranslate, true);
@@ -174,53 +213,49 @@ test('ARP-TC-026: addon-manifest.json conforms to AddonManifest.v1, passes real 
       cwd: ROOT,
       encoding: 'utf8',
     });
-    assert.ok(out.toLowerCase().includes('valid') || out.includes('antigravity-remote-plugin'));
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.pluginId, 'antigravity-remote-plugin');
   }
 
-  // Execute the real built dist/addon-renderer.js inside the exact host wrapper shape: (function(addonHost){ ... })
+  // Execute real built dist/addon-renderer.js inside strict host wrapper matching host-loader-builder.js
   const rendererSource = readFileSync(join(ROOT, 'dist/addon-renderer.js'), 'utf8');
   const doc = createMiniDom();
-  const mockHost = createScopedMockAddonHost(doc);
-  const copied = [];
-  const fakeNav = {
-    clipboard: {
-      async writeText(text) {
-        copied.push(text);
-      },
-    },
-  };
+  const mockHost = createStrictScopedMockAddonHost(doc);
+  const fakeNav = { clipboard: { async writeText() {} } };
 
   const runner = new Function('addonHost', 'document', 'navigator', rendererSource);
   runner(mockHost.handle, doc, fakeNav);
 
-  // Must mount ONLY declared slot & inject style strictly via addonHost (0 direct document.head writes)
   assert.equal(doc.head.childNodes.length, 0);
   assert.deepEqual(mockHost.handle.listOwnedSlots(), ['antigravity-remote-plugin.settings']);
   assert.equal(mockHost.styles.size, 1);
-  assert.ok(mockHost.calls.some(([op, arg]) => op === 'mountSlot' && arg === 'antigravity-remote-plugin.settings'));
-  assert.ok(mockHost.calls.some(([op]) => op === 'injectStyle'));
 
-  // Disposing handle removes slot & style completely
+  // F4: Host-initiated addonHost.dispose() MUST NOT throw ERR_HANDLE_DISPOSED inside onDispose!
   mockHost.handle.dispose();
+  assert.deepEqual(mockHost.disposerErrors, [], 'addonHost.dispose() must not trigger ERR_HANDLE_DISPOSED in consumer disposers');
   assert.equal(mockHost.slots.size, 0);
   assert.equal(mockHost.styles.size, 0);
   assert.equal(doc.body.childNodes.length, 0);
 });
 
-test('ARP-TC-027: HostSurfacePort LSP substitutability holds identically across AddonHostSurfaceAdapter and ShadowSurfaceAdapter', () => {
-  const docDesktop = createMiniDom();
-  const mockHost = createScopedMockAddonHost(docDesktop, ['slot.alpha']);
-  const desktopSurface = createAddonHostSurfaceAdapter(mockHost.handle);
+test('ARP-TC-027: HostSurfacePort (including listOwnedSlots) LSP substitutability holds across AddonHostSurfaceAdapter (both host & consumer dispose) and ShadowSurfaceAdapter', () => {
+  // 1) Consumer-initiated dispose parity across both adapters
+  const docDesktopA = createMiniDom();
+  const mockHostA = createStrictScopedMockAddonHost(docDesktopA, ['slot.alpha']);
+  const desktopSurfaceA = createAddonHostSurfaceAdapter(mockHostA.handle);
 
   const docWeb = createMiniDom();
   const webSurface = createShadowSurfaceAdapter({ doc: docWeb, ownerId: 'test-owner' });
 
-  for (const surface of [desktopSurface, webSurface]) {
+  for (const surface of [desktopSurfaceA, webSurface]) {
     validateHostSurfacePort(surface);
 
     let disposeCalled = 0;
     surface.onDispose(() => {
       disposeCalled += 1;
+      assert.equal(surface.removeStyle('theme'), false);
+      assert.equal(surface.unmountSlot('slot.alpha'), false);
     });
 
     const el = surface.mountSlot('slot.alpha');
@@ -229,12 +264,32 @@ test('ARP-TC-027: HostSurfacePort LSP substitutability holds identically across 
 
     const st = surface.injectStyle('theme', '.x { color: red; }');
     assert.ok(st);
-    assert.equal(surface.removeStyle('theme'), true);
-    assert.equal(surface.unmountSlot('slot.alpha'), true);
 
     surface.dispose();
     surface.dispose(); // idempotent
     assert.equal(disposeCalled, 1);
-    assert.throws(() => surface.mountSlot('slot.alpha'));
+    assert.deepEqual(surface.listOwnedSlots(), []);
+    assert.equal(surface.removeStyle('theme'), false);
+    assert.equal(surface.unmountSlot('slot.alpha'), false);
+    assert.throws(() => surface.mountSlot('slot.alpha'), (err) => err.code === 'ERR_SURFACE_DISPOSED');
   }
+  assert.deepEqual(mockHostA.disposerErrors, []);
+
+  // 2) Host-initiated addonHost.dispose() parity
+  const docDesktopB = createMiniDom();
+  const mockHostB = createStrictScopedMockAddonHost(docDesktopB, ['slot.beta']);
+  const desktopSurfaceB = createAddonHostSurfaceAdapter(mockHostB.handle);
+  let consumerDisposeCount = 0;
+  desktopSurfaceB.mountSlot('slot.beta');
+  desktopSurfaceB.injectStyle('s1', '.b{}');
+  desktopSurfaceB.onDispose(() => {
+    consumerDisposeCount += 1;
+    assert.equal(desktopSurfaceB.removeStyle('s1'), false);
+    assert.equal(desktopSurfaceB.unmountSlot('slot.beta'), false);
+  });
+  mockHostB.handle.dispose();
+  assert.equal(consumerDisposeCount, 1);
+  assert.deepEqual(mockHostB.disposerErrors, []);
+  assert.deepEqual(desktopSurfaceB.listOwnedSlots(), []);
+  assert.throws(() => desktopSurfaceB.mountSlot('slot.beta'), (err) => err.code === 'ERR_SURFACE_DISPOSED');
 });

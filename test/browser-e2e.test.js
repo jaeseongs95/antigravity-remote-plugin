@@ -59,6 +59,85 @@ function startHttpServer(handler) {
   });
 }
 
+// --- Chromium CDP helpers to inspect & interact with real Closed Shadow DOM (zero prod backdoors) ---
+
+function getAttr(node, name) {
+  const attrs = node?.attributes || [];
+  for (let i = 0; i < attrs.length; i += 2) {
+    if (attrs[i] === name) return attrs[i + 1];
+  }
+  return null;
+}
+
+function hasAttr(node, name) {
+  const attrs = node?.attributes || [];
+  for (let i = 0; i < attrs.length; i += 2) {
+    if (attrs[i] === name) return true;
+  }
+  return false;
+}
+
+function walkCdpTree(node, visitor) {
+  if (!node) return;
+  visitor(node);
+  for (const sr of node.shadowRoots || []) {
+    walkCdpTree(sr, visitor);
+  }
+  for (const child of node.children || []) {
+    walkCdpTree(child, visitor);
+  }
+}
+
+function cdpNodeText(node) {
+  if (!node) return '';
+  if (node.nodeType === 3) return node.nodeValue || '';
+  let out = '';
+  for (const sr of node.shadowRoots || []) out += cdpNodeText(sr);
+  for (const child of node.children || []) out += cdpNodeText(child);
+  return out;
+}
+
+async function getPiercedRoot(cdp) {
+  const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+  return root;
+}
+
+function findCdpNode(root, predicate) {
+  let found = null;
+  walkCdpTree(root, (n) => {
+    if (!found && predicate(n)) found = n;
+  });
+  return found;
+}
+
+async function getCdpBox(cdp, node) {
+  const { model } = await cdp.send('DOM.getBoxModel', { backendNodeId: node.backendNodeId });
+  const q = model.border;
+  const xs = [q[0], q[2], q[4], q[6]];
+  const ys = [q[1], q[3], q[5], q[7]];
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX,
+    height: maxY - minY,
+    cx: (minX + maxX) / 2,
+    cy: (minY + maxY) / 2,
+  };
+}
+
+async function clickCdpNode(page, cdp, predicate) {
+  const root = await getPiercedRoot(cdp);
+  const node = findCdpNode(root, predicate);
+  assert.ok(node, 'Expected node inside Closed Shadow DOM to exist');
+  const box = await getCdpBox(cdp, node);
+  await page.mouse.click(box.cx, box.cy);
+  return { node, box };
+}
+
 test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestrator, TrustedTypes reuse, Worker Blob, iframe load/postMessage/SOURCE_MISMATCH, same-origin ORIGIN_MISMATCH & promotion, dispose(), and cross-origin DOMException', async () => {
   const bundleSource = readFileSync(join(ROOT, 'dist/remote_bridge.js'), 'utf8');
   const REAL_CSRF = 'real-browser-csrf-token-1234';
@@ -357,15 +436,15 @@ test('ARP-TC-023: Playwright Chromium E2E verifies default window.fetch orchestr
   }
 });
 
-test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real Userscript & real javascript: Bookmarklet on https://antigravity.google.com/remote (zero prod test hooks), enforces fail-closed untrusted origin, and renders RemotePlugin.v1 plugins in their declared slots', async () => {
+test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E verifies untrusted origin spoofing fail-closed (Userscript + Bookmarklet), locked-down window.antigravityRemoteHost, and impenetrable Closed Shadow DOM via CDP (zero getSlotRoot backdoor)', async () => {
   const userscriptSource = readFileSync(join(ROOT, 'dist/antigravity-remote.user.js'), 'utf8');
   const bookmarkletHref = readFileSync(join(ROOT, 'dist/bookmarklet.txt'), 'utf8').trim();
   assert.ok(bookmarkletHref.startsWith('javascript:'));
 
   const browser = await launchChromium();
   try {
-    // 1) Fail-closed check on untrusted origin (zero test hooks in production bundle!)
-    {
+    // 1) F2 & NB4: Untrusted origin fail-closed for BOTH Userscript AND Bookmarklet, even with spoofed window.antigravityRemoteHost!
+    for (const evilMode of ['userscript', 'bookmarklet']) {
       const context = await browser.newContext();
       const page = await context.newPage();
       await page.route('https://evil.example/**', (route) =>
@@ -376,13 +455,36 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
         }),
       );
       await page.goto('https://evil.example/remote', { waitUntil: 'domcontentloaded' });
-      await page.addScriptTag({ content: userscriptSource });
-      const mountedOnEvil = await page.evaluate(() => Boolean(window.antigravityRemoteHost));
-      assert.equal(mountedOnEvil, false, 'Production bundle must refuse to mount on untrusted origin');
+      await page.evaluate(() => {
+        window.__spoofCalled = false;
+        window.antigravityRemoteHost = {
+          toggleDock() {
+            window.__spoofCalled = true;
+          },
+        };
+      });
+      if (evilMode === 'userscript') {
+        await page.addScriptTag({ content: userscriptSource });
+      } else {
+        await page.evaluate((bmHref) => {
+          const a = document.createElement('a');
+          a.id = 'evil-bm';
+          a.href = bmHref;
+          document.body.appendChild(a);
+          a.click();
+        }, bookmarkletHref);
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      const evilState = await page.evaluate(() => ({
+        spoofCalled: window.__spoofCalled,
+        surfaceCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
+      }));
+      assert.equal(evilState.spoofCalled, false, `${evilMode}: isOriginAllowed must execute BEFORE touching window.antigravityRemoteHost`);
+      assert.equal(evilState.surfaceCount, 0, `${evilMode}: must refuse to mount on untrusted origin`);
       await context.close();
     }
 
-    // 2) Trusted real origin https://antigravity.google.com/remote on Desktop (Userscript) and Mobile 390x844 (real javascript: Bookmarklet)
+    // 2) Trusted real origin https://antigravity.google.com/remote (Desktop Userscript + Mobile 390x844 Bookmarklet)
     const scenarios = [
       { mode: 'userscript', viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false },
       { mode: 'bookmarklet', viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true },
@@ -395,6 +497,7 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
         hasTouch: sc.hasTouch,
       });
       const page = await context.newPage();
+      const cdp = await context.newCDPSession(page);
       const errors = [];
       page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
       page.on('console', (msg) => {
@@ -408,7 +511,8 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
           status: 200,
           contentType: 'text/html; charset=utf-8',
           headers: {
-            'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'",
+            'Content-Security-Policy':
+              "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'self'",
           },
           body: `<!doctype html>
             <html lang="en">
@@ -429,7 +533,6 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
       if (sc.mode === 'userscript') {
         await page.addScriptTag({ content: userscriptSource });
       } else {
-        // Real javascript: URL execution (not addScriptTag bypass!)
         await page.evaluate((bmHref) => {
           const a = document.createElement('a');
           a.id = 'run-bookmarklet';
@@ -442,23 +545,48 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
 
       await page.waitForFunction(() => Boolean(window.antigravityRemoteHost));
 
-      // Verify Closed Shadow DOM isolation: hostElement.shadowRoot MUST be null!
-      const shadowCheck = await page.evaluate(() => {
+      // F2: Verify locked-down global surface — zero renderer/getSlotRoot/registry/diagnostics/unregister/issueHandshakeNonce/dispose
+      const surfaceAudit = await page.evaluate(() => {
         const hostEl = document.querySelector('[data-remote-host-surface="closed-shadow"]');
+        const api = window.antigravityRemoteHost;
         return {
           exists: Boolean(hostEl),
           shadowRootIsNull: hostEl ? hostEl.shadowRoot === null : false,
           noTranslate: hostEl ? hostEl.getAttribute('translate') : null,
+          keys: Object.keys(api).sort(),
+          frozen: Object.isFrozen(api),
+          hasRenderer: 'renderer' in api,
+          hasRegistry: 'registry' in api,
+          hasDiagnostics: 'diagnostics' in api,
+          hasUnregister: 'unregister' in api,
+          hasIssueNonce: 'issueHandshakeNonce' in api,
+          hasDispose: 'dispose' in api,
         };
       });
-      assert.equal(shadowCheck.exists, true);
-      assert.equal(shadowCheck.shadowRootIsNull, true);
-      assert.equal(shadowCheck.noTranslate, 'no');
+      assert.equal(surfaceAudit.exists, true);
+      assert.equal(surfaceAudit.shadowRootIsNull, true);
+      assert.equal(surfaceAudit.noTranslate, 'no');
+      assert.equal(surfaceAudit.frozen, true);
+      assert.deepEqual(surfaceAudit.keys, [
+        'contractVersion',
+        'getLocale',
+        'listSlots',
+        'register',
+        'setLocale',
+        'toggleDock',
+        'version',
+      ]);
+      assert.equal(surfaceAudit.hasRenderer, false);
+      assert.equal(surfaceAudit.hasRegistry, false);
+      assert.equal(surfaceAudit.hasDiagnostics, false);
+      assert.equal(surfaceAudit.hasUnregister, false);
+      assert.equal(surfaceAudit.hasIssueNonce, false);
+      assert.equal(surfaceAudit.hasDispose, false);
 
-      // Register two plugins implementing RemotePlugin.v1 in their own declared slots (status-bar + settings-pane)
+      // Register status-bar + settings-pane plugins through the public register() API
       await page.evaluate(() => {
         window.__confirmedRuns = 0;
-        window.antigravityRemoteHost.register({
+        window.__unregStatus = window.antigravityRemoteHost.register({
           contractVersion: 'remote-plugin.v1',
           id: 'demo-statusbar',
           version: '1.0.0',
@@ -479,7 +607,7 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
             };
           },
         });
-        window.antigravityRemoteHost.register({
+        window.__unregSettings = window.antigravityRemoteHost.register({
           contractVersion: 'remote-plugin.v1',
           id: 'demo-settings-tool',
           version: '1.0.0',
@@ -513,88 +641,82 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
         });
       });
 
-      // Wait for declarative slot render & inspect inside slot root via renderer API
-      const uiMetrics = await page.evaluate(async () => {
-        const h = window.antigravityRemoteHost;
-        await h.renderer.render();
-        const root = h.renderer.getSlotRoot();
-        const statusBar = root.querySelector('[data-remote-slot="status-bar"]');
-        const pill = root.querySelector('[data-rph-control="dock-pill"]');
-        pill.click();
-        await h.renderer.render();
+      // Wait briefly for async declarative render, then inspect & click Closed Shadow DOM via CDP!
+      await new Promise((r) => setTimeout(r, 60));
+      let root = await getPiercedRoot(cdp);
+      const statusBar = findCdpNode(root, (n) => getAttr(n, 'data-remote-slot') === 'status-bar');
+      assert.ok(statusBar && !hasAttr(statusBar, 'hidden'), `${sc.mode}: status-bar must be visible`);
+      assert.ok(cdpNodeText(statusBar).includes('42%'), `${sc.mode}: status-bar must show metric 42%`);
 
-        const settingsGroup = root.querySelector('[data-remote-slot-group="settings-pane"]');
-        const langBtn = root.querySelector('[data-rph-control="lang-toggle"]');
-        const closeBtn = root.querySelector('[data-rph-control="close"]');
-        const actionBtn = root.querySelector('[data-action-id="apply-stdio"]');
+      // Click dock pill via real mouse coordinates from CDP box model
+      const { box: pillBox } = await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-rph-control') === 'dock-pill');
+      await new Promise((r) => setTimeout(r, 40));
 
-        const heights = [pill, langBtn, closeBtn, actionBtn].map((el) => el.getBoundingClientRect().height);
-        const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+      root = await getPiercedRoot(cdp);
+      const settingsGroup = findCdpNode(root, (n) => getAttr(n, 'data-remote-slot-group') === 'settings-pane');
+      assert.ok(settingsGroup, `${sc.mode}: settings-pane plugin must render in settings-pane group`);
 
-        // Click risky action -> must show 2-step confirmation, NOT auto-confirm!
-        actionBtn.click();
-        await new Promise((r) => setTimeout(r, 30));
-        const runsBeforeConfirm = window.__confirmedRuns;
-        const confirmVisible = !root.querySelector('[data-rph-control="confirm-box"]').hidden;
-        root.querySelector('[data-rph-control="confirm-accept"]').click();
-        await new Promise((r) => setTimeout(r, 30));
-        const runsAfterConfirm = window.__confirmedRuns;
+      const langNode = findCdpNode(root, (n) => getAttr(n, 'data-rph-control') === 'lang-toggle');
+      const closeNode = findCdpNode(root, (n) => getAttr(n, 'data-rph-control') === 'close');
+      const actionNode = findCdpNode(root, (n) => getAttr(n, 'data-action-id') === 'apply-stdio');
+      const heights = await Promise.all([langNode, closeNode, actionNode].map((n) => getCdpBox(cdp, n).then((b) => b.height)));
+      heights.push(pillBox.height);
+      assert.ok(Math.min(...heights) >= 44, `${sc.mode}: touch target < 44px (${Math.min(...heights)}px)`);
 
-        // Switch KO -> EN via host self-managed toggle
-        langBtn.click();
-        await new Promise((r) => setTimeout(r, 30));
-        const enTitle = root.querySelector('.rph-title').textContent;
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      assert.ok(overflow <= 0, `${sc.mode}: horizontal overflow (${overflow}px)`);
 
-        return {
-          statusBarVisible: Boolean(statusBar && !statusBar.hidden && statusBar.textContent.includes('42%')),
-          settingsGroupMounted: Boolean(settingsGroup),
-          minHeight: Math.min(...heights),
-          overflow,
-          runsBeforeConfirm,
-          confirmVisible,
-          runsAfterConfirm,
-          enTitle,
-        };
-      });
+      // Click risky action -> 2-step confirmation MUST appear, never auto-confirmed!
+      await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-action-id') === 'apply-stdio');
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(await page.evaluate(() => window.__confirmedRuns), 0, `${sc.mode}: must NEVER auto-confirm`);
+      root = await getPiercedRoot(cdp);
+      const confirmBox = findCdpNode(root, (n) => getAttr(n, 'data-rph-control') === 'confirm-box');
+      assert.ok(confirmBox && !hasAttr(confirmBox, 'hidden'), `${sc.mode}: 2-step confirmation box must be visible`);
 
-      assert.equal(uiMetrics.statusBarVisible, true, `${sc.mode}: status-bar plugin must render in status-bar slot`);
-      assert.equal(uiMetrics.settingsGroupMounted, true, `${sc.mode}: settings-pane plugin must render in settings-pane group`);
-      assert.ok(uiMetrics.minHeight >= 44, `${sc.mode}: touch target < 44px (${uiMetrics.minHeight}px)`);
-      assert.ok(uiMetrics.overflow <= 0, `${sc.mode}: horizontal overflow (${uiMetrics.overflow}px)`);
-      assert.equal(uiMetrics.runsBeforeConfirm, 0, `${sc.mode}: host must NEVER auto-confirm`);
-      assert.equal(uiMetrics.confirmVisible, true, `${sc.mode}: 2-step confirmation dialog must appear`);
-      assert.equal(uiMetrics.runsAfterConfirm, 1, `${sc.mode}: confirmed action must run once`);
-      assert.equal(uiMetrics.enTitle, 'Remote Plugin Host');
+      // Click Confirm -> runs once and shows KO feedback ("적용됨")
+      await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-rph-control') === 'confirm-accept');
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(await page.evaluate(() => window.__confirmedRuns), 1);
 
-      // Escape closes drawer and returns focus
+      // Click KO -> EN toggle -> both title AND existing action feedback ("Applied") translate live!
+      await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-rph-control') === 'lang-toggle');
+      await new Promise((r) => setTimeout(r, 50));
+      root = await getPiercedRoot(cdp);
+      const titleNode = findCdpNode(root, (n) => getAttr(n, 'class') === 'rph-title');
+      assert.equal(cdpNodeText(titleNode), 'Remote Plugin Host');
+      const drawerBody = findCdpNode(root, (n) => getAttr(n, 'data-rph-control') === 'drawer-body');
+      assert.ok(cdpNodeText(drawerBody).includes('Applied'), `${sc.mode}: action feedback must translate dynamically to EN`);
+
+      // Escape closes drawer
       await page.keyboard.press('Escape');
-      const closedAfterEscape = await page.evaluate(() => !window.antigravityRemoteHost.renderer.isOpen());
-      assert.equal(closedAfterEscape, true);
+      await new Promise((r) => setTimeout(r, 40));
+      root = await getPiercedRoot(cdp);
+      const drawerAfterEsc = findCdpNode(root, (n) => getAttr(n, 'class') === 'rph-drawer');
+      assert.equal(hasAttr(drawerAfterEsc, 'hidden'), true, `${sc.mode}: Escape must close drawer`);
 
-      // Idempotent second bookmarklet tap toggles drawer open without duplicating root
+      // Idempotent second bookmarklet tap toggles drawer open without duplicating host surface
       if (sc.mode === 'bookmarklet') {
         await page.click('#run-bookmarklet');
-        await page.waitForFunction(() => window.antigravityRemoteHost?.renderer?.isOpen() === true, null, {
-          timeout: 5000,
-        });
-        const bmCheck = await page.evaluate(() => ({
-          hostCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
-          reopened: window.antigravityRemoteHost.renderer.isOpen(),
-        }));
-        assert.equal(bmCheck.hostCount, 1);
-        assert.equal(bmCheck.reopened, true);
+        const deadline = Date.now() + 5000;
+        let reopened = false;
+        while (Date.now() < deadline) {
+          root = await getPiercedRoot(cdp);
+          const d = findCdpNode(root, (n) => getAttr(n, 'class') === 'rph-drawer');
+          if (d && !hasAttr(d, 'hidden')) {
+            reopened = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(reopened, true, 'Second bookmarklet tap must reopen drawer');
+        const hostCount = await page.evaluate(
+          () => document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
+        );
+        assert.equal(hostCount, 1);
       }
 
-      // Full dispose() removes host DOM & cleans global handle
-      await page.evaluate(() => window.antigravityRemoteHost.dispose());
-      const afterDispose = await page.evaluate(() => ({
-        hostCount: document.querySelectorAll('[data-remote-host-surface="closed-shadow"]').length,
-        hasGlobal: 'antigravityRemoteHost' in window,
-      }));
-      assert.equal(afterDispose.hostCount, 0);
-      assert.equal(afterDispose.hasGlobal, false);
       assert.deepEqual(errors, [], `${sc.mode}: unexpected browser errors`);
-
       await context.close();
     }
   } finally {
@@ -602,7 +724,7 @@ test('ARP-TC-028: Playwright Desktop & Mobile (390x844 touch) E2E runs real User
   }
 });
 
-test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js inside AddonManifest.v1 scoped addonHost sandbox and verifies full dispose teardown', async () => {
+test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js inside strict assertNotDisposed() AddonManifest.v1 sandbox and verifies real host-initiated dispose() throws 0 errors', async () => {
   const addonRendererSource = readFileSync(join(ROOT, 'dist/addon-renderer.js'), 'utf8');
   const srv = await startHttpServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -621,6 +743,13 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
       const slots = new Map();
       const styles = new Map();
       const disposers = [];
+      const disposerErrors = [];
+      let disposed = false;
+
+      function assertNotDisposed() {
+        if (disposed) throw new Error('ERR_HANDLE_DISPOSED:antigravity-remote-plugin');
+      }
+
       const addonHost = Object.freeze({
         pluginId: 'antigravity-remote-plugin',
         hostVersion: '1.0.1',
@@ -631,6 +760,7 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
           return '[data-addon-host-owner], [translate="no"], [data-agy-no-translate="true"]';
         },
         mountSlot(slotId) {
+          assertNotDisposed();
           if (slotId !== 'antigravity-remote-plugin.settings') {
             throw new Error(`ERR_UNDECLARED_SLOT:${slotId}`);
           }
@@ -645,6 +775,7 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
           return slots.get(slotId);
         },
         unmountSlot(slotId) {
+          assertNotDisposed();
           const el = slots.get(slotId);
           if (!el) return false;
           el.remove();
@@ -652,6 +783,7 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
           return true;
         },
         injectStyle(styleId, cssText) {
+          assertNotDisposed();
           let st = styles.get(styleId);
           if (!st) {
             st = document.createElement('style');
@@ -664,6 +796,7 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
           return st;
         },
         removeStyle(styleId) {
+          assertNotDisposed();
           const st = styles.get(styleId);
           if (!st) return false;
           st.remove();
@@ -674,11 +807,18 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
           return [...slots.keys()];
         },
         onDispose(fn) {
+          assertNotDisposed();
           disposers.push(fn);
         },
         dispose() {
+          if (disposed) return;
+          disposed = true;
           for (const fn of disposers.splice(0, disposers.length)) {
-            fn();
+            try {
+              fn();
+            } catch (err) {
+              disposerErrors.push(err.message);
+            }
           }
           for (const el of slots.values()) el.remove();
           slots.clear();
@@ -706,10 +846,12 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
         koTitle,
         enTitle,
         remainingSlots,
+        disposerErrors,
       };
     }, addonRendererSource);
 
     assert.deepEqual(errors, []);
+    assert.deepEqual(result.disposerErrors, [], 'Real addonHost.dispose() must not trigger ERR_HANDLE_DISPOSED');
     assert.equal(result.mounted, true);
     assert.equal(result.owner, 'antigravity-remote-plugin');
     assert.equal(result.noTranslate, 'no');
@@ -723,5 +865,141 @@ test('ARP-TC-029: Playwright Chromium E2E runs built dist/addon-renderer.js insi
     await browser.close();
     srv.server.closeAllConnections?.();
     await new Promise((r) => srv.server.close(r));
+  }
+});
+
+test('ARP-TC-030: Playwright Chromium E2E verifies real cross-context iframe MessageChannel handshake, MessagePort register/snapshot/2-step invoke RPC, and clean disconnect teardown', async () => {
+  const userscriptSource = readFileSync(join(ROOT, 'dist/antigravity-remote.user.js'), 'utf8');
+  const bundleSource = readFileSync(join(ROOT, 'dist/remote_bridge.js'), 'utf8');
+
+  const browser = await launchChromium();
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await context.newPage();
+    const cdp = await context.newCDPSession(page);
+    const errors = [];
+    page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+    });
+
+    await page.route('https://antigravity.google.com/**', (route) => {
+      const url = route.request().url();
+      if (url.endsWith('/remote_bridge.js')) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/javascript; charset=utf-8',
+          body: bundleSource,
+        });
+      }
+      if (url.endsWith('/plugin-frame')) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: `<!doctype html><html><body><script type="module">
+            import { connectPluginHandshake, serveRemotePluginOverPort } from '/remote_bridge.js';
+
+            window.__rpcRuns = 0;
+            const port = await connectPluginHandshake({
+              selfWindow: window,
+              targetWindow: window.parent,
+              targetOrigin: 'https://antigravity.google.com',
+              allowedOrigins: ['https://antigravity.google.com'],
+              pluginId: 'iframe-aux-plugin',
+            });
+            const server = serveRemotePluginOverPort({
+              port,
+              plugin: {
+                contractVersion: 'remote-plugin.v1',
+                id: 'iframe-aux-plugin',
+                version: '1.0.0',
+                displayName: { ko: '아이프레임 보조', en: 'Iframe Aux' },
+                uiSlot: { slot: 'aux-pane', slotId: 'iframe-aux-plugin.pane', exclusive: false },
+                capabilities: ['panel', 'actions', 'subscribe'],
+                loadOrder: 30,
+                getSnapshot() {
+                  return {
+                    revision: 'if-1',
+                    sections: [
+                      {
+                        kind: 'actions',
+                        items: [{ id: 'rpc-run', label: { ko: 'RPC 실행', en: 'Run RPC' }, style: 'primary' }],
+                      },
+                    ],
+                  };
+                },
+                invoke(actionId, invocation) {
+                  if (actionId === 'rpc-run' && invocation.challengeResponse?.confirmed !== true) {
+                    return {
+                      status: 'confirmation_required',
+                      challengeId: 'if-chg-1',
+                      message: { ko: 'RPC 실행 확인', en: 'Confirm RPC run' },
+                    };
+                  }
+                  window.__rpcRuns += 1;
+                  return { status: 'ok', message: { ko: 'RPC 성공', en: 'RPC OK' } };
+                },
+                subscribe() { return () => {}; },
+              },
+            });
+            await server.ready;
+            window.__iframeServer = server;
+            window.__iframeReady = true;
+          </script></body></html>`,
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: '<!doctype html><html><body><main>Remote Host</main></body></html>',
+      });
+    });
+
+    await page.goto('https://antigravity.google.com/remote', { waitUntil: 'domcontentloaded' });
+    await page.addScriptTag({ content: userscriptSource });
+    await page.waitForFunction(() => Boolean(window.antigravityRemoteHost));
+
+    // Mount real same-origin iframe that connects over MessageChannel challenge-response
+    await page.evaluate(() => {
+      const iframe = document.createElement('iframe');
+      iframe.id = 'plugin-iframe';
+      iframe.src = 'https://antigravity.google.com/plugin-frame';
+      document.body.appendChild(iframe);
+    });
+
+    const frame = page.frame({ url: 'https://antigravity.google.com/plugin-frame' }) || page.frames()[1];
+    await frame.waitForFunction(() => window.__iframeReady === true, null, { timeout: 5000 });
+
+    // Open dock pill via CDP and verify aux-pane plugin rendered inside Closed Shadow DOM
+    await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-rph-control') === 'dock-pill');
+    await new Promise((r) => setTimeout(r, 60));
+    let root = await getPiercedRoot(cdp);
+    const auxGroup = findCdpNode(root, (n) => getAttr(n, 'data-remote-slot-group') === 'aux-pane');
+    assert.ok(auxGroup && cdpNodeText(auxGroup).includes('아이프레임 보조'));
+
+    // Click RPC action -> 2-step confirmation -> click Confirm -> RPC executes in iframe!
+    await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-action-id') === 'rpc-run');
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(await frame.evaluate(() => window.__rpcRuns), 0);
+
+    await clickCdpNode(page, cdp, (n) => getAttr(n, 'data-rph-control') === 'confirm-accept');
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(await frame.evaluate(() => window.__rpcRuns), 1);
+
+    root = await getPiercedRoot(cdp);
+    const bodyAfterRpc = findCdpNode(root, (n) => getAttr(n, 'data-rph-control') === 'drawer-body');
+    assert.ok(cdpNodeText(bodyAfterRpc).includes('RPC 성공'));
+
+    // Iframe disconnects -> plugin unregisters and aux-pane disappears cleanly
+    await frame.evaluate(() => window.__iframeServer.disconnect());
+    await new Promise((r) => setTimeout(r, 80));
+    root = await getPiercedRoot(cdp);
+    const auxAfterDisconnect = findCdpNode(root, (n) => getAttr(n, 'data-remote-slot-group') === 'aux-pane');
+    assert.equal(auxAfterDisconnect, null, 'Disconnecting MessagePort must remove plugin slot');
+
+    assert.deepEqual(errors, []);
+    await context.close();
+  } finally {
+    await browser.close();
   }
 });

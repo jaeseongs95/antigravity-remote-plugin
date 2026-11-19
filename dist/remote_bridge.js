@@ -1,5 +1,5 @@
 // antigravity-remote-plugin v2.0.0 — standalone self-contained ESM bundle
-// Built deterministically with esbuild from 26 library modules.
+// Built deterministically with esbuild from 28 library modules.
 
 // src/security/redactor.js
 var SENSITIVE_KEY_PATTERN = /^(authorization|cookie|set-cookie|token|access_token|refresh_token|csrf|csrf_token|x-sidecar-token|x-csrf-token|x-api-key|api_key|apikey|secret|password|passwd|env|headers)$/i;
@@ -529,8 +529,12 @@ function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}) {
 }
 
 // src/security/plugin-handshake.js
+var HANDSHAKE_REQUEST_TYPE = "remote-plugin-v1:handshake-request";
+var HANDSHAKE_CHALLENGE_TYPE = "remote-plugin-v1:handshake-challenge";
 var HANDSHAKE_PROTOCOL_TYPE = "remote-plugin-v1:handshake-init";
 var HANDSHAKE_ACK_TYPE = "remote-plugin-v1:handshake-ack";
+var DEFAULT_NONCE_TTL_MS = 3e4;
+var MAX_PENDING_NONCES = 128;
 function generateHandshakeNonce(byteLength = 24) {
   const bytes = new Uint8Array(byteLength);
   if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
@@ -543,7 +547,13 @@ function generateHandshakeNonce(byteLength = 24) {
   }
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
-function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
+function createPluginHandshakeHost({
+  win,
+  allowedOrigins,
+  onPortConnected,
+  nonceTtlMs = DEFAULT_NONCE_TTL_MS,
+  now = () => Date.now()
+}) {
   if (!win || typeof win.addEventListener !== "function") {
     throw new SecurityPolicyError("ERR_INVALID_WINDOW", "A window with event listeners is required.");
   }
@@ -553,9 +563,36 @@ function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
   if (typeof onPortConnected !== "function") {
     throw new TypeError("onPortConnected callback is required.");
   }
-  const pendingNonces = /* @__PURE__ */ new Set();
+  const pendingNonces = /* @__PURE__ */ new Map();
   const activePorts = /* @__PURE__ */ new Set();
   let disposed = false;
+  function pruneExpiredNonces() {
+    const t = now();
+    for (const [nonce, meta] of pendingNonces.entries()) {
+      if (meta.expiresAt <= t) {
+        pendingNonces.delete(nonce);
+      }
+    }
+  }
+  function issueNonceInternal({ boundOrigin = null, boundSource = null } = {}) {
+    if (disposed) {
+      throw new SecurityPolicyError("ERR_HANDSHAKE_DISPOSED", "Handshake host is disposed.");
+    }
+    pruneExpiredNonces();
+    if (pendingNonces.size >= MAX_PENDING_NONCES) {
+      const oldestKey = pendingNonces.keys().next().value;
+      if (oldestKey !== void 0) {
+        pendingNonces.delete(oldestKey);
+      }
+    }
+    const nonce = generateHandshakeNonce();
+    pendingNonces.set(nonce, {
+      expiresAt: now() + Math.max(100, Number(nonceTtlMs) || DEFAULT_NONCE_TTL_MS),
+      boundOrigin,
+      boundSource
+    });
+    return nonce;
+  }
   const onMessage = (event) => {
     if (disposed || !event || typeof event !== "object") {
       return;
@@ -564,10 +601,43 @@ function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
       return;
     }
     const data = event.data;
-    if (!data || typeof data !== "object" || data.type !== HANDSHAKE_PROTOCOL_TYPE) {
+    if (!data || typeof data !== "object") {
       return;
     }
+    if (data.type === HANDSHAKE_REQUEST_TYPE) {
+      if (typeof data.requestId !== "string" || !data.requestId || data.requestId.length > 128) {
+        return;
+      }
+      const replyTarget = event.source;
+      if (!replyTarget || typeof replyTarget.postMessage !== "function") {
+        return;
+      }
+      const nonce = issueNonceInternal({
+        boundOrigin: event.origin,
+        boundSource: replyTarget
+      });
+      replyTarget.postMessage(
+        {
+          type: HANDSHAKE_CHALLENGE_TYPE,
+          requestId: data.requestId,
+          nonce
+        },
+        event.origin
+      );
+      return;
+    }
+    if (data.type !== HANDSHAKE_PROTOCOL_TYPE) {
+      return;
+    }
+    pruneExpiredNonces();
     if (typeof data.nonce !== "string" || !pendingNonces.has(data.nonce)) {
+      return;
+    }
+    const meta = pendingNonces.get(data.nonce);
+    if (meta.boundOrigin && meta.boundOrigin !== event.origin) {
+      return;
+    }
+    if (meta.boundSource && event.source !== meta.boundSource) {
       return;
     }
     const port = Array.isArray(event.ports) ? event.ports[0] : null;
@@ -579,30 +649,32 @@ function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
     if (typeof port.start === "function") {
       port.start();
     }
+    let closed = false;
+    const closePort = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      activePorts.delete(port);
+      if (typeof port.close === "function") {
+        port.close();
+      }
+    };
     port.postMessage({ type: HANDSHAKE_ACK_TYPE, accepted: true });
     onPortConnected({
       port,
       origin: event.origin,
       pluginId: typeof data.pluginId === "string" ? data.pluginId : null,
-      close() {
-        activePorts.delete(port);
-        if (typeof port.close === "function") {
-          port.close();
-        }
-      }
+      close: closePort
     });
   };
   win.addEventListener("message", onMessage);
   return Object.freeze({
     issueNonce() {
-      if (disposed) {
-        throw new SecurityPolicyError("ERR_HANDSHAKE_DISPOSED", "Handshake host is disposed.");
-      }
-      const nonce = generateHandshakeNonce();
-      pendingNonces.add(nonce);
-      return nonce;
+      return issueNonceInternal();
     },
     pendingCount() {
+      pruneExpiredNonces();
       return pendingNonces.size;
     },
     activePortCount() {
@@ -617,12 +689,12 @@ function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
       if (typeof win.removeEventListener === "function") {
         win.removeEventListener("message", onMessage);
       }
-      for (const port of activePorts) {
+      for (const port of [...activePorts]) {
+        activePorts.delete(port);
         if (typeof port.close === "function") {
           port.close();
         }
       }
-      activePorts.clear();
     }
   });
 }
@@ -655,6 +727,98 @@ function initiatePluginHandshake({
     [channel.port2]
   );
   return channel.port1;
+}
+async function connectPluginHandshake({
+  selfWindow,
+  targetWindow,
+  targetOrigin,
+  allowedOrigins,
+  pluginId,
+  timeoutMs = 5e3,
+  MessageChannelCtor = globalThis.MessageChannel
+}) {
+  assertOriginAllowed(targetOrigin, allowedOrigins, "handshake targetOrigin");
+  if (!selfWindow || typeof selfWindow.addEventListener !== "function") {
+    throw new SecurityPolicyError("ERR_INVALID_WINDOW", "selfWindow with event listeners is required.");
+  }
+  const requestId = generateHandshakeNonce(12);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let clientPort = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (typeof selfWindow.removeEventListener === "function") {
+        selfWindow.removeEventListener("message", onChallenge);
+      }
+    };
+    const fail = (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (clientPort && typeof clientPort.close === "function") {
+        clientPort.close();
+      }
+      reject(err);
+    };
+    const timer = setTimeout(() => {
+      fail(new SecurityPolicyError("ERR_HANDSHAKE_TIMEOUT", "Plugin handshake timed out."));
+    }, timeoutMs);
+    const onChallenge = (event) => {
+      if (settled || !event || event.origin !== targetOrigin || event.source !== targetWindow) {
+        return;
+      }
+      const data = event.data;
+      if (!data || data.type !== HANDSHAKE_CHALLENGE_TYPE || data.requestId !== requestId) {
+        return;
+      }
+      cleanup();
+      try {
+        clientPort = initiatePluginHandshake({
+          targetWindow,
+          targetOrigin,
+          allowedOrigins,
+          nonce: data.nonce,
+          pluginId,
+          MessageChannelCtor
+        });
+      } catch (err) {
+        fail(err);
+        return;
+      }
+      const ackTimer = setTimeout(() => {
+        fail(new SecurityPolicyError("ERR_HANDSHAKE_ACK_TIMEOUT", "Plugin handshake ACK timed out."));
+      }, timeoutMs);
+      const onAck = (ackEvent) => {
+        const msg = ackEvent?.data;
+        if (!msg || msg.type !== HANDSHAKE_ACK_TYPE || msg.accepted !== true) {
+          return;
+        }
+        clearTimeout(ackTimer);
+        if (typeof clientPort.removeEventListener === "function") {
+          clientPort.removeEventListener("message", onAck);
+        }
+        if (!settled) {
+          settled = true;
+          resolve(clientPort);
+        }
+      };
+      if (typeof clientPort.addEventListener === "function") {
+        clientPort.addEventListener("message", onAck);
+      } else {
+        clientPort.onmessage = onAck;
+      }
+    };
+    selfWindow.addEventListener("message", onChallenge);
+    targetWindow.postMessage(
+      {
+        type: HANDSHAKE_REQUEST_TYPE,
+        requestId
+      },
+      targetOrigin
+    );
+  });
 }
 
 // src/core/diagnostics.js
@@ -907,6 +1071,7 @@ var PORT_CONTRACTS = Object.freeze({
     "unmountSlot",
     "injectStyle",
     "removeStyle",
+    "listOwnedSlots",
     "onDispose",
     "dispose"
   ])
@@ -1358,7 +1523,13 @@ function validateRemotePlugin(plugin) {
   if (typeof plugin.uiSlot.slotId !== "string" || !SLOT_ID_RE.test(plugin.uiSlot.slotId) || FORBIDDEN_KEYS.has(plugin.uiSlot.slotId)) {
     throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "Invalid uiSlot.slotId.");
   }
-  const exclusive = Boolean(plugin.uiSlot.exclusive);
+  if (plugin.uiSlot.exclusive !== void 0 && typeof plugin.uiSlot.exclusive !== "boolean") {
+    throw new SecurityPolicyError(
+      "ERR_INVALID_EXCLUSIVE_FLAG",
+      "uiSlot.exclusive must be a boolean when provided."
+    );
+  }
+  const exclusive = plugin.uiSlot.exclusive === true;
   if (!Array.isArray(plugin.capabilities) || plugin.capabilities.length === 0) {
     throw new SecurityPolicyError(
       "ERR_INVALID_CAPABILITIES",
@@ -1974,6 +2145,7 @@ var RemotePluginRegistry = class {
 // src/core/declarative-slot-renderer.js
 var HOST_STYLE_ID = "remote-slot-host-css";
 var HOST_SLOT_ID = "remote-slot-host.root";
+var hasOwn2 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 var SLOT_LABELS = Object.freeze({
   "title-bar": Object.freeze({ ko: "\uC0C1\uB2E8 \uD0C0\uC774\uD2C0 \uBC14", en: "Title Bar" }),
   "status-bar": Object.freeze({ ko: "\uC0C1\uD0DC \uD45C\uC2DC\uC904", en: "Status Bar" }),
@@ -2020,6 +2192,10 @@ var STRINGS = Object.freeze({
     actionOk: "Action completed."
   })
 });
+var ACTION_OK_LOCALIZED = Object.freeze({
+  ko: STRINGS.ko.actionOk,
+  en: STRINGS.en.actionOk
+});
 var HOST_CSS = [
   `:host, .rph-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color-scheme: light dark; box-sizing: border-box; }`,
   `.rph-root * { box-sizing: border-box; }`,
@@ -2060,7 +2236,7 @@ var HOST_CSS = [
   `.rph-notice[data-tone="error"] { background: rgba(234,67,53,0.18); }`,
   `.rph-notice[data-tone="warn"] { background: rgba(251,188,4,0.18); }`,
   `.rph-confirm { border-radius: 10px; border: 1px solid #f29900; background: rgba(251,188,4,0.12); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
-  `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }`,
+  `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }`,
   `@media (prefers-color-scheme: light) { .rph-titlebar, .rph-statusbar, .rph-composerbar, .rph-pill, .rph-drawer { background: var(--card, #ffffff); color: var(--foreground, #1f2328); } }`
 ].join(" ");
 function clearChildren(el) {
@@ -2086,8 +2262,10 @@ function createDeclarativeSlotRenderer({
   let isOpen = false;
   let disposed = false;
   let renderSeq = 0;
+  let actionGeneration = 0;
   let pendingChallenge = null;
   const feedbackByPlugin = /* @__PURE__ */ Object.create(null);
+  const actionMutex = new AsyncMutex();
   surface.injectStyle(HOST_STYLE_ID, HOST_CSS);
   const slotRoot = surface.mountSlot(HOST_SLOT_ID);
   slotRoot.setAttribute("class", "rph-root");
@@ -2138,7 +2316,12 @@ function createDeclarativeSlotRenderer({
   headerEl.appendChild(titleEl);
   headerEl.appendChild(headerActions);
   const confirmBoxEl = createSafeElement(doc, "div", {
-    attrs: { class: "rph-confirm", "data-rph-control": "confirm-box", role: "alertdialog", hidden: "hidden" }
+    attrs: {
+      class: "rph-confirm",
+      "data-rph-control": "confirm-box",
+      role: "alertdialog",
+      hidden: "hidden"
+    }
   });
   const drawerBodyEl = createSafeElement(doc, "div", {
     attrs: { "data-rph-control": "drawer-body" }
@@ -2168,6 +2351,16 @@ function createDeclarativeSlotRenderer({
   slotRoot.appendChild(composerBarEl);
   slotRoot.appendChild(statusBarEl);
   slotRoot.appendChild(dockEl);
+  function pruneStalePluginState(activeIdSet) {
+    if (pendingChallenge && !activeIdSet.has(pendingChallenge.pluginId)) {
+      pendingChallenge = null;
+    }
+    for (const key of Object.keys(feedbackByPlugin)) {
+      if (!activeIdSet.has(key)) {
+        delete feedbackByPlugin[key];
+      }
+    }
+  }
   function setOpen(nextOpen) {
     isOpen = Boolean(nextOpen);
     drawerEl.hidden = !isOpen;
@@ -2188,7 +2381,8 @@ function createDeclarativeSlotRenderer({
   }
   function renderConfirmBox() {
     clearChildren(confirmBoxEl);
-    if (!pendingChallenge) {
+    if (!pendingChallenge || !registry.get(pendingChallenge.pluginId)) {
+      pendingChallenge = null;
       confirmBoxEl.hidden = true;
       return;
     }
@@ -2241,46 +2435,55 @@ function createDeclarativeSlotRenderer({
     confirmBoxEl.appendChild(btnRow);
   }
   async function executePluginAction(pluginId, actionId, invocation = {}) {
-    const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
-    if (disposed) {
+    const myGen = ++actionGeneration;
+    return actionMutex.runExclusive(async () => {
+      if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+        return null;
+      }
+      const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
+      if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+        return null;
+      }
+      if (result.status === "confirmation_required") {
+        pendingChallenge = {
+          pluginId,
+          actionId,
+          expectedRevision: invocation.expectedRevision,
+          challengeId: result.challengeId,
+          message: result.message,
+          confirmLabel: result.confirmLabel
+        };
+        setOpen(true);
+        renderConfirmBox();
+        return result;
+      }
+      if (pendingChallenge && pendingChallenge.pluginId === pluginId) {
+        pendingChallenge = null;
+      }
+      if (result.status === "conflict") {
+        feedbackByPlugin[pluginId] = {
+          tone: "warn",
+          message: result.message,
+          needsRefresh: true
+        };
+      } else if (result.status === "error") {
+        feedbackByPlugin[pluginId] = {
+          tone: "error",
+          message: result.message,
+          needsRefresh: false
+        };
+      } else {
+        feedbackByPlugin[pluginId] = {
+          tone: "ok",
+          message: result.message ?? ACTION_OK_LOCALIZED,
+          needsRefresh: false
+        };
+      }
+      await render();
       return result;
-    }
-    if (result.status === "confirmation_required") {
-      pendingChallenge = {
-        pluginId,
-        actionId,
-        expectedRevision: invocation.expectedRevision,
-        challengeId: result.challengeId,
-        message: result.message,
-        confirmLabel: result.confirmLabel
-      };
-      setOpen(true);
-      renderConfirmBox();
-      return result;
-    }
-    if (result.status === "conflict") {
-      feedbackByPlugin[pluginId] = {
-        tone: "warn",
-        text: resolveLocalizedText(result.message, locale),
-        needsRefresh: true
-      };
-    } else if (result.status === "error") {
-      feedbackByPlugin[pluginId] = {
-        tone: "error",
-        text: resolveLocalizedText(result.message, locale),
-        needsRefresh: false
-      };
-    } else {
-      feedbackByPlugin[pluginId] = {
-        tone: "ok",
-        text: result.message ? resolveLocalizedText(result.message, locale) : STRINGS[locale].actionOk,
-        needsRefresh: false
-      };
-    }
-    await render();
-    return result;
+    });
   }
-  function renderSection(pluginId, snapshotRevision, section) {
+  function renderSection(plugin, snapshotRevision, section) {
     if (section.kind === "notice") {
       return createSafeElement(doc, "div", {
         attrs: { class: "rph-notice", "data-tone": section.tone },
@@ -2302,7 +2505,12 @@ function createDeclarativeSlotRenderer({
     if (section.kind === "list") {
       const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, "div", {
+            attrs: { class: "rph-slot-heading" },
+            text: resolveLocalizedText(section.title, locale)
+          })
+        );
       }
       const ul = createSafeElement(doc, "ul", { attrs: { class: "rph-list" } });
       for (const item of section.items) {
@@ -2310,11 +2518,21 @@ function createDeclarativeSlotRenderer({
         const left = createSafeElement(doc, "div");
         left.appendChild(createSafeElement(doc, "div", { text: resolveLocalizedText(item.primary, locale) }));
         if (item.secondary) {
-          left.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(item.secondary, locale) }));
+          left.appendChild(
+            createSafeElement(doc, "div", {
+              attrs: { class: "rph-slot-heading" },
+              text: resolveLocalizedText(item.secondary, locale)
+            })
+          );
         }
         li.appendChild(left);
         if (item.badge) {
-          li.appendChild(createSafeElement(doc, "span", { attrs: { class: "rph-chip" }, text: resolveLocalizedText(item.badge, locale) }));
+          li.appendChild(
+            createSafeElement(doc, "span", {
+              attrs: { class: "rph-chip" },
+              text: resolveLocalizedText(item.badge, locale)
+            })
+          );
         }
         ul.appendChild(li);
       }
@@ -2324,7 +2542,12 @@ function createDeclarativeSlotRenderer({
     if (section.kind === "key-value") {
       const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, "div", {
+            attrs: { class: "rph-slot-heading" },
+            text: resolveLocalizedText(section.title, locale)
+          })
+        );
       }
       for (const entry of section.entries) {
         const row = createSafeElement(doc, "div", { attrs: { class: "rph-kv-row" } });
@@ -2335,9 +2558,17 @@ function createDeclarativeSlotRenderer({
       return box;
     }
     if (section.kind === "actions") {
+      if (!plugin.capabilities.includes("actions")) {
+        return null;
+      }
       const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, "div", {
+            attrs: { class: "rph-slot-heading" },
+            text: resolveLocalizedText(section.title, locale)
+          })
+        );
       }
       const row = createSafeElement(doc, "div", { attrs: { class: "rph-actions" } });
       for (const item of section.items) {
@@ -2345,7 +2576,7 @@ function createDeclarativeSlotRenderer({
           type: "button",
           class: "rph-btn",
           "data-style": item.style,
-          "data-plugin-id": pluginId,
+          "data-plugin-id": plugin.id,
           "data-action-id": item.id
         };
         if (item.disabled) {
@@ -2357,7 +2588,7 @@ function createDeclarativeSlotRenderer({
         });
         btn.addEventListener("click", () => {
           void executePluginAction(
-            pluginId,
+            plugin.id,
             item.id,
             snapshotRevision ? { expectedRevision: snapshotRevision } : {}
           );
@@ -2367,7 +2598,7 @@ function createDeclarativeSlotRenderer({
       box.appendChild(row);
       return box;
     }
-    return createSafeElement(doc, "div");
+    return null;
   }
   function renderInlineBarPlugin(container, plugin, snapResult) {
     const itemWrap = createSafeElement(doc, "div", {
@@ -2403,11 +2634,21 @@ function createDeclarativeSlotRenderer({
       );
     }
     for (const sec of snapshot.sections) {
-      if (sec.kind === "metrics") {
-        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
-      } else if (sec.kind === "actions") {
-        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      if (sec.kind === "metrics" || sec.kind === "actions") {
+        const rendered = renderSection(plugin, snapshot.revision, sec);
+        if (rendered) {
+          itemWrap.appendChild(rendered);
+        }
       }
+    }
+    if (hasOwn2(feedbackByPlugin, plugin.id)) {
+      const fb = feedbackByPlugin[plugin.id];
+      itemWrap.appendChild(
+        createSafeElement(doc, "span", {
+          attrs: { class: "rph-chip", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
+          text: resolveLocalizedText(fb.message, locale)
+        })
+      );
     }
     container.appendChild(itemWrap);
   }
@@ -2454,15 +2695,19 @@ function createDeclarativeSlotRenderer({
       );
     }
     for (const sec of snapshot.sections) {
-      card.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      const rendered = renderSection(plugin, snapshot.revision, sec);
+      if (rendered) {
+        card.appendChild(rendered);
+      }
     }
-    const fb = feedbackByPlugin[plugin.id];
-    if (fb) {
-      const fbEl = createSafeElement(doc, "div", {
-        attrs: { class: "rph-notice", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
-        text: fb.text
-      });
-      card.appendChild(fbEl);
+    if (hasOwn2(feedbackByPlugin, plugin.id)) {
+      const fb = feedbackByPlugin[plugin.id];
+      card.appendChild(
+        createSafeElement(doc, "div", {
+          attrs: { class: "rph-notice", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
+          text: resolveLocalizedText(fb.message, locale)
+        })
+      );
       if (fb.needsRefresh) {
         const reloadBtn = createSafeElement(doc, "button", {
           attrs: { type: "button", class: "rph-btn", "data-rph-control": "conflict-reload" },
@@ -2483,6 +2728,8 @@ function createDeclarativeSlotRenderer({
     }
     const seq = ++renderSeq;
     const plugins = registry.list();
+    const activeIds = new Set(plugins.map((p) => p.id));
+    pruneStalePluginState(activeIds);
     const snapshots = await Promise.all(
       plugins.map(async (plugin) => ({
         plugin,
@@ -2492,6 +2739,8 @@ function createDeclarativeSlotRenderer({
     if (disposed || seq !== renderSeq) {
       return;
     }
+    const liveIds = new Set(registry.list().map((p) => p.id));
+    pruneStalePluginState(liveIds);
     updateChromeLocale();
     renderConfirmBox();
     pillCountSpan.textContent = String(plugins.length);
@@ -2504,6 +2753,9 @@ function createDeclarativeSlotRenderer({
     let statusBarCount = 0;
     let composerBarCount = 0;
     for (const entry of snapshots) {
+      if (!liveIds.has(entry.plugin.id)) {
+        continue;
+      }
       const slot = entry.plugin.uiSlot.slot;
       if (slot === "title-bar") {
         renderInlineBarPlugin(titleBarEl, entry.plugin, entry.snapResult);
@@ -2570,7 +2822,14 @@ function createDeclarativeSlotRenderer({
   if (win && typeof win.addEventListener === "function") {
     win.addEventListener("keydown", onKeyDown);
   }
-  const unsubRegistry = registry.onChange(() => {
+  const unsubRegistry = registry.onChange((evt) => {
+    if (evt && evt.type === "unregistered" && typeof evt.pluginId === "string") {
+      actionGeneration += 1;
+      if (pendingChallenge && pendingChallenge.pluginId === evt.pluginId) {
+        pendingChallenge = null;
+      }
+      delete feedbackByPlugin[evt.pluginId];
+    }
     void render();
   });
   const dispose = () => {
@@ -2578,6 +2837,8 @@ function createDeclarativeSlotRenderer({
       return;
     }
     disposed = true;
+    actionGeneration += 1;
+    pendingChallenge = null;
     unsubRegistry();
     pillBtn.removeEventListener("click", onPillClick);
     closeBtn.removeEventListener("click", onCloseClick);
@@ -2606,9 +2867,7 @@ function createDeclarativeSlotRenderer({
     isOpen() {
       return isOpen;
     },
-    getSlotRoot() {
-      return slotRoot;
-    },
+    executePluginAction,
     dispose
   });
 }
@@ -2680,7 +2939,7 @@ function mountDesktopCompanionView({
   surface.injectStyle(PANEL_STYLE_ID, PANEL_CSS);
   const container = surface.mountSlot(slotId);
   const bookmarkletText = typeof remoteArtifacts.bookmarklet === "string" && remoteArtifacts.bookmarklet.trim() ? remoteArtifacts.bookmarklet.trim() : "dist/bookmarklet.txt";
-  const userscriptPath = typeof remoteArtifacts.userscriptPath === "string" && remoteArtifacts.userscriptPath.trim() ? remoteArtifacts.userscriptPath.trim() : "dist/remote-companion.user.js";
+  const userscriptPath = typeof remoteArtifacts.userscriptPath === "string" && remoteArtifacts.userscriptPath.trim() ? remoteArtifacts.userscriptPath.trim() : "dist/remote-plugin.user.js";
   async function copyText(text, successKey) {
     if (!clipboard || typeof clipboard.writeText !== "function") {
       statusMessage = COPY[locale].copyFailed;
@@ -3367,16 +3626,406 @@ function createMcpExtensionSlot({
   };
 }
 
+// src/bridges/remote-plugin-port-bridge.js
+var PORT_MSG = Object.freeze({
+  REGISTER: "remote-plugin-v1:register",
+  REGISTER_RESULT: "remote-plugin-v1:register-result",
+  UNREGISTER: "remote-plugin-v1:unregister",
+  DISCONNECT: "remote-plugin-v1:disconnect",
+  DIRTY: "remote-plugin-v1:dirty",
+  LIST: "remote-plugin-v1:list",
+  LIST_RESULT: "remote-plugin-v1:list-result",
+  SNAPSHOT_REQ: "remote-plugin-v1:snapshot-req",
+  SNAPSHOT_RES: "remote-plugin-v1:snapshot-res",
+  INVOKE_REQ: "remote-plugin-v1:invoke-req",
+  INVOKE_RES: "remote-plugin-v1:invoke-res"
+});
+var DEFAULT_RPC_TIMEOUT_MS = 5e3;
+function attachRemotePluginPortBridge({
+  port,
+  registry,
+  diagnostics = null,
+  onClose = null,
+  rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS
+}) {
+  if (!port || typeof port.postMessage !== "function") {
+    throw new TypeError("attachRemotePluginPortBridge requires a MessagePort.");
+  }
+  if (!registry || typeof registry.register !== "function") {
+    throw new TypeError("attachRemotePluginPortBridge requires a RemotePluginRegistry.");
+  }
+  let closed = false;
+  let reqCounter = 0;
+  let registeredPluginId = null;
+  let unregisterFn = null;
+  let dirtyCallback = null;
+  const pendingRpc = /* @__PURE__ */ new Map();
+  function rejectAllPending(reason) {
+    for (const [id, entry] of pendingRpc.entries()) {
+      clearTimeout(entry.timer);
+      pendingRpc.delete(id);
+      entry.reject(new Error(reason));
+    }
+  }
+  function sendRpc(reqType, payload) {
+    if (closed) {
+      return Promise.reject(new SecurityPolicyError("ERR_PORT_CLOSED", "Remote plugin port is closed."));
+    }
+    const requestId = `rpc-${++reqCounter}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingRpc.delete(requestId);
+        reject(new Error(`RPC ${reqType} timed out`));
+      }, rpcTimeoutMs);
+      pendingRpc.set(requestId, { resolve, reject, timer });
+      try {
+        port.postMessage({ type: reqType, requestId, ...payload });
+      } catch (err) {
+        clearTimeout(timer);
+        pendingRpc.delete(requestId);
+        reject(err);
+      }
+    });
+  }
+  function teardownLocalPlugin() {
+    dirtyCallback = null;
+    if (typeof unregisterFn === "function") {
+      const unreg = unregisterFn;
+      unregisterFn = null;
+      registeredPluginId = null;
+      unreg();
+    } else {
+      registeredPluginId = null;
+    }
+  }
+  function closeBridge() {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    rejectAllPending("Remote plugin port disconnected.");
+    teardownLocalPlugin();
+    if (typeof port.removeEventListener === "function") {
+      port.removeEventListener("message", onMessage);
+    } else if (port.onmessage === onMessage) {
+      port.onmessage = null;
+    }
+    if (typeof onClose === "function") {
+      onClose();
+    } else if (typeof port.close === "function") {
+      port.close();
+    }
+  }
+  function onMessage(event) {
+    if (closed) {
+      return;
+    }
+    const msg = event?.data;
+    if (!msg || typeof msg !== "object") {
+      return;
+    }
+    if (msg.type === PORT_MSG.SNAPSHOT_RES || msg.type === PORT_MSG.INVOKE_RES) {
+      const entry = pendingRpc.get(msg.requestId);
+      if (!entry) {
+        return;
+      }
+      clearTimeout(entry.timer);
+      pendingRpc.delete(msg.requestId);
+      if (msg.ok) {
+        entry.resolve(msg.result);
+      } else {
+        entry.reject(new Error(typeof msg.error === "string" ? msg.error : "Remote RPC error"));
+      }
+      return;
+    }
+    if (msg.type === PORT_MSG.LIST) {
+      port.postMessage({
+        type: PORT_MSG.LIST_RESULT,
+        requestId: msg.requestId ?? null,
+        plugins: registry.list().map((p) => ({
+          id: p.id,
+          version: p.version,
+          uiSlot: p.uiSlot,
+          capabilities: p.capabilities
+        }))
+      });
+      return;
+    }
+    if (msg.type === PORT_MSG.REGISTER) {
+      const desc = msg.descriptor;
+      if (!desc || typeof desc !== "object" || Array.isArray(desc)) {
+        port.postMessage({
+          type: PORT_MSG.REGISTER_RESULT,
+          requestId: msg.requestId ?? null,
+          ok: false,
+          error: "Invalid plugin descriptor."
+        });
+        return;
+      }
+      if (registeredPluginId) {
+        port.postMessage({
+          type: PORT_MSG.REGISTER_RESULT,
+          requestId: msg.requestId ?? null,
+          ok: false,
+          error: "Port already registered a plugin."
+        });
+        return;
+      }
+      const caps = Array.isArray(desc.capabilities) ? desc.capabilities : [];
+      const proxy = {
+        contractVersion: desc.contractVersion ?? REMOTE_PLUGIN_CONTRACT_VERSION,
+        id: desc.id,
+        version: desc.version,
+        displayName: desc.displayName,
+        uiSlot: desc.uiSlot,
+        capabilities: caps,
+        loadOrder: desc.loadOrder,
+        getSnapshot(ctx) {
+          return sendRpc(PORT_MSG.SNAPSHOT_REQ, { ctx });
+        },
+        ...caps.includes("actions") ? {
+          invoke(actionId, invocation, ctx) {
+            return sendRpc(PORT_MSG.INVOKE_REQ, { actionId, invocation, ctx });
+          }
+        } : {},
+        ...caps.includes("subscribe") ? {
+          subscribe(onDirty) {
+            dirtyCallback = onDirty;
+            return () => {
+              if (dirtyCallback === onDirty) {
+                dirtyCallback = null;
+              }
+            };
+          }
+        } : {},
+        dispose() {
+          if (!closed) {
+            try {
+              port.postMessage({ type: PORT_MSG.DISCONNECT });
+            } catch (err) {
+              if (diagnostics) {
+                diagnostics.emit({
+                  level: "warn",
+                  code: "PORT_DISCONNECT_SEND_FAILED",
+                  source: "bridge.remote-plugin-port",
+                  message: "Failed sending disconnect over port",
+                  detail: err
+                });
+              }
+            }
+          }
+          closeBridge();
+        }
+      };
+      try {
+        unregisterFn = registry.register(proxy);
+        registeredPluginId = desc.id;
+        port.postMessage({
+          type: PORT_MSG.REGISTER_RESULT,
+          requestId: msg.requestId ?? null,
+          ok: true,
+          pluginId: desc.id
+        });
+      } catch (err) {
+        const redacted = redactSecrets(err);
+        port.postMessage({
+          type: PORT_MSG.REGISTER_RESULT,
+          requestId: msg.requestId ?? null,
+          ok: false,
+          error: redacted?.message || "Registration failed.",
+          code: err?.code || "ERR_REGISTER_FAILED"
+        });
+      }
+      return;
+    }
+    if (msg.type === PORT_MSG.DIRTY) {
+      if (typeof dirtyCallback === "function") {
+        dirtyCallback();
+      }
+      return;
+    }
+    if (msg.type === PORT_MSG.UNREGISTER) {
+      teardownLocalPlugin();
+      return;
+    }
+    if (msg.type === PORT_MSG.DISCONNECT) {
+      closeBridge();
+    }
+  }
+  if (typeof port.addEventListener === "function") {
+    port.addEventListener("message", onMessage);
+    if (typeof port.start === "function") {
+      port.start();
+    }
+  } else {
+    port.onmessage = onMessage;
+  }
+  return Object.freeze({
+    getRegisteredPluginId() {
+      return registeredPluginId;
+    },
+    close: closeBridge
+  });
+}
+function serveRemotePluginOverPort({ port, plugin, timeoutMs = DEFAULT_RPC_TIMEOUT_MS }) {
+  if (!port || typeof port.postMessage !== "function") {
+    throw new TypeError("serveRemotePluginOverPort requires a MessagePort.");
+  }
+  if (!plugin || typeof plugin !== "object") {
+    throw new TypeError("serveRemotePluginOverPort requires a RemotePlugin.v1 object.");
+  }
+  let unsubDirty = null;
+  let closed = false;
+  const onMessage = async (event) => {
+    if (closed) {
+      return;
+    }
+    const msg = event?.data;
+    if (!msg || typeof msg !== "object") {
+      return;
+    }
+    if (msg.type === PORT_MSG.SNAPSHOT_REQ) {
+      try {
+        const result = await plugin.getSnapshot(msg.ctx || { locale: "ko" });
+        port.postMessage({ type: PORT_MSG.SNAPSHOT_RES, requestId: msg.requestId, ok: true, result });
+      } catch (err) {
+        const redacted = redactSecrets(err);
+        port.postMessage({
+          type: PORT_MSG.SNAPSHOT_RES,
+          requestId: msg.requestId,
+          ok: false,
+          error: redacted?.message || "Snapshot failed"
+        });
+      }
+      return;
+    }
+    if (msg.type === PORT_MSG.INVOKE_REQ) {
+      try {
+        if (typeof plugin.invoke !== "function") {
+          throw new Error("Plugin does not implement invoke().");
+        }
+        const result = await plugin.invoke(msg.actionId, msg.invocation || {}, msg.ctx || { locale: "ko" });
+        port.postMessage({ type: PORT_MSG.INVOKE_RES, requestId: msg.requestId, ok: true, result });
+      } catch (err) {
+        const redacted = redactSecrets(err);
+        port.postMessage({
+          type: PORT_MSG.INVOKE_RES,
+          requestId: msg.requestId,
+          ok: false,
+          error: redacted?.message || "Invoke failed"
+        });
+      }
+      return;
+    }
+    if (msg.type === PORT_MSG.DISCONNECT) {
+      disconnect();
+    }
+  };
+  if (typeof port.addEventListener === "function") {
+    port.addEventListener("message", onMessage);
+    if (typeof port.start === "function") {
+      port.start();
+    }
+  } else {
+    port.onmessage = onMessage;
+  }
+  function disconnect() {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (typeof unsubDirty === "function") {
+      unsubDirty();
+      unsubDirty = null;
+    }
+    try {
+      port.postMessage({ type: PORT_MSG.DISCONNECT });
+    } catch (_err) {
+      closed = true;
+    }
+    if (typeof port.removeEventListener === "function") {
+      port.removeEventListener("message", onMessage);
+    } else if (port.onmessage === onMessage) {
+      port.onmessage = null;
+    }
+    if (typeof port.close === "function") {
+      port.close();
+    }
+  }
+  const registerPromise = new Promise((resolve, reject) => {
+    const requestId = "reg-1";
+    const timer = setTimeout(() => {
+      reject(new Error("Remote plugin registration over MessagePort timed out."));
+    }, timeoutMs);
+    const onRegResult = (event) => {
+      const msg = event?.data;
+      if (!msg || msg.type !== PORT_MSG.REGISTER_RESULT || msg.requestId !== requestId) {
+        return;
+      }
+      clearTimeout(timer);
+      if (typeof port.removeEventListener === "function") {
+        port.removeEventListener("message", onRegResult);
+      }
+      if (msg.ok) {
+        if (typeof plugin.subscribe === "function") {
+          const maybeUnsub = plugin.subscribe(
+            () => {
+              if (!closed) {
+                port.postMessage({ type: PORT_MSG.DIRTY });
+              }
+            },
+            { locale: "ko" }
+          );
+          if (typeof maybeUnsub === "function") {
+            unsubDirty = maybeUnsub;
+          }
+        }
+        resolve(msg);
+      } else {
+        const err = new Error(msg.error || "Registration rejected");
+        err.code = msg.code || "ERR_REGISTER_FAILED";
+        reject(err);
+      }
+    };
+    if (typeof port.addEventListener === "function") {
+      port.addEventListener("message", onRegResult);
+    }
+    port.postMessage({
+      type: PORT_MSG.REGISTER,
+      requestId,
+      descriptor: {
+        contractVersion: plugin.contractVersion,
+        id: plugin.id,
+        version: plugin.version,
+        displayName: plugin.displayName,
+        uiSlot: plugin.uiSlot,
+        capabilities: plugin.capabilities,
+        loadOrder: plugin.loadOrder
+      }
+    });
+  });
+  return Object.freeze({
+    ready: registerPromise,
+    notifyDirty() {
+      if (!closed) {
+        port.postMessage({ type: PORT_MSG.DIRTY });
+      }
+    },
+    disconnect
+  });
+}
+
 // src/adapters/addon-host/addon-host-surface-adapter.js
 var REQUIRED_ADDON_HOST_METHODS = Object.freeze([
   "mountSlot",
   "unmountSlot",
   "injectStyle",
   "removeStyle",
+  "listOwnedSlots",
   "onDispose",
   "dispose"
 ]);
-function createAddonHostSurfaceAdapter(addonHost) {
+function createAddonHostSurfaceAdapter(addonHost, { diagnostics = null } = {}) {
   if (!addonHost || typeof addonHost !== "object") {
     throw new SecurityPolicyError(
       "ERR_MISSING_ADDON_HOST",
@@ -3387,6 +4036,31 @@ function createAddonHostSurfaceAdapter(addonHost) {
   let disposed = false;
   const ownedSlots = /* @__PURE__ */ new Set();
   const ownedStyles = /* @__PURE__ */ new Set();
+  const localDisposers = [];
+  function runLocalTeardown() {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    for (const fn of localDisposers.splice(0, localDisposers.length).reverse()) {
+      try {
+        fn();
+      } catch (err) {
+        if (diagnostics && typeof diagnostics.emit === "function") {
+          diagnostics.emit({
+            level: "error",
+            code: "SURFACE_DISPOSER_FAILED",
+            source: "adapter.addon-host-surface",
+            message: "Desktop surface disposer threw during teardown",
+            detail: err
+          });
+        }
+      }
+    }
+    ownedSlots.clear();
+    ownedStyles.clear();
+  }
+  addonHost.onDispose(runLocalTeardown);
   return Object.freeze({
     pluginId: typeof addonHost.pluginId === "string" ? addonHost.pluginId : "antigravity-remote-plugin",
     hostVersion: typeof addonHost.hostVersion === "string" ? addonHost.hostVersion : "1.0.1",
@@ -3423,28 +4097,29 @@ function createAddonHostSurfaceAdapter(addonHost) {
       return Boolean(addonHost.removeStyle(styleId));
     },
     listOwnedSlots() {
+      if (disposed) {
+        return [];
+      }
       return [...ownedSlots];
     },
     onDispose(fn) {
       if (disposed || typeof fn !== "function") {
         return;
       }
-      addonHost.onDispose(fn);
+      localDisposers.push(fn);
     },
     dispose() {
       if (disposed) {
         return;
       }
-      disposed = true;
-      ownedSlots.clear();
-      ownedStyles.clear();
+      runLocalTeardown();
       addonHost.dispose();
     }
   });
 }
 
 // src/adapters/remote-web/shadow-surface-adapter.js
-var hasOwn2 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+var hasOwn3 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 function createShadowSurfaceAdapter({
   doc,
   ownerId = "antigravity-remote-plugin",
@@ -3480,7 +4155,7 @@ function createShadowSurfaceAdapter({
       if (typeof slotId !== "string" || !slotId.trim()) {
         throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "slotId must be a non-empty string.");
       }
-      if (hasOwn2(slots, slotId)) {
+      if (hasOwn3(slots, slotId)) {
         return slots[slotId];
       }
       const el = createSafeElement(doc, "div", {
@@ -3495,7 +4170,7 @@ function createShadowSurfaceAdapter({
       return el;
     },
     unmountSlot(slotId) {
-      if (!hasOwn2(slots, slotId)) {
+      if (!hasOwn3(slots, slotId)) {
         return false;
       }
       const el = slots[slotId];
@@ -3512,7 +4187,7 @@ function createShadowSurfaceAdapter({
       if (typeof styleId !== "string" || !styleId.trim()) {
         throw new SecurityPolicyError("ERR_INVALID_STYLE_ID", "styleId must be a non-empty string.");
       }
-      let styleEl = hasOwn2(styles, styleId) ? styles[styleId] : null;
+      let styleEl = hasOwn3(styles, styleId) ? styles[styleId] : null;
       if (!styleEl) {
         styleEl = createSafeElement(doc, "style", {
           attrs: {
@@ -3527,7 +4202,7 @@ function createShadowSurfaceAdapter({
       return styleEl;
     },
     removeStyle(styleId) {
-      if (!hasOwn2(styles, styleId)) {
+      if (!hasOwn3(styles, styleId)) {
         return false;
       }
       const el = styles[styleId];
@@ -4106,117 +4781,8 @@ function bootstrapAntigravityRemoteBridge({
   };
 }
 
-// src/runtime/remote-host-runtime.js
-var REMOTE_HOST_VERSION = "2.0.0";
+// src/runtime/desktop-addon-runtime.js
 var DESKTOP_SETTINGS_SLOT_ID = "antigravity-remote-plugin.settings";
-function mountRemotePluginHost({
-  win = globalThis.window,
-  doc = globalThis.document,
-  allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
-  initialLocale = "ko",
-  ownerId = "antigravity-remote-plugin"
-} = {}) {
-  if (!win || !doc) {
-    return null;
-  }
-  if (win.antigravityRemoteHost && typeof win.antigravityRemoteHost.toggleDock === "function") {
-    win.antigravityRemoteHost.toggleDock();
-    return win.antigravityRemoteHost;
-  }
-  const currentOrigin = win.location?.origin || "";
-  if (!isOriginAllowed(currentOrigin, allowedOrigins)) {
-    return null;
-  }
-  const diagnostics = new DiagnosticsBus();
-  const registry = new RemotePluginRegistry({ diagnostics });
-  const surface = createShadowSurfaceAdapter({ doc, ownerId, diagnostics });
-  const renderer = createDeclarativeSlotRenderer({
-    win,
-    doc,
-    surface,
-    registry,
-    initialLocale
-  });
-  const handshake = createPluginHandshakeHost({
-    win,
-    allowedOrigins,
-    onPortConnected({ port, origin, pluginId }) {
-      diagnostics.emit({
-        level: "info",
-        code: "REMOTE_PLUGIN_HANDSHAKE_CONNECTED",
-        source: "runtime.remote-host",
-        message: "Closed MessageChannel handshake established",
-        detail: { origin, pluginId }
-      });
-      port.onmessage = (msgEvent) => {
-        const msg = msgEvent?.data;
-        if (!msg || typeof msg !== "object") {
-          return;
-        }
-        if (msg.type === "remote-plugin-v1:list") {
-          port.postMessage({
-            type: "remote-plugin-v1:list-result",
-            plugins: registry.list().map((p) => ({
-              id: p.id,
-              version: p.version,
-              uiSlot: p.uiSlot,
-              capabilities: p.capabilities
-            }))
-          });
-        }
-      };
-    }
-  });
-  let disposed = false;
-  const handle = Object.freeze({
-    contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
-    version: REMOTE_HOST_VERSION,
-    registry,
-    renderer,
-    diagnostics,
-    register(plugin) {
-      return registry.register(plugin, { locale: renderer.getLocale() });
-    },
-    unregister(pluginId) {
-      return registry.unregister(pluginId);
-    },
-    listPlugins() {
-      return registry.list();
-    },
-    listSlots() {
-      return [...ALLOWED_UI_SLOTS];
-    },
-    toggleDock() {
-      renderer.toggleOpen();
-    },
-    setOpen(open) {
-      renderer.setOpen(open);
-    },
-    setLocale(locale) {
-      return renderer.setLocale(locale);
-    },
-    getLocale() {
-      return renderer.getLocale();
-    },
-    issueHandshakeNonce() {
-      return handshake.issueNonce();
-    },
-    dispose() {
-      if (disposed) {
-        return;
-      }
-      disposed = true;
-      handshake.dispose();
-      registry.dispose();
-      surface.dispose();
-      if (win.antigravityRemoteHost === handle) {
-        delete win.antigravityRemoteHost;
-      }
-    }
-  });
-  win.antigravityRemoteHost = handle;
-  return handle;
-}
 function mountDesktopAddon(addonHost, {
   doc = globalThis.document,
   clipboard = globalThis.navigator?.clipboard ?? null,
@@ -4224,9 +4790,10 @@ function mountDesktopAddon(addonHost, {
     bookmarklet: "dist/bookmarklet.txt",
     userscriptPath: "dist/antigravity-remote.user.js"
   },
-  initialLocale = "ko"
+  initialLocale = "ko",
+  diagnostics = null
 } = {}) {
-  const surface = createAddonHostSurfaceAdapter(addonHost);
+  const surface = createAddonHostSurfaceAdapter(addonHost, { diagnostics });
   const view = mountDesktopCompanionView({
     doc,
     surface,
@@ -4250,6 +4817,148 @@ function mountDesktopAddon(addonHost, {
   });
 }
 
+// src/runtime/remote-web-runtime.js
+var REMOTE_HOST_VERSION = "2.0.0";
+var mountedHostsByWindow = /* @__PURE__ */ new WeakMap();
+function mountRemotePluginHost({
+  win = globalThis.window,
+  doc = globalThis.document,
+  allowedOrigins = DEFAULT_ANTIGRAVITY_REMOTE_ORIGINS,
+  initialLocale = "ko",
+  ownerId = "antigravity-remote-plugin"
+} = {}) {
+  if (!win || !doc) {
+    return null;
+  }
+  const currentOrigin = win.location?.origin || "";
+  if (!isOriginAllowed(currentOrigin, allowedOrigins)) {
+    return null;
+  }
+  const existing = mountedHostsByWindow.get(win);
+  if (existing) {
+    existing.toggleDock();
+    return existing.publicApi;
+  }
+  const existingDesc = Object.getOwnPropertyDescriptor(win, "antigravityRemoteHost");
+  if (existingDesc && existingDesc.writable === false && existingDesc.enumerable === false && existingDesc.value && existingDesc.value.contractVersion === REMOTE_PLUGIN_CONTRACT_VERSION && typeof existingDesc.value.toggleDock === "function") {
+    existingDesc.value.toggleDock();
+    return existingDesc.value;
+  }
+  const diagnostics = new DiagnosticsBus();
+  const registry = new RemotePluginRegistry({ diagnostics });
+  const surface = createShadowSurfaceAdapter({ doc, ownerId, diagnostics });
+  const renderer = createDeclarativeSlotRenderer({
+    win,
+    doc,
+    surface,
+    registry,
+    initialLocale
+  });
+  const activePortBridges = /* @__PURE__ */ new Set();
+  const handshake = createPluginHandshakeHost({
+    win,
+    allowedOrigins,
+    onPortConnected({ port, origin, pluginId, close }) {
+      diagnostics.emit({
+        level: "info",
+        code: "REMOTE_PLUGIN_HANDSHAKE_CONNECTED",
+        source: "runtime.remote-web",
+        message: "Closed MessageChannel handshake established",
+        detail: { origin, pluginId }
+      });
+      const bridge = attachRemotePluginPortBridge({
+        port,
+        registry,
+        diagnostics,
+        onClose() {
+          activePortBridges.delete(bridge);
+          close();
+        }
+      });
+      activePortBridges.add(bridge);
+    }
+  });
+  let disposed = false;
+  const publicApi = Object.freeze({
+    contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
+    version: REMOTE_HOST_VERSION,
+    register(plugin) {
+      if (disposed) {
+        return () => {
+        };
+      }
+      return registry.register(plugin, { locale: renderer.getLocale() });
+    },
+    listSlots() {
+      return Object.freeze([...ALLOWED_UI_SLOTS]);
+    },
+    toggleDock() {
+      if (!disposed) {
+        renderer.toggleOpen();
+      }
+    },
+    setLocale(locale) {
+      if (disposed) {
+        return Promise.resolve();
+      }
+      return renderer.setLocale(locale);
+    },
+    getLocale() {
+      return renderer.getLocale();
+    }
+  });
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    mountedHostsByWindow.delete(win);
+    for (const bridge of [...activePortBridges]) {
+      bridge.close();
+    }
+    activePortBridges.clear();
+    handshake.dispose();
+    registry.dispose();
+    surface.dispose();
+    if (win.antigravityRemoteHost === publicApi) {
+      delete win.antigravityRemoteHost;
+    }
+  };
+  const controller = Object.freeze({
+    publicApi,
+    contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
+    version: REMOTE_HOST_VERSION,
+    register: publicApi.register,
+    listSlots: publicApi.listSlots,
+    listPlugins() {
+      return registry.list();
+    },
+    toggleDock: publicApi.toggleDock,
+    setOpen(open) {
+      if (!disposed) {
+        renderer.setOpen(open);
+      }
+    },
+    isOpen() {
+      return renderer.isOpen();
+    },
+    setLocale: publicApi.setLocale,
+    getLocale: publicApi.getLocale,
+    activePortCount() {
+      return handshake.activePortCount();
+    },
+    dispose
+  });
+  mountedHostsByWindow.set(win, controller);
+  Object.defineProperty(win, "antigravityRemoteHost", {
+    value: publicApi,
+    writable: false,
+    enumerable: false,
+    configurable: true
+  });
+  return controller;
+}
+
 // virtual-remote-bridge-entry.js
 var BUILD_VERSION = "2.0.0";
 export {
@@ -4267,8 +4976,11 @@ export {
   DisposableStore,
   EventChain,
   HANDSHAKE_ACK_TYPE,
+  HANDSHAKE_CHALLENGE_TYPE,
   HANDSHAKE_PROTOCOL_TYPE,
+  HANDSHAKE_REQUEST_TYPE,
   PORT_CONTRACTS,
+  PORT_MSG,
   REDACTED,
   REMOTE_HOST_VERSION,
   REMOTE_PLUGIN_CONTRACT_VERSION,
@@ -4287,8 +4999,10 @@ export {
   assertSafeText,
   assertTrustedScriptUrl,
   assertWritableConfigPath,
+  attachRemotePluginPortBridge,
   bootstrapAntigravityRemoteBridge,
   canonicalizeConfigPath,
+  connectPluginHandshake,
   createAddonHostSurfaceAdapter,
   createAntigravityDiscoveryAdapter,
   createAntigravityFrameAdapter,
@@ -4324,6 +5038,7 @@ export {
   redactUrl,
   resolveLocalizedText,
   sanitizeTranslatorSettings,
+  serveRemotePluginOverPort,
   stripSensitiveDeep,
   stripSensitiveSettings,
   validateActionInvocation,

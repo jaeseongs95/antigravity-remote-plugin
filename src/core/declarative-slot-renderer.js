@@ -1,9 +1,14 @@
 import { createSafeElement } from '../security/dom-guard.js';
+import { AsyncMutex } from './lifecycle.js';
 import { validateHostSurfacePort } from './ports.js';
 import { resolveLocalizedText } from './remote-plugin-contract.js';
 
 const HOST_STYLE_ID = 'remote-slot-host-css';
 const HOST_SLOT_ID = 'remote-slot-host.root';
+
+const hasOwn = Object.hasOwn
+  ? Object.hasOwn
+  : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 
 const SLOT_LABELS = Object.freeze({
   'title-bar': Object.freeze({ ko: '상단 타이틀 바', en: 'Title Bar' }),
@@ -53,6 +58,11 @@ const STRINGS = Object.freeze({
   }),
 });
 
+const ACTION_OK_LOCALIZED = Object.freeze({
+  ko: STRINGS.ko.actionOk,
+  en: STRINGS.en.actionOk,
+});
+
 const HOST_CSS = [
   `:host, .rph-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color-scheme: light dark; box-sizing: border-box; }`,
   `.rph-root * { box-sizing: border-box; }`,
@@ -93,7 +103,7 @@ const HOST_CSS = [
   `.rph-notice[data-tone="error"] { background: rgba(234,67,53,0.18); }`,
   `.rph-notice[data-tone="warn"] { background: rgba(251,188,4,0.18); }`,
   `.rph-confirm { border-radius: 10px; border: 1px solid #f29900; background: rgba(251,188,4,0.12); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
-  `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }`,
+  `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }`,
   `@media (prefers-color-scheme: light) { .rph-titlebar, .rph-statusbar, .rph-composerbar, .rph-pill, .rph-drawer { background: var(--card, #ffffff); color: var(--foreground, #1f2328); } }`,
 ].join(' ');
 
@@ -122,8 +132,10 @@ export function createDeclarativeSlotRenderer({
   let isOpen = false;
   let disposed = false;
   let renderSeq = 0;
+  let actionGeneration = 0;
   let pendingChallenge = null;
   const feedbackByPlugin = Object.create(null);
+  const actionMutex = new AsyncMutex();
 
   surface.injectStyle(HOST_STYLE_ID, HOST_CSS);
   const slotRoot = surface.mountSlot(HOST_SLOT_ID);
@@ -179,7 +191,12 @@ export function createDeclarativeSlotRenderer({
   headerEl.appendChild(headerActions);
 
   const confirmBoxEl = createSafeElement(doc, 'div', {
-    attrs: { class: 'rph-confirm', 'data-rph-control': 'confirm-box', role: 'alertdialog', hidden: 'hidden' },
+    attrs: {
+      class: 'rph-confirm',
+      'data-rph-control': 'confirm-box',
+      role: 'alertdialog',
+      hidden: 'hidden',
+    },
   });
   const drawerBodyEl = createSafeElement(doc, 'div', {
     attrs: { 'data-rph-control': 'drawer-body' },
@@ -214,6 +231,17 @@ export function createDeclarativeSlotRenderer({
   slotRoot.appendChild(statusBarEl);
   slotRoot.appendChild(dockEl);
 
+  function pruneStalePluginState(activeIdSet) {
+    if (pendingChallenge && !activeIdSet.has(pendingChallenge.pluginId)) {
+      pendingChallenge = null;
+    }
+    for (const key of Object.keys(feedbackByPlugin)) {
+      if (!activeIdSet.has(key)) {
+        delete feedbackByPlugin[key];
+      }
+    }
+  }
+
   function setOpen(nextOpen) {
     isOpen = Boolean(nextOpen);
     drawerEl.hidden = !isOpen;
@@ -236,7 +264,8 @@ export function createDeclarativeSlotRenderer({
 
   function renderConfirmBox() {
     clearChildren(confirmBoxEl);
-    if (!pendingChallenge) {
+    if (!pendingChallenge || !registry.get(pendingChallenge.pluginId)) {
+      pendingChallenge = null;
       confirmBoxEl.hidden = true;
       return;
     }
@@ -292,47 +321,56 @@ export function createDeclarativeSlotRenderer({
   }
 
   async function executePluginAction(pluginId, actionId, invocation = {}) {
-    const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
-    if (disposed) {
+    const myGen = ++actionGeneration;
+    return actionMutex.runExclusive(async () => {
+      if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+        return null;
+      }
+      const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
+      if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+        return null;
+      }
+      if (result.status === 'confirmation_required') {
+        pendingChallenge = {
+          pluginId,
+          actionId,
+          expectedRevision: invocation.expectedRevision,
+          challengeId: result.challengeId,
+          message: result.message,
+          confirmLabel: result.confirmLabel,
+        };
+        setOpen(true);
+        renderConfirmBox();
+        return result;
+      }
+      if (pendingChallenge && pendingChallenge.pluginId === pluginId) {
+        pendingChallenge = null;
+      }
+      if (result.status === 'conflict') {
+        feedbackByPlugin[pluginId] = {
+          tone: 'warn',
+          message: result.message,
+          needsRefresh: true,
+        };
+      } else if (result.status === 'error') {
+        feedbackByPlugin[pluginId] = {
+          tone: 'error',
+          message: result.message,
+          needsRefresh: false,
+        };
+      } else {
+        feedbackByPlugin[pluginId] = {
+          tone: 'ok',
+          message: result.message ?? ACTION_OK_LOCALIZED,
+          needsRefresh: false,
+        };
+      }
+      await render();
       return result;
-    }
-    if (result.status === 'confirmation_required') {
-      pendingChallenge = {
-        pluginId,
-        actionId,
-        expectedRevision: invocation.expectedRevision,
-        challengeId: result.challengeId,
-        message: result.message,
-        confirmLabel: result.confirmLabel,
-      };
-      setOpen(true);
-      renderConfirmBox();
-      return result;
-    }
-    if (result.status === 'conflict') {
-      feedbackByPlugin[pluginId] = {
-        tone: 'warn',
-        text: resolveLocalizedText(result.message, locale),
-        needsRefresh: true,
-      };
-    } else if (result.status === 'error') {
-      feedbackByPlugin[pluginId] = {
-        tone: 'error',
-        text: resolveLocalizedText(result.message, locale),
-        needsRefresh: false,
-      };
-    } else {
-      feedbackByPlugin[pluginId] = {
-        tone: 'ok',
-        text: result.message ? resolveLocalizedText(result.message, locale) : STRINGS[locale].actionOk,
-        needsRefresh: false,
-      };
-    }
-    await render();
-    return result;
+    });
   }
 
-  function renderSection(pluginId, snapshotRevision, section) {
+  function renderSection(plugin, snapshotRevision, section) {
     if (section.kind === 'notice') {
       return createSafeElement(doc, 'div', {
         attrs: { class: 'rph-notice', 'data-tone': section.tone },
@@ -354,7 +392,12 @@ export function createDeclarativeSlotRenderer({
     if (section.kind === 'list') {
       const box = createSafeElement(doc, 'div', { attrs: { class: 'rph-kv' } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, 'div', { attrs: { class: 'rph-slot-heading' }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, 'div', {
+            attrs: { class: 'rph-slot-heading' },
+            text: resolveLocalizedText(section.title, locale),
+          }),
+        );
       }
       const ul = createSafeElement(doc, 'ul', { attrs: { class: 'rph-list' } });
       for (const item of section.items) {
@@ -362,11 +405,21 @@ export function createDeclarativeSlotRenderer({
         const left = createSafeElement(doc, 'div');
         left.appendChild(createSafeElement(doc, 'div', { text: resolveLocalizedText(item.primary, locale) }));
         if (item.secondary) {
-          left.appendChild(createSafeElement(doc, 'div', { attrs: { class: 'rph-slot-heading' }, text: resolveLocalizedText(item.secondary, locale) }));
+          left.appendChild(
+            createSafeElement(doc, 'div', {
+              attrs: { class: 'rph-slot-heading' },
+              text: resolveLocalizedText(item.secondary, locale),
+            }),
+          );
         }
         li.appendChild(left);
         if (item.badge) {
-          li.appendChild(createSafeElement(doc, 'span', { attrs: { class: 'rph-chip' }, text: resolveLocalizedText(item.badge, locale) }));
+          li.appendChild(
+            createSafeElement(doc, 'span', {
+              attrs: { class: 'rph-chip' },
+              text: resolveLocalizedText(item.badge, locale),
+            }),
+          );
         }
         ul.appendChild(li);
       }
@@ -376,7 +429,12 @@ export function createDeclarativeSlotRenderer({
     if (section.kind === 'key-value') {
       const box = createSafeElement(doc, 'div', { attrs: { class: 'rph-kv' } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, 'div', { attrs: { class: 'rph-slot-heading' }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, 'div', {
+            attrs: { class: 'rph-slot-heading' },
+            text: resolveLocalizedText(section.title, locale),
+          }),
+        );
       }
       for (const entry of section.entries) {
         const row = createSafeElement(doc, 'div', { attrs: { class: 'rph-kv-row' } });
@@ -387,9 +445,18 @@ export function createDeclarativeSlotRenderer({
       return box;
     }
     if (section.kind === 'actions') {
+      // NB3: Enforce declared capabilities — omit interactive buttons if plugin lacks "actions".
+      if (!plugin.capabilities.includes('actions')) {
+        return null;
+      }
       const box = createSafeElement(doc, 'div', { attrs: { class: 'rph-kv' } });
       if (section.title) {
-        box.appendChild(createSafeElement(doc, 'div', { attrs: { class: 'rph-slot-heading' }, text: resolveLocalizedText(section.title, locale) }));
+        box.appendChild(
+          createSafeElement(doc, 'div', {
+            attrs: { class: 'rph-slot-heading' },
+            text: resolveLocalizedText(section.title, locale),
+          }),
+        );
       }
       const row = createSafeElement(doc, 'div', { attrs: { class: 'rph-actions' } });
       for (const item of section.items) {
@@ -397,7 +464,7 @@ export function createDeclarativeSlotRenderer({
           type: 'button',
           class: 'rph-btn',
           'data-style': item.style,
-          'data-plugin-id': pluginId,
+          'data-plugin-id': plugin.id,
           'data-action-id': item.id,
         };
         if (item.disabled) {
@@ -409,7 +476,7 @@ export function createDeclarativeSlotRenderer({
         });
         btn.addEventListener('click', () => {
           void executePluginAction(
-            pluginId,
+            plugin.id,
             item.id,
             snapshotRevision ? { expectedRevision: snapshotRevision } : {},
           );
@@ -419,7 +486,7 @@ export function createDeclarativeSlotRenderer({
       box.appendChild(row);
       return box;
     }
-    return createSafeElement(doc, 'div');
+    return null;
   }
 
   function renderInlineBarPlugin(container, plugin, snapResult) {
@@ -456,11 +523,22 @@ export function createDeclarativeSlotRenderer({
       );
     }
     for (const sec of snapshot.sections) {
-      if (sec.kind === 'metrics') {
-        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
-      } else if (sec.kind === 'actions') {
-        itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      if (sec.kind === 'metrics' || sec.kind === 'actions') {
+        const rendered = renderSection(plugin, snapshot.revision, sec);
+        if (rendered) {
+          itemWrap.appendChild(rendered);
+        }
       }
+    }
+    // NB2: Surface action feedback (error/conflict/ok) on inline bar plugins as well.
+    if (hasOwn(feedbackByPlugin, plugin.id)) {
+      const fb = feedbackByPlugin[plugin.id];
+      itemWrap.appendChild(
+        createSafeElement(doc, 'span', {
+          attrs: { class: 'rph-chip', 'data-tone': fb.tone, role: 'status', 'aria-live': 'polite' },
+          text: resolveLocalizedText(fb.message, locale),
+        }),
+      );
     }
     container.appendChild(itemWrap);
   }
@@ -510,16 +588,20 @@ export function createDeclarativeSlotRenderer({
       );
     }
     for (const sec of snapshot.sections) {
-      card.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+      const rendered = renderSection(plugin, snapshot.revision, sec);
+      if (rendered) {
+        card.appendChild(rendered);
+      }
     }
 
-    const fb = feedbackByPlugin[plugin.id];
-    if (fb) {
-      const fbEl = createSafeElement(doc, 'div', {
-        attrs: { class: 'rph-notice', 'data-tone': fb.tone, role: 'status', 'aria-live': 'polite' },
-        text: fb.text,
-      });
-      card.appendChild(fbEl);
+    if (hasOwn(feedbackByPlugin, plugin.id)) {
+      const fb = feedbackByPlugin[plugin.id];
+      card.appendChild(
+        createSafeElement(doc, 'div', {
+          attrs: { class: 'rph-notice', 'data-tone': fb.tone, role: 'status', 'aria-live': 'polite' },
+          text: resolveLocalizedText(fb.message, locale),
+        }),
+      );
       if (fb.needsRefresh) {
         const reloadBtn = createSafeElement(doc, 'button', {
           attrs: { type: 'button', class: 'rph-btn', 'data-rph-control': 'conflict-reload' },
@@ -541,6 +623,9 @@ export function createDeclarativeSlotRenderer({
     }
     const seq = ++renderSeq;
     const plugins = registry.list();
+    const activeIds = new Set(plugins.map((p) => p.id));
+    pruneStalePluginState(activeIds);
+
     const snapshots = await Promise.all(
       plugins.map(async (plugin) => ({
         plugin,
@@ -550,6 +635,9 @@ export function createDeclarativeSlotRenderer({
     if (disposed || seq !== renderSeq) {
       return;
     }
+
+    const liveIds = new Set(registry.list().map((p) => p.id));
+    pruneStalePluginState(liveIds);
 
     updateChromeLocale();
     renderConfirmBox();
@@ -566,6 +654,9 @@ export function createDeclarativeSlotRenderer({
     let composerBarCount = 0;
 
     for (const entry of snapshots) {
+      if (!liveIds.has(entry.plugin.id)) {
+        continue;
+      }
       const slot = entry.plugin.uiSlot.slot;
       if (slot === 'title-bar') {
         renderInlineBarPlugin(titleBarEl, entry.plugin, entry.snapResult);
@@ -638,7 +729,14 @@ export function createDeclarativeSlotRenderer({
   if (win && typeof win.addEventListener === 'function') {
     win.addEventListener('keydown', onKeyDown);
   }
-  const unsubRegistry = registry.onChange(() => {
+  const unsubRegistry = registry.onChange((evt) => {
+    if (evt && evt.type === 'unregistered' && typeof evt.pluginId === 'string') {
+      actionGeneration += 1;
+      if (pendingChallenge && pendingChallenge.pluginId === evt.pluginId) {
+        pendingChallenge = null;
+      }
+      delete feedbackByPlugin[evt.pluginId];
+    }
     void render();
   });
 
@@ -647,6 +745,8 @@ export function createDeclarativeSlotRenderer({
       return;
     }
     disposed = true;
+    actionGeneration += 1;
+    pendingChallenge = null;
     unsubRegistry();
     pillBtn.removeEventListener('click', onPillClick);
     closeBtn.removeEventListener('click', onCloseClick);
@@ -677,9 +777,7 @@ export function createDeclarativeSlotRenderer({
     isOpen() {
       return isOpen;
     },
-    getSlotRoot() {
-      return slotRoot;
-    },
+    executePluginAction,
     dispose,
   });
 }

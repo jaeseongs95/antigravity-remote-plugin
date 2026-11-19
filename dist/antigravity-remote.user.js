@@ -100,113 +100,6 @@
     return false;
   }
 
-  // src/security/dom-guard.js
-  var FORBIDDEN_TAGS = /* @__PURE__ */ new Set(["base", "script", "object", "embed"]);
-  var FORBIDDEN_PROP_PREFIXES = Object.freeze(["on"]);
-  var FORBIDDEN_HTML_PROPS = /* @__PURE__ */ new Set([
-    ["inner", "HTML"].join(""),
-    ["outer", "HTML"].join(""),
-    ["insertAdjacent", "HTML"].join(""),
-    "srcdoc"
-  ]);
-  var FORBIDDEN_URI_SCHEME_PATTERN = /^(?:javascript|vbscript|data):/i;
-  function normalizeUriForSchemeCheck(rawValue) {
-    return String(rawValue).replace(/[\u0000-\u0020\u007f]+/g, "");
-  }
-  function assertSafeTagName(tagName) {
-    if (typeof tagName !== "string" || tagName.trim().length === 0) {
-      throw new SecurityPolicyError("INVALID_TAG_NAME", "Tag name must be a non-empty string.");
-    }
-    const normalized = tagName.trim().toLowerCase();
-    if (FORBIDDEN_TAGS.has(normalized)) {
-      throw new SecurityPolicyError(
-        "FORBIDDEN_ELEMENT_TAG",
-        `Creating <${normalized}> elements is forbidden by security policy.`
-      );
-    }
-    return normalized;
-  }
-  function assertSafeAttribute(attrName, attrValue) {
-    if (typeof attrName !== "string" || attrName.trim().length === 0) {
-      throw new SecurityPolicyError("INVALID_ATTRIBUTE", "Attribute name must be non-empty.");
-    }
-    const normalized = attrName.trim();
-    const lower = normalized.toLowerCase();
-    if (FORBIDDEN_HTML_PROPS.has(normalized) || FORBIDDEN_HTML_PROPS.has(lower)) {
-      throw new SecurityPolicyError(
-        "FORBIDDEN_HTML_SINK",
-        `Setting unsafe HTML sink "${attrName}" is forbidden.`
-      );
-    }
-    for (const prefix of FORBIDDEN_PROP_PREFIXES) {
-      if (lower.startsWith(prefix) && lower.length > prefix.length) {
-        throw new SecurityPolicyError(
-          "FORBIDDEN_EVENT_ATTRIBUTE",
-          `Inline event handler attribute "${attrName}" is forbidden.`
-        );
-      }
-    }
-    if (attrValue !== null && attrValue !== void 0) {
-      const collapsed = normalizeUriForSchemeCheck(attrValue);
-      if (FORBIDDEN_URI_SCHEME_PATTERN.test(collapsed)) {
-        throw new SecurityPolicyError(
-          "FORBIDDEN_URI_SCHEME",
-          `Dangerous URI scheme in attribute "${attrName}" is forbidden.`
-        );
-      }
-    }
-  }
-  function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}) {
-    const safeTag = assertSafeTagName(tagName);
-    if (!doc || typeof doc.createElement !== "function") {
-      throw new SecurityPolicyError("INVALID_DOCUMENT", "A document with createElement is required.");
-    }
-    const el = doc.createElement(safeTag);
-    for (const [key, val] of Object.entries(attrs)) {
-      const stringVal = val !== null && val !== void 0 ? String(val) : val;
-      assertSafeAttribute(key, stringVal);
-      if (stringVal !== null && stringVal !== void 0) {
-        el.setAttribute(key, stringVal);
-      }
-    }
-    if (text !== null && text !== void 0) {
-      el.textContent = String(text);
-    }
-    return el;
-  }
-
-  // src/core/ports.js
-  function assertPort(port, portName, requiredMethods) {
-    if (!port || typeof port !== "object") {
-      throw new TypeError(`Missing required port "${portName}".`);
-    }
-    for (const method of requiredMethods) {
-      if (typeof port[method] !== "function") {
-        throw new TypeError(`Port "${portName}" must implement method "${method}()".`);
-      }
-    }
-    return port;
-  }
-  var PORT_CONTRACTS = Object.freeze({
-    HostDiscoveryPort: Object.freeze(["listPlugins", "listSidecars"]),
-    FramePromotionPort: Object.freeze(["acquireActiveFrame", "onFrameChange"]),
-    SidecarRelayPort: Object.freeze(["requestJson", "buildUiUrl"]),
-    SettingsReadPort: Object.freeze(["readPluginSettings"]),
-    ThemeWorkspaceSyncPort: Object.freeze(["getThemeVariables", "getWorkspaceUris", "subscribe"]),
-    ExtensionBridgePort: Object.freeze(["id", "pluginName", "mount", "dispose"]),
-    HostSurfacePort: Object.freeze([
-      "mountSlot",
-      "unmountSlot",
-      "injectStyle",
-      "removeStyle",
-      "onDispose",
-      "dispose"
-    ])
-  });
-  function validateHostSurfacePort(port) {
-    return assertPort(port, "HostSurfacePort", PORT_CONTRACTS.HostSurfacePort);
-  }
-
   // src/security/redactor.js
   var SENSITIVE_KEY_PATTERN = /^(authorization|cookie|set-cookie|token|access_token|refresh_token|csrf|csrf_token|x-sidecar-token|x-csrf-token|x-api-key|api_key|apikey|secret|password|passwd|env|headers)$/i;
   var SENSITIVE_SUBSTRING_PATTERN = /(token|secret|password|passwd|csrf|authorization|apikey|api_key)/i;
@@ -497,7 +390,13 @@
     if (typeof plugin.uiSlot.slotId !== "string" || !SLOT_ID_RE.test(plugin.uiSlot.slotId) || FORBIDDEN_KEYS.has(plugin.uiSlot.slotId)) {
       throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "Invalid uiSlot.slotId.");
     }
-    const exclusive = Boolean(plugin.uiSlot.exclusive);
+    if (plugin.uiSlot.exclusive !== void 0 && typeof plugin.uiSlot.exclusive !== "boolean") {
+      throw new SecurityPolicyError(
+        "ERR_INVALID_EXCLUSIVE_FLAG",
+        "uiSlot.exclusive must be a boolean when provided."
+      );
+    }
+    const exclusive = plugin.uiSlot.exclusive === true;
     if (!Array.isArray(plugin.capabilities) || plugin.capabilities.length === 0) {
       throw new SecurityPolicyError(
         "ERR_INVALID_CAPABILITIES",
@@ -853,9 +752,381 @@
     });
   }
 
+  // src/bridges/remote-plugin-port-bridge.js
+  var PORT_MSG = Object.freeze({
+    REGISTER: "remote-plugin-v1:register",
+    REGISTER_RESULT: "remote-plugin-v1:register-result",
+    UNREGISTER: "remote-plugin-v1:unregister",
+    DISCONNECT: "remote-plugin-v1:disconnect",
+    DIRTY: "remote-plugin-v1:dirty",
+    LIST: "remote-plugin-v1:list",
+    LIST_RESULT: "remote-plugin-v1:list-result",
+    SNAPSHOT_REQ: "remote-plugin-v1:snapshot-req",
+    SNAPSHOT_RES: "remote-plugin-v1:snapshot-res",
+    INVOKE_REQ: "remote-plugin-v1:invoke-req",
+    INVOKE_RES: "remote-plugin-v1:invoke-res"
+  });
+  var DEFAULT_RPC_TIMEOUT_MS = 5e3;
+  function attachRemotePluginPortBridge({
+    port,
+    registry,
+    diagnostics = null,
+    onClose = null,
+    rpcTimeoutMs = DEFAULT_RPC_TIMEOUT_MS
+  }) {
+    if (!port || typeof port.postMessage !== "function") {
+      throw new TypeError("attachRemotePluginPortBridge requires a MessagePort.");
+    }
+    if (!registry || typeof registry.register !== "function") {
+      throw new TypeError("attachRemotePluginPortBridge requires a RemotePluginRegistry.");
+    }
+    let closed = false;
+    let reqCounter = 0;
+    let registeredPluginId = null;
+    let unregisterFn = null;
+    let dirtyCallback = null;
+    const pendingRpc = /* @__PURE__ */ new Map();
+    function rejectAllPending(reason) {
+      for (const [id, entry] of pendingRpc.entries()) {
+        clearTimeout(entry.timer);
+        pendingRpc.delete(id);
+        entry.reject(new Error(reason));
+      }
+    }
+    function sendRpc(reqType, payload) {
+      if (closed) {
+        return Promise.reject(new SecurityPolicyError("ERR_PORT_CLOSED", "Remote plugin port is closed."));
+      }
+      const requestId = `rpc-${++reqCounter}`;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingRpc.delete(requestId);
+          reject(new Error(`RPC ${reqType} timed out`));
+        }, rpcTimeoutMs);
+        pendingRpc.set(requestId, { resolve, reject, timer });
+        try {
+          port.postMessage({ type: reqType, requestId, ...payload });
+        } catch (err) {
+          clearTimeout(timer);
+          pendingRpc.delete(requestId);
+          reject(err);
+        }
+      });
+    }
+    function teardownLocalPlugin() {
+      dirtyCallback = null;
+      if (typeof unregisterFn === "function") {
+        const unreg = unregisterFn;
+        unregisterFn = null;
+        registeredPluginId = null;
+        unreg();
+      } else {
+        registeredPluginId = null;
+      }
+    }
+    function closeBridge() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      rejectAllPending("Remote plugin port disconnected.");
+      teardownLocalPlugin();
+      if (typeof port.removeEventListener === "function") {
+        port.removeEventListener("message", onMessage);
+      } else if (port.onmessage === onMessage) {
+        port.onmessage = null;
+      }
+      if (typeof onClose === "function") {
+        onClose();
+      } else if (typeof port.close === "function") {
+        port.close();
+      }
+    }
+    function onMessage(event) {
+      if (closed) {
+        return;
+      }
+      const msg = event?.data;
+      if (!msg || typeof msg !== "object") {
+        return;
+      }
+      if (msg.type === PORT_MSG.SNAPSHOT_RES || msg.type === PORT_MSG.INVOKE_RES) {
+        const entry = pendingRpc.get(msg.requestId);
+        if (!entry) {
+          return;
+        }
+        clearTimeout(entry.timer);
+        pendingRpc.delete(msg.requestId);
+        if (msg.ok) {
+          entry.resolve(msg.result);
+        } else {
+          entry.reject(new Error(typeof msg.error === "string" ? msg.error : "Remote RPC error"));
+        }
+        return;
+      }
+      if (msg.type === PORT_MSG.LIST) {
+        port.postMessage({
+          type: PORT_MSG.LIST_RESULT,
+          requestId: msg.requestId ?? null,
+          plugins: registry.list().map((p) => ({
+            id: p.id,
+            version: p.version,
+            uiSlot: p.uiSlot,
+            capabilities: p.capabilities
+          }))
+        });
+        return;
+      }
+      if (msg.type === PORT_MSG.REGISTER) {
+        const desc = msg.descriptor;
+        if (!desc || typeof desc !== "object" || Array.isArray(desc)) {
+          port.postMessage({
+            type: PORT_MSG.REGISTER_RESULT,
+            requestId: msg.requestId ?? null,
+            ok: false,
+            error: "Invalid plugin descriptor."
+          });
+          return;
+        }
+        if (registeredPluginId) {
+          port.postMessage({
+            type: PORT_MSG.REGISTER_RESULT,
+            requestId: msg.requestId ?? null,
+            ok: false,
+            error: "Port already registered a plugin."
+          });
+          return;
+        }
+        const caps = Array.isArray(desc.capabilities) ? desc.capabilities : [];
+        const proxy = {
+          contractVersion: desc.contractVersion ?? REMOTE_PLUGIN_CONTRACT_VERSION,
+          id: desc.id,
+          version: desc.version,
+          displayName: desc.displayName,
+          uiSlot: desc.uiSlot,
+          capabilities: caps,
+          loadOrder: desc.loadOrder,
+          getSnapshot(ctx) {
+            return sendRpc(PORT_MSG.SNAPSHOT_REQ, { ctx });
+          },
+          ...caps.includes("actions") ? {
+            invoke(actionId, invocation, ctx) {
+              return sendRpc(PORT_MSG.INVOKE_REQ, { actionId, invocation, ctx });
+            }
+          } : {},
+          ...caps.includes("subscribe") ? {
+            subscribe(onDirty) {
+              dirtyCallback = onDirty;
+              return () => {
+                if (dirtyCallback === onDirty) {
+                  dirtyCallback = null;
+                }
+              };
+            }
+          } : {},
+          dispose() {
+            if (!closed) {
+              try {
+                port.postMessage({ type: PORT_MSG.DISCONNECT });
+              } catch (err) {
+                if (diagnostics) {
+                  diagnostics.emit({
+                    level: "warn",
+                    code: "PORT_DISCONNECT_SEND_FAILED",
+                    source: "bridge.remote-plugin-port",
+                    message: "Failed sending disconnect over port",
+                    detail: err
+                  });
+                }
+              }
+            }
+            closeBridge();
+          }
+        };
+        try {
+          unregisterFn = registry.register(proxy);
+          registeredPluginId = desc.id;
+          port.postMessage({
+            type: PORT_MSG.REGISTER_RESULT,
+            requestId: msg.requestId ?? null,
+            ok: true,
+            pluginId: desc.id
+          });
+        } catch (err) {
+          const redacted = redactSecrets(err);
+          port.postMessage({
+            type: PORT_MSG.REGISTER_RESULT,
+            requestId: msg.requestId ?? null,
+            ok: false,
+            error: redacted?.message || "Registration failed.",
+            code: err?.code || "ERR_REGISTER_FAILED"
+          });
+        }
+        return;
+      }
+      if (msg.type === PORT_MSG.DIRTY) {
+        if (typeof dirtyCallback === "function") {
+          dirtyCallback();
+        }
+        return;
+      }
+      if (msg.type === PORT_MSG.UNREGISTER) {
+        teardownLocalPlugin();
+        return;
+      }
+      if (msg.type === PORT_MSG.DISCONNECT) {
+        closeBridge();
+      }
+    }
+    if (typeof port.addEventListener === "function") {
+      port.addEventListener("message", onMessage);
+      if (typeof port.start === "function") {
+        port.start();
+      }
+    } else {
+      port.onmessage = onMessage;
+    }
+    return Object.freeze({
+      getRegisteredPluginId() {
+        return registeredPluginId;
+      },
+      close: closeBridge
+    });
+  }
+
+  // src/security/dom-guard.js
+  var FORBIDDEN_TAGS = /* @__PURE__ */ new Set(["base", "script", "object", "embed"]);
+  var FORBIDDEN_PROP_PREFIXES = Object.freeze(["on"]);
+  var FORBIDDEN_HTML_PROPS = /* @__PURE__ */ new Set([
+    ["inner", "HTML"].join(""),
+    ["outer", "HTML"].join(""),
+    ["insertAdjacent", "HTML"].join(""),
+    "srcdoc"
+  ]);
+  var FORBIDDEN_URI_SCHEME_PATTERN = /^(?:javascript|vbscript|data):/i;
+  function normalizeUriForSchemeCheck(rawValue) {
+    return String(rawValue).replace(/[\u0000-\u0020\u007f]+/g, "");
+  }
+  function assertSafeTagName(tagName) {
+    if (typeof tagName !== "string" || tagName.trim().length === 0) {
+      throw new SecurityPolicyError("INVALID_TAG_NAME", "Tag name must be a non-empty string.");
+    }
+    const normalized = tagName.trim().toLowerCase();
+    if (FORBIDDEN_TAGS.has(normalized)) {
+      throw new SecurityPolicyError(
+        "FORBIDDEN_ELEMENT_TAG",
+        `Creating <${normalized}> elements is forbidden by security policy.`
+      );
+    }
+    return normalized;
+  }
+  function assertSafeAttribute(attrName, attrValue) {
+    if (typeof attrName !== "string" || attrName.trim().length === 0) {
+      throw new SecurityPolicyError("INVALID_ATTRIBUTE", "Attribute name must be non-empty.");
+    }
+    const normalized = attrName.trim();
+    const lower = normalized.toLowerCase();
+    if (FORBIDDEN_HTML_PROPS.has(normalized) || FORBIDDEN_HTML_PROPS.has(lower)) {
+      throw new SecurityPolicyError(
+        "FORBIDDEN_HTML_SINK",
+        `Setting unsafe HTML sink "${attrName}" is forbidden.`
+      );
+    }
+    for (const prefix of FORBIDDEN_PROP_PREFIXES) {
+      if (lower.startsWith(prefix) && lower.length > prefix.length) {
+        throw new SecurityPolicyError(
+          "FORBIDDEN_EVENT_ATTRIBUTE",
+          `Inline event handler attribute "${attrName}" is forbidden.`
+        );
+      }
+    }
+    if (attrValue !== null && attrValue !== void 0) {
+      const collapsed = normalizeUriForSchemeCheck(attrValue);
+      if (FORBIDDEN_URI_SCHEME_PATTERN.test(collapsed)) {
+        throw new SecurityPolicyError(
+          "FORBIDDEN_URI_SCHEME",
+          `Dangerous URI scheme in attribute "${attrName}" is forbidden.`
+        );
+      }
+    }
+  }
+  function createSafeElement(doc, tagName, { attrs = {}, text = null } = {}) {
+    const safeTag = assertSafeTagName(tagName);
+    if (!doc || typeof doc.createElement !== "function") {
+      throw new SecurityPolicyError("INVALID_DOCUMENT", "A document with createElement is required.");
+    }
+    const el = doc.createElement(safeTag);
+    for (const [key, val] of Object.entries(attrs)) {
+      const stringVal = val !== null && val !== void 0 ? String(val) : val;
+      assertSafeAttribute(key, stringVal);
+      if (stringVal !== null && stringVal !== void 0) {
+        el.setAttribute(key, stringVal);
+      }
+    }
+    if (text !== null && text !== void 0) {
+      el.textContent = String(text);
+    }
+    return el;
+  }
+
+  // src/core/lifecycle.js
+  var AsyncMutex = class {
+    #tail = Promise.resolve();
+    async runExclusive(taskFn) {
+      if (typeof taskFn !== "function") {
+        throw new TypeError("AsyncMutex taskFn must be a function.");
+      }
+      const prev = this.#tail;
+      let release;
+      this.#tail = new Promise((resolve) => {
+        release = resolve;
+      });
+      await prev;
+      try {
+        return await taskFn();
+      } finally {
+        release();
+      }
+    }
+  };
+
+  // src/core/ports.js
+  function assertPort(port, portName, requiredMethods) {
+    if (!port || typeof port !== "object") {
+      throw new TypeError(`Missing required port "${portName}".`);
+    }
+    for (const method of requiredMethods) {
+      if (typeof port[method] !== "function") {
+        throw new TypeError(`Port "${portName}" must implement method "${method}()".`);
+      }
+    }
+    return port;
+  }
+  var PORT_CONTRACTS = Object.freeze({
+    HostDiscoveryPort: Object.freeze(["listPlugins", "listSidecars"]),
+    FramePromotionPort: Object.freeze(["acquireActiveFrame", "onFrameChange"]),
+    SidecarRelayPort: Object.freeze(["requestJson", "buildUiUrl"]),
+    SettingsReadPort: Object.freeze(["readPluginSettings"]),
+    ThemeWorkspaceSyncPort: Object.freeze(["getThemeVariables", "getWorkspaceUris", "subscribe"]),
+    ExtensionBridgePort: Object.freeze(["id", "pluginName", "mount", "dispose"]),
+    HostSurfacePort: Object.freeze([
+      "mountSlot",
+      "unmountSlot",
+      "injectStyle",
+      "removeStyle",
+      "listOwnedSlots",
+      "onDispose",
+      "dispose"
+    ])
+  });
+  function validateHostSurfacePort(port) {
+    return assertPort(port, "HostSurfacePort", PORT_CONTRACTS.HostSurfacePort);
+  }
+
   // src/core/declarative-slot-renderer.js
   var HOST_STYLE_ID = "remote-slot-host-css";
   var HOST_SLOT_ID = "remote-slot-host.root";
+  var hasOwn = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
   var SLOT_LABELS = Object.freeze({
     "title-bar": Object.freeze({ ko: "\uC0C1\uB2E8 \uD0C0\uC774\uD2C0 \uBC14", en: "Title Bar" }),
     "status-bar": Object.freeze({ ko: "\uC0C1\uD0DC \uD45C\uC2DC\uC904", en: "Status Bar" }),
@@ -902,6 +1173,10 @@
       actionOk: "Action completed."
     })
   });
+  var ACTION_OK_LOCALIZED = Object.freeze({
+    ko: STRINGS.ko.actionOk,
+    en: STRINGS.en.actionOk
+  });
   var HOST_CSS = [
     `:host, .rph-root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; color-scheme: light dark; box-sizing: border-box; }`,
     `.rph-root * { box-sizing: border-box; }`,
@@ -942,7 +1217,7 @@
     `.rph-notice[data-tone="error"] { background: rgba(234,67,53,0.18); }`,
     `.rph-notice[data-tone="warn"] { background: rgba(251,188,4,0.18); }`,
     `.rph-confirm { border-radius: 10px; border: 1px solid #f29900; background: rgba(251,188,4,0.12); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
-    `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }`,
+    `.rph-status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }`,
     `@media (prefers-color-scheme: light) { .rph-titlebar, .rph-statusbar, .rph-composerbar, .rph-pill, .rph-drawer { background: var(--card, #ffffff); color: var(--foreground, #1f2328); } }`
   ].join(" ");
   function clearChildren(el) {
@@ -968,8 +1243,10 @@
     let isOpen = false;
     let disposed = false;
     let renderSeq = 0;
+    let actionGeneration = 0;
     let pendingChallenge = null;
     const feedbackByPlugin = /* @__PURE__ */ Object.create(null);
+    const actionMutex = new AsyncMutex();
     surface.injectStyle(HOST_STYLE_ID, HOST_CSS);
     const slotRoot = surface.mountSlot(HOST_SLOT_ID);
     slotRoot.setAttribute("class", "rph-root");
@@ -1020,7 +1297,12 @@
     headerEl.appendChild(titleEl);
     headerEl.appendChild(headerActions);
     const confirmBoxEl = createSafeElement(doc, "div", {
-      attrs: { class: "rph-confirm", "data-rph-control": "confirm-box", role: "alertdialog", hidden: "hidden" }
+      attrs: {
+        class: "rph-confirm",
+        "data-rph-control": "confirm-box",
+        role: "alertdialog",
+        hidden: "hidden"
+      }
     });
     const drawerBodyEl = createSafeElement(doc, "div", {
       attrs: { "data-rph-control": "drawer-body" }
@@ -1050,6 +1332,16 @@
     slotRoot.appendChild(composerBarEl);
     slotRoot.appendChild(statusBarEl);
     slotRoot.appendChild(dockEl);
+    function pruneStalePluginState(activeIdSet) {
+      if (pendingChallenge && !activeIdSet.has(pendingChallenge.pluginId)) {
+        pendingChallenge = null;
+      }
+      for (const key of Object.keys(feedbackByPlugin)) {
+        if (!activeIdSet.has(key)) {
+          delete feedbackByPlugin[key];
+        }
+      }
+    }
     function setOpen(nextOpen) {
       isOpen = Boolean(nextOpen);
       drawerEl.hidden = !isOpen;
@@ -1070,7 +1362,8 @@
     }
     function renderConfirmBox() {
       clearChildren(confirmBoxEl);
-      if (!pendingChallenge) {
+      if (!pendingChallenge || !registry.get(pendingChallenge.pluginId)) {
+        pendingChallenge = null;
         confirmBoxEl.hidden = true;
         return;
       }
@@ -1123,46 +1416,55 @@
       confirmBoxEl.appendChild(btnRow);
     }
     async function executePluginAction(pluginId, actionId, invocation = {}) {
-      const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
-      if (disposed) {
+      const myGen = ++actionGeneration;
+      return actionMutex.runExclusive(async () => {
+        if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+          return null;
+        }
+        const result = await registry.invokeAction(pluginId, actionId, invocation, { locale });
+        if (disposed || myGen !== actionGeneration || !registry.get(pluginId)) {
+          return null;
+        }
+        if (result.status === "confirmation_required") {
+          pendingChallenge = {
+            pluginId,
+            actionId,
+            expectedRevision: invocation.expectedRevision,
+            challengeId: result.challengeId,
+            message: result.message,
+            confirmLabel: result.confirmLabel
+          };
+          setOpen(true);
+          renderConfirmBox();
+          return result;
+        }
+        if (pendingChallenge && pendingChallenge.pluginId === pluginId) {
+          pendingChallenge = null;
+        }
+        if (result.status === "conflict") {
+          feedbackByPlugin[pluginId] = {
+            tone: "warn",
+            message: result.message,
+            needsRefresh: true
+          };
+        } else if (result.status === "error") {
+          feedbackByPlugin[pluginId] = {
+            tone: "error",
+            message: result.message,
+            needsRefresh: false
+          };
+        } else {
+          feedbackByPlugin[pluginId] = {
+            tone: "ok",
+            message: result.message ?? ACTION_OK_LOCALIZED,
+            needsRefresh: false
+          };
+        }
+        await render();
         return result;
-      }
-      if (result.status === "confirmation_required") {
-        pendingChallenge = {
-          pluginId,
-          actionId,
-          expectedRevision: invocation.expectedRevision,
-          challengeId: result.challengeId,
-          message: result.message,
-          confirmLabel: result.confirmLabel
-        };
-        setOpen(true);
-        renderConfirmBox();
-        return result;
-      }
-      if (result.status === "conflict") {
-        feedbackByPlugin[pluginId] = {
-          tone: "warn",
-          text: resolveLocalizedText(result.message, locale),
-          needsRefresh: true
-        };
-      } else if (result.status === "error") {
-        feedbackByPlugin[pluginId] = {
-          tone: "error",
-          text: resolveLocalizedText(result.message, locale),
-          needsRefresh: false
-        };
-      } else {
-        feedbackByPlugin[pluginId] = {
-          tone: "ok",
-          text: result.message ? resolveLocalizedText(result.message, locale) : STRINGS[locale].actionOk,
-          needsRefresh: false
-        };
-      }
-      await render();
-      return result;
+      });
     }
-    function renderSection(pluginId, snapshotRevision, section) {
+    function renderSection(plugin, snapshotRevision, section) {
       if (section.kind === "notice") {
         return createSafeElement(doc, "div", {
           attrs: { class: "rph-notice", "data-tone": section.tone },
@@ -1184,7 +1486,12 @@
       if (section.kind === "list") {
         const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
         if (section.title) {
-          box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+          box.appendChild(
+            createSafeElement(doc, "div", {
+              attrs: { class: "rph-slot-heading" },
+              text: resolveLocalizedText(section.title, locale)
+            })
+          );
         }
         const ul = createSafeElement(doc, "ul", { attrs: { class: "rph-list" } });
         for (const item of section.items) {
@@ -1192,11 +1499,21 @@
           const left = createSafeElement(doc, "div");
           left.appendChild(createSafeElement(doc, "div", { text: resolveLocalizedText(item.primary, locale) }));
           if (item.secondary) {
-            left.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(item.secondary, locale) }));
+            left.appendChild(
+              createSafeElement(doc, "div", {
+                attrs: { class: "rph-slot-heading" },
+                text: resolveLocalizedText(item.secondary, locale)
+              })
+            );
           }
           li.appendChild(left);
           if (item.badge) {
-            li.appendChild(createSafeElement(doc, "span", { attrs: { class: "rph-chip" }, text: resolveLocalizedText(item.badge, locale) }));
+            li.appendChild(
+              createSafeElement(doc, "span", {
+                attrs: { class: "rph-chip" },
+                text: resolveLocalizedText(item.badge, locale)
+              })
+            );
           }
           ul.appendChild(li);
         }
@@ -1206,7 +1523,12 @@
       if (section.kind === "key-value") {
         const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
         if (section.title) {
-          box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+          box.appendChild(
+            createSafeElement(doc, "div", {
+              attrs: { class: "rph-slot-heading" },
+              text: resolveLocalizedText(section.title, locale)
+            })
+          );
         }
         for (const entry of section.entries) {
           const row = createSafeElement(doc, "div", { attrs: { class: "rph-kv-row" } });
@@ -1217,9 +1539,17 @@
         return box;
       }
       if (section.kind === "actions") {
+        if (!plugin.capabilities.includes("actions")) {
+          return null;
+        }
         const box = createSafeElement(doc, "div", { attrs: { class: "rph-kv" } });
         if (section.title) {
-          box.appendChild(createSafeElement(doc, "div", { attrs: { class: "rph-slot-heading" }, text: resolveLocalizedText(section.title, locale) }));
+          box.appendChild(
+            createSafeElement(doc, "div", {
+              attrs: { class: "rph-slot-heading" },
+              text: resolveLocalizedText(section.title, locale)
+            })
+          );
         }
         const row = createSafeElement(doc, "div", { attrs: { class: "rph-actions" } });
         for (const item of section.items) {
@@ -1227,7 +1557,7 @@
             type: "button",
             class: "rph-btn",
             "data-style": item.style,
-            "data-plugin-id": pluginId,
+            "data-plugin-id": plugin.id,
             "data-action-id": item.id
           };
           if (item.disabled) {
@@ -1239,7 +1569,7 @@
           });
           btn.addEventListener("click", () => {
             void executePluginAction(
-              pluginId,
+              plugin.id,
               item.id,
               snapshotRevision ? { expectedRevision: snapshotRevision } : {}
             );
@@ -1249,7 +1579,7 @@
         box.appendChild(row);
         return box;
       }
-      return createSafeElement(doc, "div");
+      return null;
     }
     function renderInlineBarPlugin(container, plugin, snapResult) {
       const itemWrap = createSafeElement(doc, "div", {
@@ -1285,11 +1615,21 @@
         );
       }
       for (const sec of snapshot.sections) {
-        if (sec.kind === "metrics") {
-          itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
-        } else if (sec.kind === "actions") {
-          itemWrap.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+        if (sec.kind === "metrics" || sec.kind === "actions") {
+          const rendered = renderSection(plugin, snapshot.revision, sec);
+          if (rendered) {
+            itemWrap.appendChild(rendered);
+          }
         }
+      }
+      if (hasOwn(feedbackByPlugin, plugin.id)) {
+        const fb = feedbackByPlugin[plugin.id];
+        itemWrap.appendChild(
+          createSafeElement(doc, "span", {
+            attrs: { class: "rph-chip", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
+            text: resolveLocalizedText(fb.message, locale)
+          })
+        );
       }
       container.appendChild(itemWrap);
     }
@@ -1336,15 +1676,19 @@
         );
       }
       for (const sec of snapshot.sections) {
-        card.appendChild(renderSection(plugin.id, snapshot.revision, sec));
+        const rendered = renderSection(plugin, snapshot.revision, sec);
+        if (rendered) {
+          card.appendChild(rendered);
+        }
       }
-      const fb = feedbackByPlugin[plugin.id];
-      if (fb) {
-        const fbEl = createSafeElement(doc, "div", {
-          attrs: { class: "rph-notice", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
-          text: fb.text
-        });
-        card.appendChild(fbEl);
+      if (hasOwn(feedbackByPlugin, plugin.id)) {
+        const fb = feedbackByPlugin[plugin.id];
+        card.appendChild(
+          createSafeElement(doc, "div", {
+            attrs: { class: "rph-notice", "data-tone": fb.tone, role: "status", "aria-live": "polite" },
+            text: resolveLocalizedText(fb.message, locale)
+          })
+        );
         if (fb.needsRefresh) {
           const reloadBtn = createSafeElement(doc, "button", {
             attrs: { type: "button", class: "rph-btn", "data-rph-control": "conflict-reload" },
@@ -1365,6 +1709,8 @@
       }
       const seq = ++renderSeq;
       const plugins = registry.list();
+      const activeIds = new Set(plugins.map((p) => p.id));
+      pruneStalePluginState(activeIds);
       const snapshots = await Promise.all(
         plugins.map(async (plugin) => ({
           plugin,
@@ -1374,6 +1720,8 @@
       if (disposed || seq !== renderSeq) {
         return;
       }
+      const liveIds = new Set(registry.list().map((p) => p.id));
+      pruneStalePluginState(liveIds);
       updateChromeLocale();
       renderConfirmBox();
       pillCountSpan.textContent = String(plugins.length);
@@ -1386,6 +1734,9 @@
       let statusBarCount = 0;
       let composerBarCount = 0;
       for (const entry of snapshots) {
+        if (!liveIds.has(entry.plugin.id)) {
+          continue;
+        }
         const slot = entry.plugin.uiSlot.slot;
         if (slot === "title-bar") {
           renderInlineBarPlugin(titleBarEl, entry.plugin, entry.snapResult);
@@ -1452,7 +1803,14 @@
     if (win && typeof win.addEventListener === "function") {
       win.addEventListener("keydown", onKeyDown);
     }
-    const unsubRegistry = registry.onChange(() => {
+    const unsubRegistry = registry.onChange((evt) => {
+      if (evt && evt.type === "unregistered" && typeof evt.pluginId === "string") {
+        actionGeneration += 1;
+        if (pendingChallenge && pendingChallenge.pluginId === evt.pluginId) {
+          pendingChallenge = null;
+        }
+        delete feedbackByPlugin[evt.pluginId];
+      }
       void render();
     });
     const dispose = () => {
@@ -1460,6 +1818,8 @@
         return;
       }
       disposed = true;
+      actionGeneration += 1;
+      pendingChallenge = null;
       unsubRegistry();
       pillBtn.removeEventListener("click", onPillClick);
       closeBtn.removeEventListener("click", onCloseClick);
@@ -1488,57 +1848,10 @@
       isOpen() {
         return isOpen;
       },
-      getSlotRoot() {
-        return slotRoot;
-      },
+      executePluginAction,
       dispose
     });
   }
-
-  // src/core/desktop-companion-view.js
-  var PANEL_CSS = [
-    `.drc-panel { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; border-radius: 12px; border: 1px solid rgba(128,134,139,0.3); padding: 14px; display: flex; flex-direction: column; gap: 10px; max-width: 680px; }`,
-    `.drc-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }`,
-    `.drc-title { margin: 0; font-size: 15px; font-weight: 700; }`,
-    `.drc-subtitle { margin: 0; font-size: 12px; opacity: 0.78; }`,
-    `.drc-card { border-radius: 8px; border: 1px solid rgba(128,134,139,0.22); padding: 10px; display: flex; flex-direction: column; gap: 8px; }`,
-    `.drc-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; }`,
-    `.drc-slots { display: flex; flex-wrap: wrap; gap: 6px; }`,
-    `.drc-chip { padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: rgba(128,134,139,0.16); }`,
-    `.drc-btn { min-height: 36px; padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(128,134,139,0.35); background: rgba(128,134,139,0.14); color: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }`,
-    `.drc-btn:focus-visible { outline: 2px solid #4d90fe; outline-offset: 2px; }`,
-    `.drc-status { font-size: 12px; opacity: 0.85; min-height: 18px; }`
-  ].join(" ");
-  var COPY = Object.freeze({
-    ko: Object.freeze({
-      title: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uCEF4\uD328\uB2C8\uC5B8",
-      subtitle: "AddonManifest.v1 \uD638\uC2A4\uD2B8 \uACA9\uB9AC \uC2AC\uB86F\uC5D0\uC11C \uB3D9\uC791\uD558\uB294 \uC6D0\uACA9 \uC5F0\uB3D9 \uC548\uB0B4 \uD328\uB110\uC785\uB2C8\uB2E4.",
-      langToggle: "EN",
-      contractLabel: "\uC6D0\uACA9 \uD50C\uB7EC\uADF8\uC778 \uD45C\uC900 \uACC4\uC57D",
-      hostLabel: "\uB124\uC774\uD2F0\uBE0C \uD638\uC2A4\uD2B8 \uD504\uB85C\uD544",
-      setupTitle: "\uC678\uBD80 \xB7 \uBAA8\uBC14\uC77C \uBE0C\uB77C\uC6B0\uC800 \uC6D0\uACA9 \uC5F0\uB3D9",
-      copyBookmarklet: "\uBD81\uB9C8\uD074\uB9BF \uBCF5\uC0AC",
-      copyUserscript: "\uC720\uC800\uC2A4\uD06C\uB9BD\uD2B8 \uACBD\uB85C \uBCF5\uC0AC",
-      copiedBookmarklet: "\uBD81\uB9C8\uD074\uB9BF \uC2A4\uB2C8\uD3AB\uC744 \uD074\uB9BD\uBCF4\uB4DC\uC5D0 \uBCF5\uC0AC\uD588\uC2B5\uB2C8\uB2E4.",
-      copiedUserscript: "\uC720\uC800\uC2A4\uD06C\uB9BD\uD2B8 \uACBD\uB85C\uB97C \uD074\uB9BD\uBCF4\uB4DC\uC5D0 \uBCF5\uC0AC\uD588\uC2B5\uB2C8\uB2E4.",
-      copyFailed: "\uD074\uB9BD\uBCF4\uB4DC \uBCF5\uC0AC\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4. \uBC30\uD3EC \uD30C\uC77C\uC744 \uC9C1\uC811 \uC5F4\uC5B4 \uBCF5\uC0AC\uD558\uC138\uC694.",
-      slotsTitle: "\uC9C0\uC6D0\uB418\uB294 \uC6D0\uACA9 UI \uC2AC\uB86F \uBC30\uCE58"
-    }),
-    en: Object.freeze({
-      title: "Remote Plugin Companion",
-      subtitle: "Remote integration settings panel running inside an isolated AddonManifest.v1 slot.",
-      langToggle: "KO",
-      contractLabel: "Remote Plugin Standard",
-      hostLabel: "Native Host Profile",
-      setupTitle: "External & Mobile Browser Setup",
-      copyBookmarklet: "Copy Bookmarklet",
-      copyUserscript: "Copy Userscript Path",
-      copiedBookmarklet: "Bookmarklet snippet copied to clipboard.",
-      copiedUserscript: "Userscript path copied to clipboard.",
-      copyFailed: "Clipboard copy failed. Copy directly from the built dist artifact.",
-      slotsTitle: "Supported Remote UI Slot Placements"
-    })
-  });
 
   // src/core/diagnostics.js
   var DEFAULT_MAX_EVENTS = 200;
@@ -1588,7 +1901,7 @@
   };
 
   // src/core/remote-plugin-registry.js
-  var hasOwn = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  var hasOwn2 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
   var RemotePluginRegistry = class {
     #plugins = /* @__PURE__ */ Object.create(null);
     #exclusiveSlotOwners = /* @__PURE__ */ Object.create(null);
@@ -1608,25 +1921,25 @@
         throw new SecurityPolicyError("ERR_REGISTRY_DISPOSED", "Cannot register plugin on a disposed registry.");
       }
       const plugin = validateRemotePlugin(rawPlugin);
-      if (hasOwn(this.#plugins, plugin.id)) {
+      if (hasOwn2(this.#plugins, plugin.id)) {
         throw new SecurityPolicyError(
           "ERR_DUPLICATE_PLUGIN_ID",
           `Remote plugin "${plugin.id}" is already registered.`
         );
       }
-      if (hasOwn(this.#slotIds, plugin.uiSlot.slotId)) {
+      if (hasOwn2(this.#slotIds, plugin.uiSlot.slotId)) {
         throw new SecurityPolicyError(
           "ERR_DUPLICATE_SLOT_ID",
           `UI slotId "${plugin.uiSlot.slotId}" is already claimed by "${this.#slotIds[plugin.uiSlot.slotId]}".`
         );
       }
-      if (plugin.uiSlot.exclusive && hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
+      if (plugin.uiSlot.exclusive && hasOwn2(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
         throw new SecurityPolicyError(
           "ERR_EXCLUSIVE_SLOT_CONFLICT",
           `Exclusive slot "${plugin.uiSlot.slot}" is already owned by "${this.#exclusiveSlotOwners[plugin.uiSlot.slot]}".`
         );
       }
-      if (!plugin.uiSlot.exclusive && hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
+      if (!plugin.uiSlot.exclusive && hasOwn2(this.#exclusiveSlotOwners, plugin.uiSlot.slot)) {
         throw new SecurityPolicyError(
           "ERR_EXCLUSIVE_SLOT_CONFLICT",
           `Slot "${plugin.uiSlot.slot}" is exclusively owned by "${this.#exclusiveSlotOwners[plugin.uiSlot.slot]}".`
@@ -1651,7 +1964,7 @@
         try {
           const unsub = plugin.subscribe(
             () => {
-              if (!this.#disposed && hasOwn(this.#plugins, plugin.id)) {
+              if (!this.#disposed && hasOwn2(this.#plugins, plugin.id)) {
                 this.#emitChange({ type: "dirty", pluginId: plugin.id });
               }
             },
@@ -1681,18 +1994,18 @@
       };
     }
     unregister(pluginId) {
-      if (typeof pluginId !== "string" || !hasOwn(this.#plugins, pluginId)) {
+      if (typeof pluginId !== "string" || !hasOwn2(this.#plugins, pluginId)) {
         return false;
       }
       const plugin = this.#plugins[pluginId];
       delete this.#plugins[pluginId];
-      if (hasOwn(this.#slotIds, plugin.uiSlot.slotId) && this.#slotIds[plugin.uiSlot.slotId] === pluginId) {
+      if (hasOwn2(this.#slotIds, plugin.uiSlot.slotId) && this.#slotIds[plugin.uiSlot.slotId] === pluginId) {
         delete this.#slotIds[plugin.uiSlot.slotId];
       }
-      if (hasOwn(this.#exclusiveSlotOwners, plugin.uiSlot.slot) && this.#exclusiveSlotOwners[plugin.uiSlot.slot] === pluginId) {
+      if (hasOwn2(this.#exclusiveSlotOwners, plugin.uiSlot.slot) && this.#exclusiveSlotOwners[plugin.uiSlot.slot] === pluginId) {
         delete this.#exclusiveSlotOwners[plugin.uiSlot.slot];
       }
-      if (hasOwn(this.#unsubscribers, pluginId)) {
+      if (hasOwn2(this.#unsubscribers, pluginId)) {
         const unsub = this.#unsubscribers[pluginId];
         delete this.#unsubscribers[pluginId];
         try {
@@ -1724,7 +2037,7 @@
       return true;
     }
     get(pluginId) {
-      if (typeof pluginId !== "string" || !hasOwn(this.#plugins, pluginId)) {
+      if (typeof pluginId !== "string" || !hasOwn2(this.#plugins, pluginId)) {
         return null;
       }
       return this.#plugins[pluginId];
@@ -1844,16 +2157,6 @@
     }
   };
 
-  // src/adapters/addon-host/addon-host-surface-adapter.js
-  var REQUIRED_ADDON_HOST_METHODS = Object.freeze([
-    "mountSlot",
-    "unmountSlot",
-    "injectStyle",
-    "removeStyle",
-    "onDispose",
-    "dispose"
-  ]);
-
   // src/security/trusted-types.js
   var RESERVED_TRUSTED_TYPES_POLICIES = Object.freeze([
     "default",
@@ -1868,7 +2171,7 @@
   ]);
 
   // src/adapters/remote-web/shadow-surface-adapter.js
-  var hasOwn2 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  var hasOwn3 = Object.hasOwn ? Object.hasOwn : (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
   function createShadowSurfaceAdapter({
     doc,
     ownerId = "antigravity-remote-plugin",
@@ -1904,7 +2207,7 @@
         if (typeof slotId !== "string" || !slotId.trim()) {
           throw new SecurityPolicyError("ERR_INVALID_SLOT_ID", "slotId must be a non-empty string.");
         }
-        if (hasOwn2(slots, slotId)) {
+        if (hasOwn3(slots, slotId)) {
           return slots[slotId];
         }
         const el = createSafeElement(doc, "div", {
@@ -1919,7 +2222,7 @@
         return el;
       },
       unmountSlot(slotId) {
-        if (!hasOwn2(slots, slotId)) {
+        if (!hasOwn3(slots, slotId)) {
           return false;
         }
         const el = slots[slotId];
@@ -1936,7 +2239,7 @@
         if (typeof styleId !== "string" || !styleId.trim()) {
           throw new SecurityPolicyError("ERR_INVALID_STYLE_ID", "styleId must be a non-empty string.");
         }
-        let styleEl = hasOwn2(styles, styleId) ? styles[styleId] : null;
+        let styleEl = hasOwn3(styles, styleId) ? styles[styleId] : null;
         if (!styleEl) {
           styleEl = createSafeElement(doc, "style", {
             attrs: {
@@ -1951,7 +2254,7 @@
         return styleEl;
       },
       removeStyle(styleId) {
-        if (!hasOwn2(styles, styleId)) {
+        if (!hasOwn3(styles, styleId)) {
           return false;
         }
         const el = styles[styleId];
@@ -2012,8 +2315,12 @@
   }
 
   // src/security/plugin-handshake.js
+  var HANDSHAKE_REQUEST_TYPE = "remote-plugin-v1:handshake-request";
+  var HANDSHAKE_CHALLENGE_TYPE = "remote-plugin-v1:handshake-challenge";
   var HANDSHAKE_PROTOCOL_TYPE = "remote-plugin-v1:handshake-init";
   var HANDSHAKE_ACK_TYPE = "remote-plugin-v1:handshake-ack";
+  var DEFAULT_NONCE_TTL_MS = 3e4;
+  var MAX_PENDING_NONCES = 128;
   function generateHandshakeNonce(byteLength = 24) {
     const bytes = new Uint8Array(byteLength);
     if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
@@ -2026,7 +2333,13 @@
     }
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   }
-  function createPluginHandshakeHost({ win, allowedOrigins, onPortConnected }) {
+  function createPluginHandshakeHost({
+    win,
+    allowedOrigins,
+    onPortConnected,
+    nonceTtlMs = DEFAULT_NONCE_TTL_MS,
+    now = () => Date.now()
+  }) {
     if (!win || typeof win.addEventListener !== "function") {
       throw new SecurityPolicyError("ERR_INVALID_WINDOW", "A window with event listeners is required.");
     }
@@ -2036,9 +2349,36 @@
     if (typeof onPortConnected !== "function") {
       throw new TypeError("onPortConnected callback is required.");
     }
-    const pendingNonces = /* @__PURE__ */ new Set();
+    const pendingNonces = /* @__PURE__ */ new Map();
     const activePorts = /* @__PURE__ */ new Set();
     let disposed = false;
+    function pruneExpiredNonces() {
+      const t = now();
+      for (const [nonce, meta] of pendingNonces.entries()) {
+        if (meta.expiresAt <= t) {
+          pendingNonces.delete(nonce);
+        }
+      }
+    }
+    function issueNonceInternal({ boundOrigin = null, boundSource = null } = {}) {
+      if (disposed) {
+        throw new SecurityPolicyError("ERR_HANDSHAKE_DISPOSED", "Handshake host is disposed.");
+      }
+      pruneExpiredNonces();
+      if (pendingNonces.size >= MAX_PENDING_NONCES) {
+        const oldestKey = pendingNonces.keys().next().value;
+        if (oldestKey !== void 0) {
+          pendingNonces.delete(oldestKey);
+        }
+      }
+      const nonce = generateHandshakeNonce();
+      pendingNonces.set(nonce, {
+        expiresAt: now() + Math.max(100, Number(nonceTtlMs) || DEFAULT_NONCE_TTL_MS),
+        boundOrigin,
+        boundSource
+      });
+      return nonce;
+    }
     const onMessage = (event) => {
       if (disposed || !event || typeof event !== "object") {
         return;
@@ -2047,10 +2387,43 @@
         return;
       }
       const data = event.data;
-      if (!data || typeof data !== "object" || data.type !== HANDSHAKE_PROTOCOL_TYPE) {
+      if (!data || typeof data !== "object") {
         return;
       }
+      if (data.type === HANDSHAKE_REQUEST_TYPE) {
+        if (typeof data.requestId !== "string" || !data.requestId || data.requestId.length > 128) {
+          return;
+        }
+        const replyTarget = event.source;
+        if (!replyTarget || typeof replyTarget.postMessage !== "function") {
+          return;
+        }
+        const nonce = issueNonceInternal({
+          boundOrigin: event.origin,
+          boundSource: replyTarget
+        });
+        replyTarget.postMessage(
+          {
+            type: HANDSHAKE_CHALLENGE_TYPE,
+            requestId: data.requestId,
+            nonce
+          },
+          event.origin
+        );
+        return;
+      }
+      if (data.type !== HANDSHAKE_PROTOCOL_TYPE) {
+        return;
+      }
+      pruneExpiredNonces();
       if (typeof data.nonce !== "string" || !pendingNonces.has(data.nonce)) {
+        return;
+      }
+      const meta = pendingNonces.get(data.nonce);
+      if (meta.boundOrigin && meta.boundOrigin !== event.origin) {
+        return;
+      }
+      if (meta.boundSource && event.source !== meta.boundSource) {
         return;
       }
       const port = Array.isArray(event.ports) ? event.ports[0] : null;
@@ -2062,30 +2435,32 @@
       if (typeof port.start === "function") {
         port.start();
       }
+      let closed = false;
+      const closePort = () => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        activePorts.delete(port);
+        if (typeof port.close === "function") {
+          port.close();
+        }
+      };
       port.postMessage({ type: HANDSHAKE_ACK_TYPE, accepted: true });
       onPortConnected({
         port,
         origin: event.origin,
         pluginId: typeof data.pluginId === "string" ? data.pluginId : null,
-        close() {
-          activePorts.delete(port);
-          if (typeof port.close === "function") {
-            port.close();
-          }
-        }
+        close: closePort
       });
     };
     win.addEventListener("message", onMessage);
     return Object.freeze({
       issueNonce() {
-        if (disposed) {
-          throw new SecurityPolicyError("ERR_HANDSHAKE_DISPOSED", "Handshake host is disposed.");
-        }
-        const nonce = generateHandshakeNonce();
-        pendingNonces.add(nonce);
-        return nonce;
+        return issueNonceInternal();
       },
       pendingCount() {
+        pruneExpiredNonces();
         return pendingNonces.size;
       },
       activePortCount() {
@@ -2100,18 +2475,19 @@
         if (typeof win.removeEventListener === "function") {
           win.removeEventListener("message", onMessage);
         }
-        for (const port of activePorts) {
+        for (const port of [...activePorts]) {
+          activePorts.delete(port);
           if (typeof port.close === "function") {
             port.close();
           }
         }
-        activePorts.clear();
       }
     });
   }
 
-  // src/runtime/remote-host-runtime.js
+  // src/runtime/remote-web-runtime.js
   var REMOTE_HOST_VERSION = "2.0.0";
+  var mountedHostsByWindow = /* @__PURE__ */ new WeakMap();
   function mountRemotePluginHost({
     win = globalThis.window,
     doc = globalThis.document,
@@ -2122,13 +2498,19 @@
     if (!win || !doc) {
       return null;
     }
-    if (win.antigravityRemoteHost && typeof win.antigravityRemoteHost.toggleDock === "function") {
-      win.antigravityRemoteHost.toggleDock();
-      return win.antigravityRemoteHost;
-    }
     const currentOrigin = win.location?.origin || "";
     if (!isOriginAllowed(currentOrigin, allowedOrigins)) {
       return null;
+    }
+    const existing = mountedHostsByWindow.get(win);
+    if (existing) {
+      existing.toggleDock();
+      return existing.publicApi;
+    }
+    const existingDesc = Object.getOwnPropertyDescriptor(win, "antigravityRemoteHost");
+    if (existingDesc && existingDesc.writable === false && existingDesc.enumerable === false && existingDesc.value && existingDesc.value.contractVersion === REMOTE_PLUGIN_CONTRACT_VERSION && typeof existingDesc.value.toggleDock === "function") {
+      existingDesc.value.toggleDock();
+      return existingDesc.value;
     }
     const diagnostics = new DiagnosticsBus();
     const registry = new RemotePluginRegistry({ diagnostics });
@@ -2140,85 +2522,109 @@
       registry,
       initialLocale
     });
+    const activePortBridges = /* @__PURE__ */ new Set();
     const handshake = createPluginHandshakeHost({
       win,
       allowedOrigins,
-      onPortConnected({ port, origin, pluginId }) {
+      onPortConnected({ port, origin, pluginId, close }) {
         diagnostics.emit({
           level: "info",
           code: "REMOTE_PLUGIN_HANDSHAKE_CONNECTED",
-          source: "runtime.remote-host",
+          source: "runtime.remote-web",
           message: "Closed MessageChannel handshake established",
           detail: { origin, pluginId }
         });
-        port.onmessage = (msgEvent) => {
-          const msg = msgEvent?.data;
-          if (!msg || typeof msg !== "object") {
-            return;
+        const bridge = attachRemotePluginPortBridge({
+          port,
+          registry,
+          diagnostics,
+          onClose() {
+            activePortBridges.delete(bridge);
+            close();
           }
-          if (msg.type === "remote-plugin-v1:list") {
-            port.postMessage({
-              type: "remote-plugin-v1:list-result",
-              plugins: registry.list().map((p) => ({
-                id: p.id,
-                version: p.version,
-                uiSlot: p.uiSlot,
-                capabilities: p.capabilities
-              }))
-            });
-          }
-        };
+        });
+        activePortBridges.add(bridge);
       }
     });
     let disposed = false;
-    const handle = Object.freeze({
+    const publicApi = Object.freeze({
       contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
       version: REMOTE_HOST_VERSION,
-      registry,
-      renderer,
-      diagnostics,
       register(plugin) {
+        if (disposed) {
+          return () => {
+          };
+        }
         return registry.register(plugin, { locale: renderer.getLocale() });
       },
-      unregister(pluginId) {
-        return registry.unregister(pluginId);
-      },
-      listPlugins() {
-        return registry.list();
-      },
       listSlots() {
-        return [...ALLOWED_UI_SLOTS];
+        return Object.freeze([...ALLOWED_UI_SLOTS]);
       },
       toggleDock() {
-        renderer.toggleOpen();
-      },
-      setOpen(open) {
-        renderer.setOpen(open);
+        if (!disposed) {
+          renderer.toggleOpen();
+        }
       },
       setLocale(locale) {
+        if (disposed) {
+          return Promise.resolve();
+        }
         return renderer.setLocale(locale);
       },
       getLocale() {
         return renderer.getLocale();
-      },
-      issueHandshakeNonce() {
-        return handshake.issueNonce();
-      },
-      dispose() {
-        if (disposed) {
-          return;
-        }
-        disposed = true;
-        handshake.dispose();
-        registry.dispose();
-        surface.dispose();
-        if (win.antigravityRemoteHost === handle) {
-          delete win.antigravityRemoteHost;
-        }
       }
     });
-    win.antigravityRemoteHost = handle;
-    return handle;
+    const dispose = () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      mountedHostsByWindow.delete(win);
+      for (const bridge of [...activePortBridges]) {
+        bridge.close();
+      }
+      activePortBridges.clear();
+      handshake.dispose();
+      registry.dispose();
+      surface.dispose();
+      if (win.antigravityRemoteHost === publicApi) {
+        delete win.antigravityRemoteHost;
+      }
+    };
+    const controller = Object.freeze({
+      publicApi,
+      contractVersion: REMOTE_PLUGIN_CONTRACT_VERSION,
+      version: REMOTE_HOST_VERSION,
+      register: publicApi.register,
+      listSlots: publicApi.listSlots,
+      listPlugins() {
+        return registry.list();
+      },
+      toggleDock: publicApi.toggleDock,
+      setOpen(open) {
+        if (!disposed) {
+          renderer.setOpen(open);
+        }
+      },
+      isOpen() {
+        return renderer.isOpen();
+      },
+      setLocale: publicApi.setLocale,
+      getLocale: publicApi.getLocale,
+      activePortCount() {
+        return handshake.activePortCount();
+      },
+      dispose
+    });
+    mountedHostsByWindow.set(win, controller);
+    Object.defineProperty(win, "antigravityRemoteHost", {
+      value: publicApi,
+      writable: false,
+      enumerable: false,
+      configurable: true
+    });
+    return controller;
   }
 
   // src/runtime/remote-web-entry.js
