@@ -17,7 +17,7 @@ test('ARP-TC-019: scripts/build.js generates self-contained standalone bundle & 
   const manifest = JSON.parse(readFileSync(join(ROOT, 'dist/manifest.json'), 'utf8'));
   const bundle = readFileSync(join(ROOT, 'dist/remote_bridge.js'), 'utf8');
 
-  assert.equal(pkg.version, '0.1.0');
+  assert.equal(pkg.version, '1.0.0');
   assert.equal(pluginJson.version, pkg.version);
   assert.equal(manifest.version, pkg.version);
   assert.equal(manifest.moduleCount, 18);
@@ -44,7 +44,7 @@ test('ARP-TC-019: scripts/build.js generates self-contained standalone bundle & 
     const copiedBundle = join(isolatedDir, 'remote_bridge.mjs');
     copyFileSync(join(ROOT, 'dist/remote_bridge.js'), copiedBundle);
     const loaded = await import(pathToFileURL(copiedBundle).href);
-    assert.equal(loaded.BUILD_VERSION, '0.1.0');
+    assert.equal(loaded.BUILD_VERSION, '1.0.0');
     assert.equal(typeof loaded.bootstrapAntigravityRemoteBridge, 'function');
     assert.equal(typeof loaded.RemoteOrchestrator, 'function');
   } finally {

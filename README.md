@@ -2,7 +2,7 @@
 
 [한국어 문서 (Korean README)](./README.ko.md)
 
-**Version:** `0.1.0`
+**Version:** `1.0.0`
 
 `antigravity-remote-plugin` is a vendor-independent remote web bridge plugin designed to separate remote web control responsibilities from desktop-native Antigravity companion plugins (`antigravity-statusbar`, `antigravity-ko-translator`, and `antigravity-mcp-manager`).
 
@@ -38,4 +38,4 @@ This runs `scripts/build.js` to emit `dist/remote_bridge.js` and `dist/manifest.
 
 ## Release Notes
 
-- [v0.1.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v0.1.0.md)
+- [v1.0.0 Release Notes (EN / KO)](./docs/RELEASE_NOTES_v1.0.0.md)
